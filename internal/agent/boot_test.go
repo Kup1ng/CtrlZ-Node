@@ -588,7 +588,7 @@ func TestBootKeepsTheResolversWhenTheEnrolmentIsDead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- boot(ctx, rig.env) }()
-	t.Cleanup(func() { cancel(); <-done })
+	t.Cleanup(func() { cancel() })
 	for end := time.Now().Add(10 * time.Second); !strings.Contains(console.String(), "the enrolment is over"); time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(end) {
 			t.Fatalf("no word of the dead enrolment on the console: %q", console.String())
