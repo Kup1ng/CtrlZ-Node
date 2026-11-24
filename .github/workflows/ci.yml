@@ -1,0 +1,98 @@
+# CI of the Node on GitHub Actions: the steps of scripts/ci.sh, cut into three parallel
+# jobs. What stays local is named in ci/github/README.md of the workspace: the equality of
+# the two shared copies (it needs both repositories side by side) and gitleaks over the
+# real local history.
+#
+# Rules this file keeps:
+#   - no pull_request or pull_request_target trigger: the repository is public and a fork
+#     must never get to run these jobs;
+#   - read-only token and no repository credential of any kind (check-tree.mjs refuses the
+#     word that names them, comments included, so it is not written in this file);
+#   - actions are pinned to a full commit SHA, the version in the comment, and only
+#     actions/checkout and actions/setup-go are used. A release is pinned only when it is at
+#     least 14 days old (setup-go v7.1.0 was two days old and is not used yet);
+#   - three jobs at once. The Panel's run peaks at 17, so both together fit the 20 of the
+#     free account.
+name: ci
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A go.mod ahead of the installed Go must fail, not download a toolchain (go-pin-check.sh).
+  GOTOOLCHAIN: local
+
+jobs:
+  # pin check, shared verify of the one copy, shared tests, gofmt, build, vet for both systems.
+  static:
+    name: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Static checks
+        run: sh .github/ci/static.sh
+
+  tests:
+    name: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Check the compiler
+        run: sh scripts/go-pin-check.sh
+      # shardrun runs go test -count=1 -json ./... and fails on a package that reports no
+      # result or a skip that is not on its list of by-design skips, and says what was skipped.
+      - name: go test
+        run: go run ./.github/ci/shardrun module .
+
+  # The published history is only snapshots, so gitleaks reads the files of the checkout
+  # with the repository's own .gitleaks.toml (publish.mjs only pushes a tree whose file is a reviewed
+  # one) and with gitleaks:allow comments ignored. The history is scanned by the local run.
+  scan:
+    name: gitleaks and govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No build or module cache here: the cache that setup-go restores is saved by whichever job
+      # finishes first, which can be one that has just run the tree's tests and so its dependencies,
+      # and the scanners must not be compiled from anything such a job could have written (CI review
+      # round 7, ci-r7-8). They are built from the module proxy with the checksum database instead.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install the scanners
+        run: sh .github/ci/install-tools.sh
+      - name: gitleaks
+        run: gitleaks dir --no-banner --redact --log-level=warn --ignore-gitleaks-allow .
+      - name: govulncheck
+        run: govulncheck -C . ./...
