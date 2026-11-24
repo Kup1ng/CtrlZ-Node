@@ -135,8 +135,10 @@ type Facts struct {
 	FreeEnabled    bool   `json:"fon"`
 	FreeQPS        uint32 `json:"fqps"`
 	FreeVersion    uint64 `json:"fver"`
-	// AppliedSeq is the applied seq the facts above were judged at. The agent commits
-	// it before the image swap, and the swap or dns's open of the image can fail, so
+	// AppliedSeq is the applied seq the facts above were judged at: it moves after the
+	// images of an Apply reached dns, not at each commit inside a batch, so a batch in
+	// progress does not turn the free path off. The agent commits it before the image
+	// swap, and the swap or dns's open of the image can fail, so
 	// dns serves from an image with a seq below it until the next one arrives. dns
 	// therefore counts the node as caught up only while the image it serves has at
 	// least this seq (SC 5.2a (c)); an image from a lost state has a higher seq and

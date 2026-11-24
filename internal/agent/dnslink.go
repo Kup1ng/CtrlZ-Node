@@ -307,7 +307,11 @@ func (a *Agent) publishTableAndFacts() {
 	if seen {
 		off = a.hubOffset.Load()
 	}
-	f := &sock.Facts{ServerTimeSeen: fs.ServerTimeSeen, CaughtUpOnce: fs.CaughtUpOnce, LagOK: fs.LagOK, OffFloor: fs.OffFloor, HubOffset: off, AppliedSeq: a.app.AppliedSeq()}
+	f := &sock.Facts{ServerTimeSeen: fs.ServerTimeSeen, CaughtUpOnce: fs.CaughtUpOnce, LagOK: fs.LagOK, OffFloor: fs.OffFloor, HubOffset: off,
+		// The seq the facts were judged at, not the Applier's live one: that moves at each
+		// commit of a batch, before afterApply hands dns the images, and dns would count
+		// the node as not caught up (SC 5.2a (c)) for the whole batch.
+		AppliedSeq: fs.Applied}
 	if v := a.freeValue.Load(); v != nil {
 		f.FreeSet, f.FreeEnabled, f.FreeQPS, f.FreeVersion = true, v.Enabled, v.Qps, v.Version
 	}
