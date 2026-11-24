@@ -524,3 +524,20 @@ func (r *Root) StateHash() ([32]byte, error) {
 	}
 	return sha256.Sum256(b), nil
 }
+
+// PeekMember is the PairTable of the applied state, or nil when there is none or the
+// file does not decode. It opens no blob and changes nothing on disk, not even a
+// damaged file, which only LoadApplied sets aside and reports: the start of an agent
+// that has no identity yet reads the node addresses from it (the do-not-query list)
+// and must leave the repair, and the alert about it, to the agent that follows.
+func (r *Root) PeekMember() *policyv1.PairTable {
+	file, err := os.ReadFile(r.Path(DirState, stateFile))
+	if err != nil {
+		return nil
+	}
+	a, _, err := decodeApplied(file)
+	if err != nil {
+		return nil
+	}
+	return a.Member
+}

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -921,4 +922,120 @@ func TestStartAfterTheInstallRemovedARenderedFileOfAnotherConfiguration(t *testi
 	if !strings.Contains(f.Get("/etc/ctrlz/unbound/free.conf"), "outgoing-interface: 198.51.101.7") {
 		t.Error("the new file lacks the outgoing interface")
 	}
+}
+
+// p4n-MC-r2-1 and p4n-MC-r2-2: the restart onto a replaced binary is judged on the
+// binary now on disk, not on the version cached at the start. A package that went
+// back below the floor must leave the running, patched process alone and be alerted;
+// a good update must change the version the Heartbeat reports.
+func TestAStaleRestartHoldsTheNewBinaryToTheFloor(t *testing.T) {
+	boot := time.Unix(1_700_000_000, 0)
+	started := boot.Add(1000 * time.Second)
+	now := started.Add(time.Hour)
+	// what `unbound -V` and dpkg-query answer now; the test changes them between the
+	// start and the stale pass
+	var mu sync.Mutex
+	version, deb := "1.19.2", DistroFloor
+	setup := func() (*Supervisor, *fake.Runner, *alert.Memory) {
+		units := &fake.Units{}
+		r := &fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
+			if c.Name == "systemctl" && len(c.Args) > 1 && c.Args[0] == "show" {
+				return []byte("4242\n"), nil
+			}
+			if out, err, ok := units.Handle(c); ok {
+				return out, err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case c.Name == "unbound":
+				return []byte("Version " + version + "\n"), nil
+			case c.Name == "dpkg-query":
+				return []byte(deb), nil
+			case c.Name == "dpkg":
+				// dpkg --compare-versions <rev> ge <floor>: only the fake's own rule is needed,
+				// the revisions of this test are either DistroFloor or the release pocket build.
+				if c.Args[1] == "1.19.2-1ubuntu3" {
+					return nil, errors.New("exit status 1")
+				}
+			}
+			return nil, nil
+		}}
+		f := fake.NewFiles(map[string]string{EphemeralPath: "32768 39999\n"})
+		f.M["/proc/4242/stat"] = []byte("4242 (unbound) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 100000 1000 1000 18446744073709551615\n")
+		f.M["/proc/stat"] = []byte("cpu  1 2 3\nbtime 1700000000\n")
+		al := &alert.Memory{}
+		s := New(Config{Runner: r, Files: f, Alert: al, ConfDir: "/etc/ctrlz/unbound",
+			Identified: DefaultParams(Identified), Free: DefaultParams(Free),
+			Now:        func() time.Time { return now },
+			ChangeTime: func(p string) (time.Time, error) { return started.Add(10 * time.Minute), nil }})
+		for _, k := range []Kind{Identified, Free} {
+			if err := s.Start(context.Background(), k, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s, r, al
+	}
+	restarts := func(r *fake.Runner) int {
+		n := 0
+		for _, l := range r.Lines() {
+			if strings.HasPrefix(l, "systemctl restart ctrlz-unbound") {
+				n++
+			}
+		}
+		return n
+	}
+	ctx := context.Background()
+
+	t.Run("the distribution build rolled back below the floor is not started", func(t *testing.T) {
+		mu.Lock()
+		version, deb = "1.19.2", DistroFloor
+		mu.Unlock()
+		s, r, al := setup()
+		mu.Lock()
+		deb = "1.19.2-1ubuntu3"
+		mu.Unlock()
+		s.Check(ctx)
+		if restarts(r) != 0 || al.Count(alert.UnboundStale) != 0 {
+			t.Fatalf("restarted onto a build below the floor: %v", r.Lines())
+		}
+		if al.Count(alert.UnboundRefused) != 2 {
+			t.Errorf("refusals: %v", al.Codes())
+		}
+		if s.RunningVersion() != "1.19.2" {
+			t.Errorf("the running version changed to %q although nothing was restarted", s.RunningVersion())
+		}
+	})
+	t.Run("an upstream version that moved below the floor is not started", func(t *testing.T) {
+		mu.Lock()
+		version, deb = "1.24.0", DistroFloor
+		mu.Unlock()
+		s, r, al := setup()
+		mu.Lock()
+		version = "1.18.0"
+		mu.Unlock()
+		s.Check(ctx)
+		if restarts(r) != 0 || al.Count(alert.UnboundRefused) != 2 {
+			t.Fatalf("restarts %d, alerts %v", restarts(r), al.Codes())
+		}
+	})
+	t.Run("a good update restarts and moves the reported version", func(t *testing.T) {
+		mu.Lock()
+		version, deb = "1.19.2", DistroFloor
+		mu.Unlock()
+		s, r, al := setup()
+		if s.RunningVersion() != "1.19.2" {
+			t.Fatalf("version after the start: %q", s.RunningVersion())
+		}
+		mu.Lock()
+		version = "1.24.0"
+		mu.Unlock()
+		s.Check(ctx)
+		if restarts(r) != 2 || al.Count(alert.UnboundStale) != 2 || al.Count(alert.UnboundRefused) != 0 {
+			t.Fatalf("restarts %d, alerts %v", restarts(r), al.Codes())
+		}
+		if s.RunningVersion() != "1.24.0" {
+			t.Errorf("the reported version is %q after a restart onto 1.24.0", s.RunningVersion())
+		}
+	})
 }

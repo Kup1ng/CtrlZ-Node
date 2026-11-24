@@ -335,21 +335,28 @@ func New(cfg Config) (*Agent, error) {
 	})
 	a.upl = upload.New(upload.Config{Conn: a.uplPool, Counters: a.free, Activity: a.act,
 		CountersPoll: cfg.CountersPoll, ActivityEvery: cfg.ActivityEvery})
-	a.unb = unbound.New(unbound.Config{Runner: cfg.Runner, Files: cfg.Files, Alert: cfg.Alert, ConfDir: UnboundConfDir,
-		Identified: a.unboundParams(unbound.Identified), Free: a.unboundParams(unbound.Free),
-		Binary: cfg.UnboundBinary, Control: cfg.UnboundControl, Gate: a.coreGate, StartRetry: cfg.UnboundStartRetry})
+	a.unb = newUnbound(cfg)
 	return a, nil
 }
 
-func (a *Agent) unboundParams(k unbound.Kind) unbound.Params {
-	p := a.cfg.UnboundIdentified
+// newUnbound is the supervisor of the two Unbound processes. The agent builds it, and
+// so does the start before the agent exists (serve_pending.go): the two must judge
+// and render alike, or the one that takes over would refuse the other's files.
+func newUnbound(cfg Config) *unbound.Supervisor {
+	return unbound.New(unbound.Config{Runner: cfg.Runner, Files: cfg.Files, Alert: cfg.Alert, ConfDir: UnboundConfDir,
+		Identified: unboundParams(cfg, unbound.Identified), Free: unboundParams(cfg, unbound.Free),
+		Binary: cfg.UnboundBinary, Control: cfg.UnboundControl, Gate: func() error { return coreGate(cfg) }, StartRetry: cfg.UnboundStartRetry})
+}
+
+func unboundParams(cfg Config, k unbound.Kind) unbound.Params {
+	p := cfg.UnboundIdentified
 	if k == unbound.Free {
-		p = a.cfg.UnboundFree
+		p = cfg.UnboundFree
 	}
 	if p.Kind == 0 {
 		p = unbound.DefaultParams(k)
-		if k == unbound.Free && a.cfg.Conf.FreeOutgoingInterface.IsValid() {
-			p.OutgoingInterface = a.cfg.Conf.FreeOutgoingInterface
+		if k == unbound.Free && cfg.Conf.FreeOutgoingInterface.IsValid() {
+			p.OutgoingInterface = cfg.Conf.FreeOutgoingInterface
 		}
 	}
 	return p

@@ -487,3 +487,57 @@ func TestBootHoldsADeadEnrolmentBeforeItExits(t *testing.T) {
 		t.Error("a node with no token spoke to the hub")
 	}
 }
+
+// p4n-MC-r2-3: while the admin has not approved the enrolment, the node already has
+// both Unbound processes running (install removed their files and stopped them, and
+// the dns role forwards every identified miss to the identified one). Control stays
+// closed until the certificate is stored.
+func TestBootStartsUnboundBeforeTheEnrolmentIsApproved(t *testing.T) {
+	eh := newEnrollHub(t)
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	hub := fakehub.New()
+	hub.Start()
+	t.Cleanup(hub.Stop)
+	runner, files := unboundHost()
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.PollEvery = 20 * time.Millisecond
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	rig.env.Tune = func(c *Config) {
+		c.SockGroup = ""
+		c.PeerCheck = func(net.Conn) error { return nil }
+		c.Dial = func(hubconn.Role) (*grpc.ClientConn, error) { return hub.Dial() }
+		c.Runner, c.Files = runner, files
+		c.SkipHostChecks = true
+		c.UnboundEvery = 20 * time.Millisecond
+		c.HeartbeatEvery = 50 * time.Millisecond
+		c.RetryEvery, c.LogPoll, c.ProbeEvery = time.Hour, time.Hour, time.Hour
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- boot(ctx, rig.env) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	started := func() bool {
+		s := strings.Join(runner.Lines(), "\n")
+		return strings.Contains(s, "systemctl start ctrlz-unbound.service") && strings.Contains(s, "systemctl start ctrlz-unbound-free.service")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !started() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !started() {
+		t.Fatalf("no Unbound started while the enrolment is pending: %v", runner.Lines())
+	}
+	if files.Get("/etc/ctrlz/unbound/identified.conf") == "" {
+		t.Error("identified.conf not written")
+	}
+	if s, err := hub.NextSession(300 * time.Millisecond); err == nil {
+		t.Fatalf("Control opened before approval: %v", s)
+	}
+	eh.approve.Store(true)
+	if _, err := hub.NextSession(10 * time.Second); err != nil {
+		t.Fatalf("no Control stream after approval: %v", err)
+	}
+}

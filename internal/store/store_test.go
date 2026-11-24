@@ -338,3 +338,32 @@ func TestKeysAreAgentOnly(t *testing.T) {
 		}
 	}
 }
+
+// PeekMember reads the table of the state and, unlike LoadApplied, leaves a damaged
+// file where it is.
+func TestPeekMemberReadsAndChangesNothing(t *testing.T) {
+	r := open(t, t.TempDir(), nil)
+	if r.PeekMember() != nil {
+		t.Fatal("a table from no state")
+	}
+	a, _ := fullState(t, r)
+	if err := r.SaveApplied(a); err != nil {
+		t.Fatal(err)
+	}
+	if m := r.PeekMember(); m == nil || len(m.Nodes) != 2 {
+		t.Fatalf("member %v", m)
+	}
+	p := r.Path(store.DirState, "state.bin")
+	if err := os.WriteFile(p, []byte("not a state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r.PeekMember() != nil {
+		t.Fatal("a table from a damaged file")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("PeekMember moved the damaged file")
+	}
+	if _, err := os.Stat(r.Path(store.DirQuarantine, "state.bin.corrupt")); err == nil {
+		t.Fatal("PeekMember quarantined the file")
+	}
+}

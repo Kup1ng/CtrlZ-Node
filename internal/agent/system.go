@@ -75,28 +75,9 @@ func (a *Agent) systemLoop(ctx context.Context) {
 	if a.cfg.NoSystem {
 		return
 	}
-	files := a.cfg.Files
 
-	// Core dumps first: a process that can leave a core holds its cache and request
-	// list in it, so neither Unbound starts while a check fails (SC 5.2a, No trace).
-	coresOK := true
-	if !a.cfg.SkipHostChecks {
-		fs := hostcheck.CoreDumps(files)
-		hostcheck.Alerts(a.al, fs)
-		coresOK = len(fs) == 0
-	}
-	if v, err := a.unb.Version(ctx); err == nil {
+	if v := startUnbound(ctx, a.cfg, a.al, a.unb, a.doNotQuery()); v != "" {
 		a.unbVersion.Store(&v)
-	}
-	if coresOK {
-		for _, k := range []unbound.Kind{unbound.Identified, unbound.Free} {
-			_ = a.unb.Start(ctx, k, a.doNotQuery())
-		}
-	} else {
-		a.al.Alert(alert.Alert{Code: alert.UnboundRefused, Detail: "core dumps are not ruled out"})
-		// Not started, but meant to run: the unbound tick starts them once the host
-		// check holds (an operator fixes kernel.core_pattern while the agent runs).
-		a.unb.Want(unbound.Identified, unbound.Free)
 	}
 	a.applyNft(ctx)
 	a.updateChrony(ctx)
@@ -124,6 +105,10 @@ func (a *Agent) systemLoop(ctx context.Context) {
 			a.restartDNSIfDue(ctx)
 		case <-unbTick.C:
 			a.unb.Check(ctx)
+			// A restart onto a replaced binary changes the version the hub is told.
+			if v := a.unb.RunningVersion(); v != "" {
+				a.unbVersion.Store(&v)
+			}
 		case <-hostTick.C:
 			a.hostChecks(ctx)
 			// A chrony restart that failed is tried again here (chrony.Update keeps
@@ -230,12 +215,37 @@ func (a *Agent) updateChrony(ctx context.Context) {
 
 // coreGate is the host check an Unbound start depends on (SC 5.2a, No trace): no
 // path left by which a crashed process could leave a core with its cache in it.
-func (a *Agent) coreGate() error {
-	if a.cfg.SkipHostChecks {
+func coreGate(cfg Config) error {
+	if cfg.SkipHostChecks {
 		return nil
 	}
-	if len(hostcheck.CoreDumps(a.cfg.Files)) > 0 {
+	if len(hostcheck.CoreDumps(cfg.Files)) > 0 {
 		return errors.New("agent: core dumps are not ruled out")
 	}
 	return nil
+}
+
+// startUnbound is the first start of the two processes. Core dumps come first: a
+// process that can leave a core holds its cache and request list in it, so neither
+// starts while a check fails (SC 5.2a, No trace). It returns the Unbound version, or
+// "" when it could not be read.
+func startUnbound(ctx context.Context, cfg Config, al alert.Alerter, unb *unbound.Supervisor, dnq []netip.Prefix) string {
+	coresOK := true
+	if !cfg.SkipHostChecks {
+		fs := hostcheck.CoreDumps(cfg.Files)
+		hostcheck.Alerts(al, fs)
+		coresOK = len(fs) == 0
+	}
+	v, _ := unb.Version(ctx)
+	if coresOK {
+		for _, k := range []unbound.Kind{unbound.Identified, unbound.Free} {
+			_ = unb.Start(ctx, k, dnq)
+		}
+	} else {
+		al.Alert(alert.Alert{Code: alert.UnboundRefused, Detail: "core dumps are not ruled out"})
+		// Not started, but meant to run: the unbound tick starts them once the host
+		// check holds (an operator fixes kernel.core_pattern while the agent runs).
+		unb.Want(unbound.Identified, unbound.Free)
+	}
+	return v
 }

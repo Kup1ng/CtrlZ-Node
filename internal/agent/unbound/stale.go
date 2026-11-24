@@ -59,12 +59,38 @@ func (s *Supervisor) restartIfStale(ctx context.Context, k Kind) {
 	s.mu.Lock()
 	s.lastStale[k] = now
 	s.mu.Unlock()
-	if err := s.guard(k); err != nil {
+	// The files on disk are new, so what the floor was judged on at the start (and
+	// cached) says nothing about them: ask the binary again before it is run. A
+	// package rolled back below the floor must leave the old, patched process alone
+	// and be told to the owner, not be started (spec 7.3, T-559).
+	v, err := s.recheckBinary(ctx)
+	if err == nil {
+		err = s.guard(k)
+	}
+	if err != nil {
 		s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundRefused, Detail: k.String() + ": not restarted onto replaced files, a start check fails"})
 		return
 	}
 	s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundStale, Detail: k.String()})
-	_, _ = s.cfg.Runner.Run(ctx, nil, "systemctl", "restart", s.unit(k))
+	if _, err := s.cfg.Runner.Run(ctx, nil, "systemctl", "restart", s.unit(k)); err == nil {
+		s.mu.Lock()
+		s.ran = v
+		s.mu.Unlock()
+	}
+}
+
+// recheckBinary forgets the version and the patched state that were cached for the
+// binary of the start, reads them again from the binary now on disk and holds them to
+// the floor. It returns the version.
+func (s *Supervisor) recheckBinary(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	s.version, s.patched = "", false
+	s.mu.Unlock()
+	v, err := s.Version(ctx)
+	if err != nil {
+		return "", err
+	}
+	return v, s.checkFloor(ctx, v)
 }
 
 func (s *Supervisor) now() time.Time {

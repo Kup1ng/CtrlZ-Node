@@ -5,10 +5,12 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 	policyv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/policy/v1"
 	"github.com/Kup1ng/CtrlZ-Shared/identity"
 	"github.com/Kup1ng/CtrlZ-Shared/zone"
 
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/conf"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nets"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/probe"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/telem"
@@ -35,22 +37,28 @@ func addrOf(b []byte) (netip.Addr, bool) {
 // be (SC 5.2a): this node's bind and advertised addresses, from agent.conf and
 // the NodeConfig, and the dns_ip of every node of the applied PairTable.
 func (a *Agent) nodeAddrs() []netip.Addr {
+	return nodeAddrList(a.cfg.Conf, a.nodeCfg.Load(), a.push.Member())
+}
+
+// nodeAddrList is nodeAddrs for the inputs it is made of, so that the start before
+// the agent exists (serve_pending.go) builds the same list from the same files.
+func nodeAddrList(ac conf.Agent, c *hubv1.NodeConfig, m *policyv1.PairTable) []netip.Addr {
 	var out []netip.Addr
 	add := func(ip netip.Addr) {
 		if ip.IsValid() {
 			out = append(out, ip.Unmap())
 		}
 	}
-	add(a.cfg.Conf.DNSBindIP)
-	add(a.cfg.Conf.DNSAdvertisedIP)
-	if c := a.nodeCfg.Load(); c != nil {
+	add(ac.DNSBindIP)
+	add(ac.DNSAdvertisedIP)
+	if c != nil {
 		for _, b := range [][]byte{c.DnsBindIp, c.DnsAdvertisedIp} {
 			if ip, ok := addrOf(b); ok {
 				add(ip)
 			}
 		}
 	}
-	if m := a.push.Member(); m != nil {
+	if m != nil {
 		for _, n := range m.Nodes {
 			if ip, ok := addrOf(n.DnsIp); ok {
 				add(ip)
@@ -62,9 +70,11 @@ func (a *Agent) nodeAddrs() []netip.Addr {
 
 // doNotQuery is the do-not-query-address list of both Unbound processes' node
 // part (the non-public ranges are added by the renderer).
-func (a *Agent) doNotQuery() []netip.Prefix {
+func (a *Agent) doNotQuery() []netip.Prefix { return doNotQueryOf(a.nodeAddrs()) }
+
+func doNotQueryOf(addrs []netip.Addr) []netip.Prefix {
 	var lists [][]netip.Prefix
-	for _, ip := range a.nodeAddrs() {
+	for _, ip := range addrs {
 		lists = append(lists, nets.ForAddr(ip))
 	}
 	return nets.Merge(lists...)

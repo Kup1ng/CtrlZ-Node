@@ -634,7 +634,9 @@ restart_stale_unbound() {
 # would keep refusing its own old file: no start, no reload, the do-not-query list that
 # keeps the node's own addresses out of the upstreams never updated again
 # (p4n-MC-r1-6). The agent is stopped (quiesce) and writes the files afresh when it
-# starts the units; a change made outside install and upgrade is still refused.
+# starts the units (before an enrolment is approved too: boot starts them first, so a
+# repeat install does not leave the node without a resolver while it waits); a change
+# made outside install and upgrade is still refused.
 # The units are stopped, not restarted, because a restart needs the file this removes
 # and because reload_keep_cache does not rebind sockets or change the outgoing interface.
 reset_unbound_conf() {

@@ -75,7 +75,8 @@ type Supervisor struct {
 	// lastStale is when each kind was last restarted for a replaced binary or library.
 	lastStale map[Kind]time.Time
 	version   string
-	patched   bool // the distribution build of DistroBase with the backports
+	patched   bool   // the distribution build of DistroBase with the backports
+	ran       string // the version the processes were last started or restarted on; the Heartbeat reports it
 	unwant    int64
 }
 
@@ -156,6 +157,14 @@ func (s *Supervisor) Version(ctx context.Context) (string, error) {
 	s.version = v
 	s.mu.Unlock()
 	return v, nil
+}
+
+// RunningVersion is the Unbound version the processes were last started or restarted
+// on, which a stale restart changes. It is "" before the first start.
+func (s *Supervisor) RunningVersion() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ran
 }
 
 var debVersionRE = regexp.MustCompile(`^[0-9][A-Za-z0-9.+~:-]{0,63}$`)
@@ -254,6 +263,7 @@ func (s *Supervisor) Start(ctx context.Context, k Kind, doNotQuery []netip.Prefi
 	}
 	s.mu.Lock()
 	s.started[k] = true
+	s.ran = v
 	s.reloaded[k] = append([]netip.Prefix(nil), s.dnq...)
 	if already {
 		s.stale[k] = true

@@ -63,11 +63,6 @@ func boot(ctx context.Context, env bootEnv) error {
 		return fmt.Errorf("agent: %s: %w", filepath.Join(keys, hubconn.RootFile), err)
 	}
 
-	id, err := ensureIdentity(ctx, env, ac, keys)
-	if err != nil {
-		return err
-	}
-
 	lookup := env.LookupUID
 	if lookup == nil {
 		lookup = func(name string) (uint32, error) {
@@ -84,11 +79,13 @@ func boot(ctx context.Context, env bootEnv) error {
 		return fmt.Errorf("agent: the user %s: %w", DNSUser, err)
 	}
 
+	// The identity comes after the Config, which does not hold it yet: the Unbound
+	// processes of a node that is still enrolling are started from this Config.
+	var id *hubconn.Identity
 	cfg := Config{
 		Root: env.Root, Conf: ac, ConfPath: env.ConfPath,
 		SockPath: env.SockPath, SockGroup: SockGroup, PeerCheck: sock.UIDCheck(uid),
 		Version:   env.Version,
-		Identity:  id,
 		Dial:      func(r hubconn.Role) (*grpc.ClientConn, error) { return id.Dial(ac.HubAddr(), r) },
 		TrustRoot: trust.get,
 		Runner:    sysx.ExecRunner{},
@@ -100,6 +97,25 @@ func boot(ctx context.Context, env bootEnv) error {
 	if env.Tune != nil {
 		env.Tune(&cfg)
 	}
+	have, err := haveIdentity(keys)
+	if err != nil {
+		return err
+	}
+	if !have {
+		// A repeat install has stopped the Unbound units and removed their files, and the
+		// enrolment that follows may wait for the admin for a day or fail for good: the node
+		// resolves meanwhile (7.1, 7.2).
+		stop := servePending(ctx, cfg, ac)
+		defer stop()
+		id, err = ensureIdentity(ctx, env, ac, keys)
+		stop() // the agent's own system loop takes the units over from here
+		if err != nil {
+			return err
+		}
+	} else if id, err = hubconn.LoadIdentity(keys, ac.HubHost()); err != nil {
+		return err
+	}
+	cfg.Identity = id
 	a, err := New(cfg)
 	if err != nil {
 		return err
