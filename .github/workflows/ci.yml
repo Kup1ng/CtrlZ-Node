@@ -1,5 +1,5 @@
-# CI of the Node on GitHub Actions: the steps of scripts/ci.sh, cut into three parallel
-# jobs. What stays local is named in ci/github/README.md of the workspace: the equality of
+# CI of the Node on GitHub Actions: the steps of scripts/ci.sh, cut into parallel
+# jobs (static, tests, tests (lab), install and the scan). What stays local is named in ci/github/README.md of the workspace: the equality of
 # the two shared copies (it needs both repositories side by side) and gitleaks over the
 # real local history.
 #
@@ -11,8 +11,8 @@
 #   - actions are pinned to a full commit SHA, the version in the comment, and only
 #     actions/checkout and actions/setup-go are used. A release is pinned only when it is at
 #     least 14 days old (setup-go v7.1.0 was two days old and is not used yet);
-#   - three jobs at once. The Panel's run peaks at 17, so both together fit the 20 of the
-#     free account.
+#   - five jobs at once. The Panel's run peaks at 17, so both together are 22 and the last two queue
+#     on the 20 of the free account (a queued job waits, it does not fail).
 name: ci
 
 on:
@@ -70,6 +70,46 @@ jobs:
       # result or a skip that is not on its list of by-design skips, and says what was skipped.
       - name: go test
         run: go run ./.github/ci/shardrun module .
+
+  # The lab build (tag ctrlz_lab): the module and shared/ with the P4 fault-test build. No release job
+  # builds the files and the golden-vector cases that only this tag builds, so this job is what runs
+  # them; the cases that only a release build runs skip here, by design (shardrun, gofiles.sh).
+  tests-lab:
+    name: tests (lab)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: go test with the lab tag
+        run: sh .github/ci/lab.sh
+
+  # TestInstallInContainer, which the other jobs skip: node.sh, apply.sh and the upgrade in clean
+  # ubuntu:24.04 containers. The runner has Docker. The job pulls the image by digest and fails if
+  # the test skips.
+  install:
+    name: install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Install test in containers
+        run: sh .github/ci/install.sh
 
   # The published history is only snapshots, so gitleaks reads the files of the checkout
   # with the repository's own .gitleaks.toml (publish.mjs only pushes a tree whose file is a reviewed
