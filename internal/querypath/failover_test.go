@@ -8,7 +8,7 @@ package querypath_test
 // evaluator would decide is not here (Panel side): each test sends the push the
 // hub would have signed.
 //
-// Linux only, like the merge B end-to-end tests. Host ports 5500 to 5599.
+// Linux only, like the merge B end-to-end tests. Host ports 5400 to 5499 (not 5500 to 5599: internal/dns/listen binds there in the same go test run).
 
 import (
 	"context"
@@ -139,13 +139,13 @@ func twoTenantEntry(t *testing.T) ([][]byte, *policyv1.ConfigEntry) {
 func upNode(t *testing.T, idx int, o upOpts) *fnode {
 	t.Helper()
 	n := newNodeAt(t, idx)
-	n.portBase = 5520 + idx*12
+	n.portBase = 5420 + idx*12
 	if o.probes {
 		failingProbes(n)
 	}
 	port := o.unboundPort
 	if port == 0 {
-		port = 5500 + idx
+		port = 5400 + idx
 	}
 	ip := ipV1
 	fu := newFakeUnbound(t, "127.0.0.1", port, ip)
