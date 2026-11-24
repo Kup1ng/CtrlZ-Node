@@ -153,7 +153,22 @@ func (e *Env) Tables() TableState {
 // came up. The query path still judges (b), the hop guard, itself.
 func (e *Env) FreeOK() bool {
 	f := e.facts.Load()
-	return e.linkUp.Load() && f != nil && f.FreeOK()
+	return e.linkUp.Load() && f != nil && f.FreeOK() && e.servesApplied(f)
+}
+
+// servesApplied is the part of caught-up (SC 5.2a (c)) that the agent cannot judge:
+// the claims that tell a tenant's device from a stranger are those of the image dns
+// serves, and the agent's applied seq moves at the state commit, before the image
+// swap. A swap that failed, or an image dns could not open, leaves dns on an older
+// image while the facts say caught up, and a device whose claim is only in the newer
+// entry would be answered as a free stranger. Until the image catches up the free
+// path is refused (not_caught_up), the safe answer.
+func (e *Env) servesApplied(f *sock.Facts) bool {
+	if f.AppliedSeq == 0 {
+		return true // nothing applied, so no claim exists to be missing
+	}
+	im := e.image.Load()
+	return im != nil && im.Seq() >= f.AppliedSeq
 }
 
 // FreeGate is FreeOK in its two parts, for the counters of SC 5.2a, which name the
@@ -164,7 +179,7 @@ func (e *Env) FreeGate() (on, caughtUp bool) {
 	if !e.linkUp.Load() || f == nil {
 		return false, false
 	}
-	return f.FreeOn(), f.FreeCaughtUp()
+	return f.FreeOn(), f.FreeCaughtUp() && e.servesApplied(f)
 }
 
 // FreeQPS is the qps of the free_dns value in force, the node-wide budget, 0 when

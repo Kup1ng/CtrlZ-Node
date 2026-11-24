@@ -104,7 +104,7 @@ func TestLogApplyImageAndFreeFacts(t *testing.T) {
 	}
 	l.waitDNS("free path facts", func() bool {
 		f := l.lastDNS(sock.TypeFacts).Facts
-		return f.FreeOK() && f.FreeVersion == 2
+		return f.FreeOK() && f.FreeVersion == 2 && f.AppliedSeq == 1 // p4n-MD-r1-4: dns judges the image against this
 	})
 	tbl := l.lastDNS(sock.TypeTable)
 	if tbl == nil || len(tbl.Table.Member) == 0 {

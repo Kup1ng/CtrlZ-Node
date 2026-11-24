@@ -307,7 +307,7 @@ func (a *Agent) publishTableAndFacts() {
 	if seen {
 		off = a.hubOffset.Load()
 	}
-	f := &sock.Facts{ServerTimeSeen: fs.ServerTimeSeen, CaughtUpOnce: fs.CaughtUpOnce, LagOK: fs.LagOK, OffFloor: fs.OffFloor, HubOffset: off}
+	f := &sock.Facts{ServerTimeSeen: fs.ServerTimeSeen, CaughtUpOnce: fs.CaughtUpOnce, LagOK: fs.LagOK, OffFloor: fs.OffFloor, HubOffset: off, AppliedSeq: a.app.AppliedSeq()}
 	if v := a.freeValue.Load(); v != nil {
 		f.FreeSet, f.FreeEnabled, f.FreeQPS, f.FreeVersion = true, v.Enabled, v.Qps, v.Version
 	}

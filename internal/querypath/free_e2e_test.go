@@ -6,7 +6,8 @@ package querypath_test
 // the hub (shared proto) and two Unbound processes: the identified one and the free
 // one, on their own loopback ports, so the test can say which of them was asked.
 //
-// Linux only, like e2e_test.go. Host ports 5650 to 5699.
+// Linux only, like e2e_test.go. Host ports 5392 to 5394 for the node, the fake Unbounds take any free port: no
+// package of the module scans or binds those (p4n-MD-r1-2).
 
 import (
 	"context"
@@ -60,7 +61,7 @@ func (n *node) startFreeDNS(local, free string) {
 
 func allocFreePorts(t testing.TB) listen.Ports {
 	t.Helper()
-	return listen.Ports{DNS: 5660, TLS: 5661, HTTPS: 5662}
+	return listen.Ports{DNS: 5392, TLS: 5393, HTTPS: 5394}
 }
 
 func freeOffMsg(v uint64) *hubv1.HubMessage {
@@ -69,8 +70,8 @@ func freeOffMsg(v uint64) *hubv1.HubMessage {
 
 func TestFreeDNSThroughTheRealNode(t *testing.T) {
 	n := newNode(t)
-	idU := newFakeUnbound(t, "127.0.0.1", 5651, ipV1)
-	freeU := newFakeUnbound(t, "127.0.0.1", 5652, ipFree)
+	idU := newFakeUnbound(t, "127.0.0.1", 0, ipV1)
+	freeU := newFakeUnbound(t, "127.0.0.1", 0, ipFree)
 
 	d1, h1 := profile(t, blockedName)
 	ep1, cl1 := endpoint(1, h1)

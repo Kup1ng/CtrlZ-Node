@@ -656,3 +656,39 @@ func TestFreeGateSplitsTheFactsAndIsOffWhileTheLinkIsDown(t *testing.T) {
 		t.Fatal("a gate open with the agent gone")
 	}
 }
+
+// p4n-MD-r1-4: the agent's applied seq moves at the state commit, before the image
+// swap, and the swap or dns's open of the image can fail. The free gate must not
+// call dns caught up while the image it serves is older than the seq the facts were
+// judged at: a tenant's device whose claim is only in the newer entry would be
+// answered as a free stranger, unfiltered.
+func TestFreeGateWaitsForTheImageOfTheAppliedSeq(t *testing.T) {
+	root := t.TempDir()
+	imgs := filepath.Join(root, store.DirImage)
+	e := newEnv()
+	e.linkUp.Store(true)
+	facts := sock.Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: true, FreeSet: true, FreeEnabled: true, FreeQPS: 40, FreeVersion: 3, AppliedSeq: 2}
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if on, caught := e.FreeGate(); !on || caught || e.FreeOK() {
+		t.Fatalf("no image at applied seq 2: on %v caught up %v", on, caught)
+	}
+	e.apply(&sock.Msg{Type: sock.TypeImage, Image: &sock.Image{Name: buildImage(t, root, 1, 1)}}, imgs, func(string) {}, nil)
+	if _, caught := e.FreeGate(); caught || e.FreeOK() {
+		t.Fatal("an image of seq 1 serves applied seq 2")
+	}
+	// An image that does not open leaves the old one serving, and the gate shut.
+	e.apply(&sock.Msg{Type: sock.TypeImage, Image: &sock.Image{Name: "missing"}}, imgs, func(string) {}, nil)
+	if e.FreeOK() {
+		t.Fatal("an image that failed to open counted as caught up")
+	}
+	e.apply(&sock.Msg{Type: sock.TypeImage, Image: &sock.Image{Name: buildImage(t, root, 2, 1)}}, imgs, func(string) {}, nil)
+	if on, caught := e.FreeGate(); !on || !caught || !e.FreeOK() {
+		t.Fatalf("image of seq 2: on %v caught up %v", on, caught)
+	}
+	// An image from a lost state has a higher seq and passes.
+	facts.AppliedSeq = 1
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if !e.FreeOK() {
+		t.Fatal("an image above the applied seq must pass")
+	}
+}

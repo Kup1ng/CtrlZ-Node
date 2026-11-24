@@ -135,6 +135,13 @@ type Facts struct {
 	FreeEnabled    bool   `json:"fon"`
 	FreeQPS        uint32 `json:"fqps"`
 	FreeVersion    uint64 `json:"fver"`
+	// AppliedSeq is the applied seq the facts above were judged at. The agent commits
+	// it before the image swap, and the swap or dns's open of the image can fail, so
+	// dns serves from an image with a seq below it until the next one arrives. dns
+	// therefore counts the node as caught up only while the image it serves has at
+	// least this seq (SC 5.2a (c)); an image from a lost state has a higher seq and
+	// passes.
+	AppliedSeq uint64 `json:"applied,omitempty"`
 	// HubOffset is the seconds to add to the node's clock to get the hub's (8a.4
 	// Clock). Every expires_at the agent hands dns (revocations, ACME challenges) is
 	// in hub time, so dns must judge it with its own clock plus this, never with its

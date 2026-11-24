@@ -122,7 +122,7 @@ func TestMergeBTheWholeNodeAnswersThroughTheRealPath(t *testing.T) {
 		})
 	}
 
-	// 2. A Plain DNS source nobody claims is REFUSED (free DNS is a seam, off); an
+	// 2. A Plain DNS source nobody claims is REFUSED (no free_dns value is in force, so the free path is off); an
 	// unknown resolver id is refused at the handshake.
 	t.Run("unidentified", func(t *testing.T) {
 		r, err := c.tcp("127.0.0.9", q(allowedName, dns.TypeA))
