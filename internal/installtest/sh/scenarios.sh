@@ -594,7 +594,7 @@ sc_timesyncd() {
 
 	# The dpkg lock is held for a few seconds: apt waits for it, in the same run that
 	# removes timesyncd (a purge by hand did not wait, p4n-W5c-r5-3).
-	perl -e 'use Fcntl; open(F, ">>", "/var/lib/dpkg/lock-frontend") or die; fcntl(F, F_SETLK, pack("ssx4qqix4", F_WRLCK, 0, 0, 0, 0)) or die "lock: $!"; sleep 6' &
+	perl -e 'use Fcntl; open(F, ">>", "/var/lib/dpkg/lock-frontend") or die; my $l = pack("ssx4qqix4", F_WRLCK, 0, 0, 0, 0); fcntl(F, F_SETLK, $l) or die "lock: $!"; sleep 6' &
 	holder=$!
 	sleep 1
 	: >/var/log/stub/calls.log
