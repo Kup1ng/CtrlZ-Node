@@ -290,7 +290,6 @@ func TestFreeJoinWaitsForTheImageOfTheAppliedSeq(t *testing.T) {
 // the new route; a config whose only upstream points at this node leaves the free
 // path with no Router (the looping upstream is left out), and the segment is purged
 // again.
-// the new route; an upstream-only config with no upstream leaves no free path.
 func TestFreeJoinSwapsItsRouterAndPurgesOnAConfigChange(t *testing.T) {
 	local := newFakeUnbound(t, "127.0.0.1", 0, ipV1)
 	free := newFakeUnbound(t, "127.0.0.1", 0, ipFree)
