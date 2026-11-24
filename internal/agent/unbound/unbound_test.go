@@ -379,6 +379,9 @@ func TestSupervisorRestartsDeadUnitAndAlerts(t *testing.T) {
 	_ = s.Start(ctx, Free, nil)
 	dead := true
 	r.Reply = func(c fake.Call) ([]byte, error) {
+		if c.Name == "unbound" { // a dead unit is judged on the binary on disk (p4n-MC-r3-3)
+			return []byte("Version 1.24.0\n"), nil
+		}
 		if c.Name == "systemctl" && c.Args[0] == "is-active" && c.Args[1] == UnitFree && dead {
 			return []byte("failed\n"), errors.New("exit 3")
 		}
@@ -508,6 +511,9 @@ func TestDeadUnitIsNotRestartedWhileAStartCheckFails(t *testing.T) {
 	gate := errors.New("core dumps are not ruled out")
 	s.cfg.Gate = func() error { return gate }
 	r.Reply = func(c fake.Call) ([]byte, error) {
+		if c.Name == "unbound" {
+			return []byte("Version 1.24.0\n"), nil
+		}
 		if c.Name == "systemctl" && c.Args[0] == "is-active" {
 			return []byte("failed\n"), errors.New("exit 3")
 		}
@@ -1038,4 +1044,111 @@ func TestAStaleRestartHoldsTheNewBinaryToTheFloor(t *testing.T) {
 			t.Errorf("the reported version is %q after a restart onto 1.24.0", s.RunningVersion())
 		}
 	})
+}
+
+// p4n-MC-r3-3: a unit that dies after a package change but before the next stale pass is
+// judged on the binary now on disk, not on the version cached at the start; a binary
+// whose version cannot be read does not pass the floor by being unknown.
+func TestADeadUnitIsHeldToTheFloorOfTheBinaryOnDisk(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, now string
+		fail      bool
+	}{
+		{"the package went below the floor", "1.18.0", false},
+		{"unbound -V cannot be read", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			version, fail := "1.24.0", false
+			s, r, _, al := newSup(t, version, "32768 39999")
+			dead := false
+			r.Reply = func(c fake.Call) ([]byte, error) {
+				switch {
+				case c.Name == "unbound":
+					if fail {
+						return nil, errors.New("error while loading shared libraries")
+					}
+					return []byte("Version " + version + "\n"), nil
+				case c.Name == "systemctl" && c.Args[0] == "is-active":
+					if dead {
+						return []byte("failed\n"), errors.New("exit 3")
+					}
+					return []byte("active\n"), nil
+				}
+				return nil, nil
+			}
+			if err := s.Start(ctx, Identified, nil); err != nil {
+				t.Fatal(err)
+			}
+			// the package is replaced, then the unit dies within the same pass
+			if tc.fail {
+				fail = true
+			} else {
+				version = tc.now
+			}
+			dead = true
+			s.Check(ctx)
+			if strings.Contains(strings.Join(r.Lines(), "\n"), "systemctl restart") {
+				t.Fatalf("a unit was started on a binary that does not pass the floor: %v", r.Lines())
+			}
+			if al.Count(alert.UnboundRefused) == 0 {
+				t.Error("no refusal alert")
+			}
+			// the binary is good again: the next pass brings the unit back and reports its version
+			fail, version = false, "1.24.0"
+			s.Check(ctx)
+			if !strings.Contains(strings.Join(r.Lines(), "\n"), "systemctl restart ctrlz-unbound.service") {
+				t.Error("not restarted once the binary passes")
+			}
+		})
+	}
+}
+
+// p4n-MC-r3-3: a stale check whose version read failed is made again on the next pass,
+// not after ten minutes.
+func TestAFailedStaleCheckIsRepeatedOnTheNextPass(t *testing.T) {
+	boot := time.Unix(1_700_000_000, 0)
+	started := boot.Add(1000 * time.Second)
+	fail := false
+	units := &fake.Units{}
+	r := &fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
+		if c.Name == "systemctl" && len(c.Args) > 1 && c.Args[0] == "show" {
+			return []byte("4242\n"), nil
+		}
+		if out, err, ok := units.Handle(c); ok {
+			return out, err
+		}
+		switch c.Name {
+		case "unbound":
+			if fail {
+				return nil, errors.New("error while loading shared libraries")
+			}
+			return []byte("Version 1.19.2\n"), nil
+		case "dpkg-query":
+			return []byte(DistroFloor), nil
+		}
+		return nil, nil
+	}}
+	f := fake.NewFiles(map[string]string{EphemeralPath: "32768 39999\n"})
+	f.M["/proc/4242/stat"] = []byte("4242 (unbound) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 100000 1000 1000 18446744073709551615\n")
+	f.M["/proc/stat"] = []byte("cpu  1 2 3\nbtime 1700000000\n")
+	al := &alert.Memory{}
+	s := New(Config{Runner: r, Files: f, Alert: al, ConfDir: "/etc/ctrlz/unbound",
+		Identified: DefaultParams(Identified), Free: DefaultParams(Free),
+		Now:        func() time.Time { return started.Add(time.Hour) },
+		ChangeTime: func(string) (time.Time, error) { return started.Add(10 * time.Minute), nil }})
+	ctx := context.Background()
+	if err := s.Start(ctx, Identified, nil); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	s.Check(ctx)
+	if strings.Contains(strings.Join(r.Lines(), "\n"), "systemctl restart") {
+		t.Fatal("restarted on a binary that could not be read")
+	}
+	fail = false
+	s.Check(ctx) // no ten-minute wait: the clock has not moved
+	if !strings.Contains(strings.Join(r.Lines(), "\n"), "systemctl restart ctrlz-unbound.service") {
+		t.Error("the stale check was not repeated on the next pass")
+	}
 }

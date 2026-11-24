@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
@@ -159,24 +160,43 @@ func (a *Agent) markDNSRestartOwed() {
 }
 
 func (a *Agent) hostChecks(ctx context.Context) {
-	if a.cfg.SkipHostChecks {
+	runHostChecks(ctx, a.cfg, a.al, a.nodeAddrs())
+}
+
+// runHostChecks is the periodic host checks of 7.3 for the inputs they are made of, so
+// that the node which has no identity yet (serve_pending.go) runs the same ones.
+func runHostChecks(ctx context.Context, cfg Config, al alert.Alerter, nodeAddrs []netip.Addr) {
+	if cfg.SkipHostChecks {
 		return
 	}
-	hostcheck.Alerts(a.al, hostcheck.CoreDumps(a.cfg.Files))
-	hostcheck.Alerts(a.al, hostcheck.HostResolver(a.cfg.Files, a.nodeAddrs()))
-	want := a.cfg.ConntrackMax
+	hostcheck.Alerts(al, hostcheck.CoreDumps(cfg.Files))
+	hostcheck.Alerts(al, hostcheck.HostResolver(cfg.Files, nodeAddrs))
+	want := cfg.ConntrackMax
 	if want == 0 {
 		want = hostcheck.DefaultConntrackMax
 	}
-	hostcheck.Alerts(a.al, hostcheck.EnsureConntrack(ctx, a.cfg.Files, a.cfg.Runner, want))
+	hostcheck.Alerts(al, hostcheck.EnsureConntrack(ctx, cfg.Files, cfg.Runner, want))
 }
 
 // applyNft applies the agent's table when DNS_IP or the panel addresses changed.
 func (a *Agent) applyNft(ctx context.Context) {
-	p := nft.Params{DNSIP: a.dnsIP(), PanelAddrs: a.cfg.Conf.Panel(), FreePortLo: unbound.FreePortLo, FreePortHi: unbound.FreePortHi}
+	a.nftTable.apply(ctx, a.cfg, a.al, a.dnsIP())
+}
+
+// nftApplier applies the agent's nftables table and remembers the text it applied. The
+// agent owns one, and so does the start before the agent exists (serve_pending.go): a
+// reboot drops the kernel's table, and the notrack rules of SC 5.2a must be back before
+// the first spoofed packet, identity or not.
+type nftApplier struct {
+	mu   sync.Mutex
+	last string // the nftables script last applied
+}
+
+func (n *nftApplier) apply(ctx context.Context, cfg Config, al alert.Alerter, dnsIP netip.Addr) {
+	p := nft.Params{DNSIP: dnsIP, PanelAddrs: cfg.Conf.Panel(), FreePortLo: unbound.FreePortLo, FreePortHi: unbound.FreePortHi}
 	if len(p.PanelAddrs) == 0 {
 		// The hub is a name: resolve it once, here, because nftables needs addresses.
-		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", a.cfg.Conf.HubHost()); err == nil {
+		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", cfg.Conf.HubHost()); err == nil {
 			for _, ip := range ips {
 				p.PanelAddrs = append(p.PanelAddrs, ip.Unmap())
 			}
@@ -184,22 +204,22 @@ func (a *Agent) applyNft(ctx context.Context) {
 	}
 	text, err := nft.Render(p)
 	if err != nil {
-		a.al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the nftables table could not be rendered"})
+		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the nftables table could not be rendered"})
 		return
 	}
-	a.mu.Lock()
-	same := a.lastNft == text
-	a.mu.Unlock()
+	n.mu.Lock()
+	same := n.last == text
+	n.mu.Unlock()
 	if same {
 		return
 	}
-	if err := nft.Apply(ctx, a.cfg.Runner, p); err != nil {
-		a.al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "nft refused the table"})
+	if err := nft.Apply(ctx, cfg.Runner, p); err != nil {
+		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "nft refused the table"})
 		return
 	}
-	a.mu.Lock()
-	a.lastNft = text
-	a.mu.Unlock()
+	n.mu.Lock()
+	n.last = text
+	n.mu.Unlock()
 }
 
 func (a *Agent) updateChrony(ctx context.Context) {

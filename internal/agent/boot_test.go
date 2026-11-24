@@ -380,6 +380,24 @@ func TestBootRefusesTheLabRootInAReleaseBuild(t *testing.T) {
 	}
 }
 
+// lockedBuffer is a console a test may read while boot still writes to it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 // sleeps records the waits boot asks for and makes them instant.
 type sleeps struct {
 	mu sync.Mutex
@@ -476,6 +494,8 @@ func TestBootHoldsADeadEnrolmentBeforeItExits(t *testing.T) {
 	rig.env.TuneEnroll = func(c *enroll.Config) {
 		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
 	}
+	// Nothing to supervise, so the process ends (a node with the units supervised stays up).
+	rig.env.Tune = func(c *Config) { c.NoSystem, c.SkipHostChecks = true, true }
 	err := boot(context.Background(), rig.env)
 	if !errors.Is(err, enroll.ErrNoToken) {
 		t.Fatalf("boot with no token: %v", err)
@@ -539,5 +559,54 @@ func TestBootStartsUnboundBeforeTheEnrolmentIsApproved(t *testing.T) {
 	eh.approve.Store(true)
 	if _, err := hub.NextSession(10 * time.Second); err != nil {
 		t.Fatalf("no Control stream after approval: %v", err)
+	}
+}
+
+// p4n-MC-r3-4: a dead enrolment on a node that supervises its Unbounds does not end the
+// process. Ending it would have systemd start it every minute, and every start takes the
+// units over with a reload that drops the requests in flight.
+func TestBootKeepsTheResolversWhenTheEnrolmentIsDead(t *testing.T) {
+	eh := newEnrollHub(t)
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	if err := os.Remove(filepath.Join(rig.keys, enroll.TokenFile)); err != nil {
+		t.Fatal(err)
+	}
+	runner, files := unboundHost()
+	sl := &sleeps{}
+	console := &lockedBuffer{}
+	rig.env.Out = console
+	rig.env.Sleep = sl.sleep
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	rig.env.Tune = func(c *Config) {
+		c.Runner, c.Files = runner, files
+		c.SkipHostChecks = true
+		c.UnboundEvery = 10 * time.Millisecond
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- boot(ctx, rig.env) }()
+	t.Cleanup(func() { cancel(); <-done })
+	for end := time.Now().Add(10 * time.Second); !strings.Contains(console.String(), "the enrolment is over"); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("no word of the dead enrolment on the console: %q", console.String())
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("boot returned (%v) with the resolvers under its supervision", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if len(sl.all()) != 0 {
+		t.Errorf("waits %v: the dead enrolment is not held a minute and then ended", sl.all())
+	}
+	if !strings.Contains(strings.Join(runner.Lines(), "\n"), "systemctl start ctrlz-unbound.service") {
+		t.Error("the units were not started")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Errorf("boot ended with %v, want the cancellation", err)
 	}
 }

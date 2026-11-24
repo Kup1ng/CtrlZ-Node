@@ -3,6 +3,7 @@ package unbound
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"path"
@@ -355,7 +356,12 @@ func (s *Supervisor) guard(k Kind) error {
 	s.mu.Lock()
 	v, patched := s.version, s.patched
 	s.mu.Unlock()
-	if v != "" && !(patched && v == DistroBase) {
+	if v == "" {
+		// An unknown version is not a passed floor: recheckBinary empties it when
+		// unbound -V cannot be read, and the unit must stay down until it can.
+		return errors.New("unbound: the version of the binary is unknown")
+	}
+	if !(patched && v == DistroBase) {
 		if err := CheckVersion(v); err != nil {
 			return err
 		}
@@ -431,13 +437,24 @@ func (s *Supervisor) Check(ctx context.Context) {
 			continue
 		}
 		s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundDown, Detail: k.String()})
-		if err := s.guard(k); err != nil {
+		// The binary on disk may not be the one that was judged at the start: a package
+		// change can have replaced it since, and a unit that dies in that window would be
+		// brought back on a build below the floor. Ask the binary again before it runs.
+		v, err := s.recheckBinary(ctx)
+		if err == nil {
+			err = s.guard(k)
+		}
+		if err != nil {
 			// The same refusals as at the start: it stays down, and is looked at again on
 			// the next pass, so it comes back when the host is right again.
 			s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundRefused, Detail: k.String() + ": not restarted, a start check fails"})
 			continue
 		}
-		_, _ = s.cfg.Runner.Run(ctx, nil, "systemctl", "restart", s.unit(k))
+		if _, err := s.cfg.Runner.Run(ctx, nil, "systemctl", "restart", s.unit(k)); err == nil {
+			s.mu.Lock()
+			s.ran = v
+			s.mu.Unlock()
+		}
 	}
 	for _, k := range kinds {
 		if k == Identified {

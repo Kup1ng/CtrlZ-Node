@@ -56,9 +56,6 @@ func (s *Supervisor) restartIfStale(ctx context.Context, k Kind) {
 	if !newest.After(start.Add(staleSlack)) {
 		return
 	}
-	s.mu.Lock()
-	s.lastStale[k] = now
-	s.mu.Unlock()
 	// The files on disk are new, so what the floor was judged on at the start (and
 	// cached) says nothing about them: ask the binary again before it is run. A
 	// package rolled back below the floor must leave the old, patched process alone
@@ -69,8 +66,14 @@ func (s *Supervisor) restartIfStale(ctx context.Context, k Kind) {
 	}
 	if err != nil {
 		s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundRefused, Detail: k.String() + ": not restarted onto replaced files, a start check fails"})
+		// No lastStale here: a check that failed (unbound -V that cannot load while a
+		// library is half replaced) must be made again on the next pass, not wait ten
+		// minutes with the old process answering (p4n-MC-r3-3).
 		return
 	}
+	s.mu.Lock()
+	s.lastStale[k] = now
+	s.mu.Unlock()
 	s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundStale, Detail: k.String()})
 	if _, err := s.cfg.Runner.Run(ctx, nil, "systemctl", "restart", s.unit(k)); err == nil {
 		s.mu.Lock()

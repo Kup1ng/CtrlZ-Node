@@ -107,7 +107,7 @@ func boot(ctx context.Context, env bootEnv) error {
 		// resolves meanwhile (7.1, 7.2).
 		stop := servePending(ctx, cfg, ac)
 		defer stop()
-		id, err = ensureIdentity(ctx, env, ac, keys)
+		id, err = ensureIdentity(ctx, env, ac, keys, pendingServes(cfg))
 		stop() // the agent's own system loop takes the units over from here
 		if err != nil {
 			return err
@@ -129,13 +129,13 @@ func boot(ctx context.Context, env bootEnv) error {
 // has approved, loads what the enrolment wrote. Anything else that is wrong with the
 // files (a broken certificate, a missing CA) is not a reason to enrol again, and
 // LoadIdentity reports it as it always has.
-func ensureIdentity(ctx context.Context, env bootEnv, ac conf.Agent, keys string) (*hubconn.Identity, error) {
+func ensureIdentity(ctx context.Context, env bootEnv, ac conf.Agent, keys string, serving bool) (*hubconn.Identity, error) {
 	have, err := haveIdentity(keys)
 	if err != nil {
 		return nil, err
 	}
 	if !have {
-		if err := enrolNode(ctx, env, ac, keys); err != nil {
+		if err := enrolNode(ctx, env, ac, keys, serving); err != nil {
 			return nil, err
 		}
 	}
@@ -154,7 +154,7 @@ func haveIdentity(keys string) (bool, error) {
 	return true, nil
 }
 
-func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string) error {
+func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string, serving bool) error {
 	pinTxt, err := os.ReadFile(filepath.Join(keys, hubconn.HubPinFile))
 	if err != nil {
 		return fmt.Errorf("agent: enrolment: %s: %w", hubconn.HubPinFile, err)
@@ -218,13 +218,25 @@ func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string) err
 			return err2
 		}
 	}
-	// A dead enrolment (no token, rejected, expired, a bad certificate) ends the process,
-	// and systemd starts it again two seconds later with the same outcome. Hold a minute
-	// first, so the journal carries one line a minute and not thirty, and the admin has
-	// the time to run the install command again (which stops this unit and wakes it).
-	if ctx.Err() == nil {
-		_ = sleep(ctx, deadEnrolmentHold)
+	if ctx.Err() != nil {
+		return err2
 	}
+	if serving {
+		// A dead enrolment (no token, rejected, expired, a bad certificate) cannot mend
+		// itself. Ending the process here would have systemd start it again every minute,
+		// and each new process takes the two Unbounds over with a reload that drops the
+		// requests in flight and forgets the supervisor's own restart limits, for as long
+		// as the admin leaves the node (p4n-MC-r3-4). The resolvers keep being supervised
+		// instead, and the install command run again stops this unit and starts it afresh.
+		fmt.Fprintf(out, "ctrlz-enroll: %v; the enrolment is over, run the install command again; the resolvers keep running\n", err2)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	// With nothing to supervise the process ends, and systemd starts it again two seconds
+	// later with the same outcome. Hold a minute first, so the journal carries one line a
+	// minute and not thirty, and the admin has the time to run the install command again
+	// (which stops this unit and wakes it).
+	_ = sleep(ctx, deadEnrolmentHold)
 	return err2
 }
 

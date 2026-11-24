@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,6 +71,76 @@ func TestServePendingStartsBothUnboundsWithoutAnIdentity(t *testing.T) {
 	for _, c := range r.Calls() {
 		if c.Name == "systemctl" && len(c.Args) > 0 && c.Args[0] == "stop" {
 			t.Errorf("the units were stopped when the supervision ended: %v", c)
+		}
+	}
+}
+
+// p4n-MC-r3-1 and p4n-MC-r3-2: the clean-up of temporary files that opening the store makes
+// is finished before servePending returns, so it can never take a file the enrolment is
+// writing (the enrolment makes ".tmp-enroll-*" in keys/ and renames it).
+func TestServePendingCleansTheStoreBeforeItReturns(t *testing.T) {
+	r, files := unboundHost()
+	root := filepath.Join(t.TempDir(), "ctrlz")
+	keys := filepath.Join(root, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(keys, ".tmp-enroll-old")
+	if err := os.WriteFile(old, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Root: root, ConfPath: filepath.Join(t.TempDir(), "agent.conf"), Runner: r, Files: files,
+		Alert: &alert.Memory{}, SkipHostChecks: true, UnboundEvery: 5 * time.Millisecond}
+	stop := servePending(context.Background(), cfg, conf.Agent{Hub: "hub.test"})
+	defer stop()
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("the clean-up had not run when servePending returned: %v", err)
+	}
+	// what the enrolment writes from here on is never touched, however long the supervision runs
+	live := filepath.Join(keys, ".tmp-enroll-live")
+	if err := os.WriteFile(live, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for end := time.Now().Add(10 * time.Second); !strings.Contains(strings.Join(r.Lines(), "\n"), "systemctl start ctrlz-unbound-free.service"); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("units not started: %v", r.Lines())
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	stop()
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("a temporary file of the enrolment was removed: %v", err)
+	}
+}
+
+// p4n-MC-r3-5: the nftables table (notrack, the NTP restriction) and the host checks do
+// not wait for an identity: after a reboot they are what stands between the open port 53
+// and a spoofed flood.
+func TestServePendingAppliesTheNftTableAndRunsTheHostChecks(t *testing.T) {
+	r, files := unboundHost()
+	al := &alert.Memory{}
+	cfg := Config{Root: filepath.Join(t.TempDir(), "ctrlz"), ConfPath: filepath.Join(t.TempDir(), "agent.conf"),
+		Runner: r, Files: files, Alert: al, UnboundEvery: 10 * time.Millisecond}
+	ac := conf.Agent{Hub: "hub.test", DNSBindIP: netip.MustParseAddr("1.2.3.4"), PanelAddrs: []netip.Addr{netip.MustParseAddr("198.51.100.20")}}
+	stop := servePending(context.Background(), cfg, ac)
+	defer stop()
+	for end := time.Now().Add(10 * time.Second); al.Count(alert.CorePattern) == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("the host checks did not run; alerts %v", al.Codes())
+		}
+	}
+	for end := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var script string
+		for _, c := range r.Calls() {
+			if c.Name == "nft" && len(c.Args) == 2 && c.Args[0] == "-f" {
+				script = string(c.Stdin)
+			}
+		}
+		if strings.Contains(script, "ip daddr 1.2.3.4 udp dport 53 notrack") {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatalf("the nftables table was not applied: %v", r.Lines())
 		}
 	}
 }

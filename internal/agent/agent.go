@@ -192,9 +192,9 @@ type Agent struct {
 	pubMu  sync.Mutex
 	headOK bool // GetHead has been learned this run
 	// vhead and plan belong to the log worker alone (chain.go).
-	vhead   signedHead
-	plan    *chainPlan
-	lastNft string // the nftables script last applied
+	vhead    signedHead
+	plan     *chainPlan
+	nftTable nftApplier // the nftables table and the script last applied
 	// drainSince is the Unix second the drain started, 0 when not draining.
 	drainSince int64
 	sysWakeCh  chan struct{}
