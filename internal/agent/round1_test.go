@@ -408,7 +408,6 @@ func TestRevocationsOfOneSeqAndDifferentKindsAreAllKept(t *testing.T) {
 func TestRevocationEndsWhenItsEntryIsApplied(t *testing.T) {
 	l := newLab(t)
 	b := storetest.Blob(t, "a.example.com")
-	l.addEntry([][]byte{b}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(1, b)}, PairTable: storetest.Table(3, 0)})
 	l.start()
 	l.attachDNS()
 	s := l.session()
@@ -418,6 +417,11 @@ func TestRevocationEndsWhenItsEntryIsApplied(t *testing.T) {
 		m := l.lastDNS(sock.TypeRevocations)
 		return m != nil && len(m.Revocations.Items) == 1 && m.Revocations.Items[0].ExpiresAt > time.Now().Unix()
 	})
+	// Entry 1 reaches the hub only now. The agent learns the head by itself at its start
+	// and applies what it finds, so an entry there from the beginning could be applied and
+	// confirmed by dns before the revocation arrived, and a revocation of an entry already
+	// applied is rightly not kept (the wait above would time out).
+	l.addEntry([][]byte{b}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(1, b)}, PairTable: storetest.Table(3, 0)})
 	// entry 1 is applied: the revocation of entry 1 is over, whatever its expiry
 	_ = s.Send(headNotice(1))
 	eventually(t, "entry 1 applied", func() bool { return lastHB(s).AppliedSeq == 1 })

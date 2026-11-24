@@ -1,10 +1,8 @@
-//go:build ignore
-
 // Command gen writes the lab test root: internal/labroot/testdata (the root and
 // the key seeds) and internal/labroot/denylist.go (the key ids the production
 // binaries refuse). Run it from the repository root:
 //
-//	go run internal/labroot/gen/main.go
+//	go run ./internal/labroot/gen
 //
 // The seeds are derived from fixed labels, so the output is the same every time
 // and the files are public on purpose: this root signs lab and CI bundles only,

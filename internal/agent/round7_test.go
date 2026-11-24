@@ -126,6 +126,15 @@ func TestActivityStampedInHubTimeKeepsItsBucketOnASkewedNode(t *testing.T) {
 	_ = s.Send(serverTime())
 	_ = s.Send(headNotice(1))
 	eventually(t, "entry 1", func() bool { return lastHB(s).AppliedSeq == 1 })
+	// The agent learns the head by itself at its start, so entry 1 can be applied and
+	// reported before the ServerTime above has been read: AppliedSeq says nothing of the
+	// offset. The offset reaching dns in the facts is what says the agent holds it. An
+	// item read earlier is checked against the node clock, which is 10 minutes behind
+	// what dns stamped, and is given the node's time instead.
+	l.waitDNS("the offset", func() bool {
+		f := l.lastDNS(sock.TypeFacts)
+		return f != nil && f.Facts.HubOffset != 0
+	})
 	hub := time.Now().Unix()
 	l.dnsCl.Send(&sock.Msg{Type: sock.TypeActivity, Activity: &sock.Activity{Items: []sock.ActivityItem{{Endpoint: ep.EndpointId, Label: "default", Proto: int32(commonv1.Protocol_PROTOCOL_DOH), At: hub}}}})
 	time.Sleep(100 * time.Millisecond)
