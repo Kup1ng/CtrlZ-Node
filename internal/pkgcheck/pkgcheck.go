@@ -604,17 +604,29 @@ func checkHost(coredump, sysctl, chrony string, bad func(string, ...any)) {
 	if !strings.Contains(sysctl, "nf_conntrack_max") {
 		bad("sysctl: nf_conntrack_max is not set")
 	}
-	hasConfdir := false
+	// chronyd parses chrony.conf as root and the agent writes into the sourcedir, so
+	// everything that is not a source line must be fixed here (R16) and the agent's
+	// directory must be read as a sourcedir, never as a confdir or an include.
+	hasSourcedir, hasUser, hasNoSys, hasCerts := false, false, false, false
 	for _, f := range lines(chrony) {
 		switch f[0] {
-		case "confdir":
-			hasConfdir = len(f) == 2 && f[1] == "/etc/ctrlz/chrony"
-		case "pool", "server", "peer", "sourcedir", "allow", "include", "refclock":
-			bad("chrony.conf holds %q; the panel is the only source and the agent writes it", f[0])
+		case "sourcedir":
+			hasSourcedir = len(f) == 2 && f[1] == "/etc/ctrlz/chrony"
+		case "user":
+			hasUser = len(f) == 2 && f[1] == "_chrony"
+		case "nosystemcert":
+			hasNoSys = len(f) == 1
+		case "ntstrustedcerts":
+			hasCerts = len(f) == 2 && f[1] == "/etc/ctrlz/chrony/node_ca.pem"
+		case "confdir", "include", "pool", "server", "peer", "allow", "refclock":
+			bad("chrony.conf holds %q; the panel is the only source and the agent writes it as a sourcedir file", f[0])
 		}
 	}
-	if !hasConfdir {
-		bad("chrony.conf must say confdir /etc/ctrlz/chrony")
+	if !hasSourcedir {
+		bad("chrony.conf must say sourcedir /etc/ctrlz/chrony")
+	}
+	if !hasUser || !hasNoSys || !hasCerts {
+		bad("chrony.conf must fix user _chrony, nosystemcert and ntstrustedcerts /etc/ctrlz/chrony/node_ca.pem itself, not leave them to the agent's directory")
 	}
 }
 

@@ -182,3 +182,50 @@ func TestInstallWritesWhatTheCodeReads(t *testing.T) {
 		t.Errorf("upgrade stages in %s", got)
 	}
 }
+
+// p4n-MC-r1-3 and r1-8: the units the agent restarts are named by constants in the code
+// and by a list in the polkit rule. A rename on one side leaves polkit answering NO on a
+// real host, where the agent could never restart dns or start an Unbound. The set of
+// the constants must be the polkit list, and the node's own units must have a unit file.
+func TestTheUnitsTheAgentManagesAreTheOnesPolkitAllows(t *testing.T) {
+	code := []string{agent.DNSUnit, unbound.UnitIdentified, unbound.UnitFree, chrony.Unit}
+	if !sameSet(code, pkgcheck.AgentUnits) {
+		t.Errorf("the agent manages %v, pkgcheck.AgentUnits (the polkit list) is %v", code, pkgcheck.AgentUnits)
+	}
+	rule := read(t, "polkit", "50-ctrlz-agent.rules")
+	for _, u := range code {
+		if !strings.Contains(rule, `"`+u+`"`) {
+			t.Errorf("the polkit rule does not name %s", u)
+		}
+		// chrony.service is the distribution's; the others are ours.
+		if u == chrony.Unit {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(pk, "systemd", u)); err != nil {
+			t.Errorf("no unit file packaging/systemd/%s", u)
+		}
+	}
+}
+
+// p4n-MC-r1-2: chronyd parses chrony.conf as root and the agent writes the directory it
+// reads sources from. The directory and the file name the code writes must be what the
+// fixed chrony.conf reads.
+func TestChronyReadsWhatTheAgentWrites(t *testing.T) {
+	conf := read(t, "chrony", "chrony.conf")
+	if !regexp.MustCompile(`(?m)^sourcedir ` + regexp.QuoteMeta(chrony.Dir) + `$`).MatchString(conf) {
+		t.Errorf("chrony.conf does not read sources from %s", chrony.Dir)
+	}
+	if !regexp.MustCompile(`(?m)^ntstrustedcerts ` + regexp.QuoteMeta(path.Join(chrony.Dir, chrony.CAName)) + `$`).MatchString(conf) {
+		t.Errorf("chrony.conf does not trust the CA file %s", chrony.CAName)
+	}
+	if !strings.HasSuffix(chrony.ConfName, ".sources") {
+		t.Errorf("chronyd reads only *.sources from a sourcedir, the agent writes %s", chrony.ConfName)
+	}
+}
+
+func sameSet(a, b []string) bool {
+	x, y := slices.Clone(a), slices.Clone(b)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
+}

@@ -227,6 +227,20 @@ check_token_only_in_keys() {
 
 # --- scenarios ------------------------------------------------------------------------
 
+# check_unbound_conf_reset: the files the agent rendered for the Unbound units are gone
+# and the units were stopped before the agent was restarted, so the agent renders them
+# afresh from its own binary and agent.conf (p4n-MC-r1-6). Every other file of the
+# directory stays.
+check_unbound_conf_reset() {
+	for f in identified.conf free.conf; do
+		[ ! -e "/etc/ctrlz/unbound/$f" ] || fail "$1: /etc/ctrlz/unbound/$f was kept; the agent would refuse it as a changed pinned setting"
+	done
+	[ -e /etc/ctrlz/unbound/keep.me ] || fail "$1: a file that is not a rendered config was removed"
+	s=$(grep -n '^systemctl stop ctrlz-unbound.service ctrlz-unbound-free.service' /var/log/stub/calls.log | head -1 | cut -d: -f1)
+	a=$(grep -n '^systemctl restart ctrlz-agent' /var/log/stub/calls.log | head -1 | cut -d: -f1)
+	[ -n "$s" ] && [ -n "$a" ] && [ "$s" -lt "$a" ] || fail "$1: the Unbound units were not stopped before the agent was restarted"
+}
+
 sc_happy() {
 	setup_host
 	mkhub 3
@@ -258,6 +272,11 @@ sc_happy() {
 	: >/var/log/stub/apt.log
 	: >/var/log/stub/calls.log
 	rm -f /var/log/stub/fetch.log
+	# An earlier run's rendered configs: a new --free-outgoing-ip or template must not
+	# leave them behind for the agent to refuse (p4n-MC-r1-6).
+	printf 'old\n' >/etc/ctrlz/unbound/identified.conf
+	printf 'old\n' >/etc/ctrlz/unbound/free.conf
+	printf 'x\n' >/etc/ctrlz/unbound/keep.me
 	run_install >/tmp/out2 2>&1 || {
 		cat /tmp/out2
 		fail 'second install exited non-zero'
@@ -265,6 +284,7 @@ sc_happy() {
 	no_leak 'second install'
 	# The repair replaced the identity files and the binary, so the running units must be restarted.
 	grep -qE "^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service" /var/log/stub/calls.log || fail "a repeat install did not restart the units"
+	check_unbound_conf_reset 'a repeat install'
 	check_layout
 	check_agent_files
 	echo "PASS $SCEN"
@@ -477,6 +497,11 @@ sc_upgrade() {
 	mkdir -p /var/lib/ctrlz/bundles/node
 	cp -r /hub/install/bundle/4 /var/lib/ctrlz/bundles/node/4
 	chown -R ctrlz-agent:ctrlz /var/lib/ctrlz/bundles
+	# An earlier run's rendered configs: a new --free-outgoing-ip or template must not
+	# leave them behind for the agent to refuse (p4n-MC-r1-6).
+	printf 'old\n' >/etc/ctrlz/unbound/identified.conf
+	printf 'old\n' >/etc/ctrlz/unbound/free.conf
+	printf 'x\n' >/etc/ctrlz/unbound/keep.me
 	before=$(cat /usr/local/bin/ctrlz-node)
 	: >/var/log/stub/calls.log
 	: >/var/log/stub/apt.log
@@ -488,6 +513,7 @@ sc_upgrade() {
 	[ "$after" != "$before" ] || fail 'the binary did not change'
 	eq "$(cat /etc/ctrlz/versions/node)" 4 'version after the upgrade'
 	grep -qE '^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' /var/log/stub/calls.log || fail 'units not restarted'
+	check_unbound_conf_reset 'an upgrade'
 	eq "$(dpkg-query -W -f='${Version}' unbound)" 1.20.0-1 'unbound after the upgrade'
 	check_layout
 	# The agent's keys and the host's identity are untouched by an upgrade.
@@ -1031,7 +1057,7 @@ sc_apt_partial() {
 	if run_install >/tmp/out 2>&1; then fail 'the install passed with a failing apt'; fi
 	eq "$(dpkg-query -W -f='${db:Status-Status}' unbound 2>/dev/null)" installed 'unbound after the failed run'
 	grep -q '^systemctl unmask' /var/log/stub/calls.log && fail 'a mask of the distribution Unbound was removed while the package is installed'
-	grep -q '^confdir /etc/ctrlz/chrony' /etc/chrony/chrony.conf || fail 'the node chrony.conf was replaced by the host file while chrony is installed'
+	grep -q '^sourcedir /etc/ctrlz/chrony' /etc/chrony/chrony.conf || fail 'the node chrony.conf was replaced by the host file while chrony is installed'
 	eq "$(cat /etc/chrony/chrony.conf.ctrlz-orig)" 'pool ntp.example.invalid iburst' 'the host chrony.conf kept as ctrlz-orig'
 	[ ! -e /usr/sbin/policy-rc.d ] || fail 'policy-rc.d was left behind'
 	grep -qE '^systemctl (start|restart|enable) ctrlz' /var/log/stub/calls.log && fail 'a unit was started'

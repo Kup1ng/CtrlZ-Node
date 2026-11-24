@@ -46,6 +46,12 @@ type Config struct {
 	// systemctl, the Gate) the next try is made, default one minute. The reason is
 	// usually the host's, and the host gets fixed while the agent runs.
 	StartRetry time.Duration
+	// Watch lists the files whose change after a process started means it runs old code
+	// (default BinaryPath and DpkgStatus). ChangeTime gives a file's change time (default:
+	// the later of mtime and ctime) and Now the clock; both are for tests.
+	Watch      []string
+	ChangeTime func(path string) (time.Time, error)
+	Now        func() time.Time
 }
 
 // Supervisor starts and watches the two processes through systemd.
@@ -65,10 +71,12 @@ type Supervisor struct {
 	reloaded map[Kind][]netip.Prefix
 	// stale marks a process that was already running when Start wrote its file: it has
 	// not been told to read it, whatever reloaded says.
-	stale   map[Kind]bool
-	version string
-	patched bool // the distribution build of DistroBase with the backports
-	unwant  int64
+	stale map[Kind]bool
+	// lastStale is when each kind was last restarted for a replaced binary or library.
+	lastStale map[Kind]time.Time
+	version   string
+	patched   bool // the distribution build of DistroBase with the backports
+	unwant    int64
 }
 
 // New returns a Supervisor.
@@ -85,8 +93,14 @@ func New(cfg Config) *Supervisor {
 	if cfg.StartRetry == 0 {
 		cfg.StartRetry = time.Minute
 	}
+	if cfg.Watch == nil {
+		cfg.Watch = []string{BinaryPath, DpkgStatus}
+	}
+	if cfg.ChangeTime == nil {
+		cfg.ChangeTime = fileChangeTime
+	}
 	return &Supervisor{cfg: cfg, started: map[Kind]bool{}, wanted: map[Kind]bool{}, lastTry: map[Kind]time.Time{},
-		reloaded: map[Kind][]netip.Prefix{}, stale: map[Kind]bool{}}
+		reloaded: map[Kind][]netip.Prefix{}, stale: map[Kind]bool{}, lastStale: map[Kind]time.Time{}}
 }
 
 // Want says the agent means to run k although it has not been able to start it
@@ -403,6 +417,7 @@ func (s *Supervisor) Check(ctx context.Context) {
 	for _, k := range kinds {
 		out, _ := s.cfg.Runner.Run(ctx, nil, "systemctl", "is-active", s.unit(k))
 		if strings.TrimSpace(string(out)) == "active" {
+			s.restartIfStale(ctx, k)
 			continue
 		}
 		s.cfg.Alert.Alert(alert.Alert{Code: alert.UnboundDown, Detail: k.String()})

@@ -625,6 +625,30 @@ restart_stale_unbound() {
 	done
 }
 
+# reset_unbound_conf stops the two node Unbounds and removes the files the agent
+# rendered for them. The agent refuses a file whose pinned settings differ from what its
+# own binary renders (a limit changed behind its back must never be put back silently),
+# and the two authorised changes look exactly like that to it: a repeat install with
+# another --free-outgoing-ip (agent.conf, which the agent renders as outgoing-interface)
+# and an upgrade whose bundle changes the template or a limit. Without this the agent
+# would keep refusing its own old file: no start, no reload, the do-not-query list that
+# keeps the node's own addresses out of the upstreams never updated again
+# (p4n-MC-r1-6). The agent is stopped (quiesce) and writes the files afresh when it
+# starts the units; a change made outside install and upgrade is still refused.
+# The units are stopped, not restarted, because a restart needs the file this removes
+# and because reload_keep_cache does not rebind sockets or change the outgoing interface.
+reset_unbound_conf() {
+	systemctl stop ctrlz-unbound.service ctrlz-unbound-free.service >/dev/null 2>&1 || true
+	for u in ctrlz-unbound.service ctrlz-unbound-free.service; do
+		if systemctl is-active --quiet "$u" >/dev/null 2>&1; then
+			die "$u is still running; it could not be stopped for a new configuration"
+		fi
+	done
+	# plain_dirs has refused a link or a non-directory at /etc/ctrlz/unbound; rm
+	# removes a name and never follows it.
+	rm -f /etc/ctrlz/unbound/identified.conf /etc/ctrlz/unbound/free.conf
+}
+
 apply_services() {
 	systemctl daemon-reload
 	restart_stale_unbound
@@ -664,6 +688,7 @@ apply_binaries
 apply_dirs
 apply_files
 [ "$MODE" != install ] || apply_identity
+reset_unbound_conf
 apply_kernel
 apply_services
 apply_version

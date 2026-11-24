@@ -23,7 +23,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -52,6 +51,7 @@ import (
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/unbound"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/upload"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/zonekeys"
+	"github.com/Kup1ng/CtrlZ-Node/internal/enroll"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store/apply"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store/blobfetch"
@@ -266,9 +266,15 @@ func New(cfg Config) (*Agent, error) {
 	a.root = root
 	a.fsw = w
 	a.ncs = nodecfg.New(root.Path(store.DirConfig), w)
-	if id, err := hex.DecodeString(cfg.Identity.NodeID()); err == nil && len(id) == 16 {
-		copy(a.self[:], id)
+	// A certificate whose CN is no node id would leave self as sixteen zero bytes: the
+	// node would not know itself in the PairTable and would probe its own address as a
+	// peer. enroll refuses such a certificate at enrolment; this covers one that was
+	// stored by another version or edited on disk.
+	id, ok := enroll.ParseNodeID(cfg.Identity.NodeID())
+	if !ok {
+		return nil, errors.New("agent: the node certificate's subject is not a node id")
 	}
+	copy(a.self[:], id)
 	a.loadServingConfig()
 	a.loadRevocations()
 	if _, err := os.Stat(a.dnsOwedPath()); err == nil {

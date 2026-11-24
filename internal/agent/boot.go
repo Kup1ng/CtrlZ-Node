@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -35,11 +36,12 @@ type bootEnv struct {
 
 	// The hooks below are nil in production.
 	OSReleasePath string
-	Out           io.Writer                         // the console of enrolment, os.Stdout
-	Hostname      func() (string, error)            // os.Hostname
-	LookupUID     func(name string) (uint32, error) // the uid of ctrlz-dns
-	TuneEnroll    func(*enroll.Config)              // timings and the dialer of the enrolment
-	Tune          func(*Config)                     // the real Config before New
+	Out           io.Writer                                        // the console of enrolment, os.Stdout
+	Hostname      func() (string, error)                           // os.Hostname
+	LookupUID     func(name string) (uint32, error)                // the uid of ctrlz-dns
+	TuneEnroll    func(*enroll.Config)                             // timings and the dialer of the enrolment
+	Tune          func(*Config)                                    // the real Config before New
+	Sleep         func(ctx context.Context, d time.Duration) error // the waits of the enrolment back-off
 }
 
 func isLabRoot(err error) bool { return errors.Is(err, labroot.ErrLabRoot) }
@@ -166,6 +168,10 @@ func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string) err
 	if out == nil {
 		out = os.Stdout // the journal of ctrlz-agent: the admin compares what it shows with the panel
 	}
+	sleep := env.Sleep
+	if sleep == nil {
+		sleep = ctxSleep
+	}
 	ec := enroll.Config{
 		KeysDir: keys, Hub: ac.HubAddr(), HubHost: ac.HubHost(), Pin: pin, NodeCAPEM: caPEM,
 		DNSBind: ac.DNSBindIP, DNSAdvertised: ac.DNSAdvertisedIP,
@@ -176,8 +182,54 @@ func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string) err
 	if env.TuneEnroll != nil {
 		env.TuneEnroll(&ec)
 	}
-	if _, err := enroll.Run(ctx, ec); err != nil {
-		return err
+	// A transient failure (the hub is down, busy or answers nonsense) is retried here with
+	// a back-off, as Control is: leaving it to systemd's 2 s restart would call Enroll
+	// thirty times a minute, which is the hub's whole limit for the source's /24 (5.7) and
+	// would keep that limit full for every other node of the prefix. The token is kept by
+	// enroll on these answers and the pending record resumes a half-made enrolment.
+	var err2 error
+	for attempt := 0; ; attempt++ {
+		_, err2 = enroll.Run(ctx, ec)
+		if err2 == nil {
+			return nil
+		}
+		if ctx.Err() != nil || !(errors.Is(err2, enroll.ErrHubUnreachable) || errors.Is(err2, enroll.ErrBadHub)) {
+			break
+		}
+		d := enrolBackoff(attempt)
+		fmt.Fprintf(out, "ctrlz-enroll: %v; trying again in %s\n", err2, d)
+		if err := sleep(ctx, d); err != nil {
+			return err2
+		}
 	}
-	return nil
+	// A dead enrolment (no token, rejected, expired, a bad certificate) ends the process,
+	// and systemd starts it again two seconds later with the same outcome. Hold a minute
+	// first, so the journal carries one line a minute and not thirty, and the admin has
+	// the time to run the install command again (which stops this unit and wakes it).
+	if ctx.Err() == nil {
+		_ = sleep(ctx, deadEnrolmentHold)
+	}
+	return err2
+}
+
+// enrolBackoff is the wait before the n-th retry: 1 s, doubling, at most 30 s.
+func enrolBackoff(n int) time.Duration {
+	d := time.Second << min(n, 5)
+	return min(d, 30*time.Second)
+}
+
+// deadEnrolmentHold is how long boot waits before it gives up on an enrolment that
+// cannot succeed on its own.
+const deadEnrolmentHold = time.Minute
+
+// ctxSleep waits d or until ctx ends.
+func ctxSleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }

@@ -40,12 +40,12 @@ func TestSystemStartsUnboundNftablesAndChrony(t *testing.T) {
 		return strings.Contains(s, "systemctl start ctrlz-unbound.service") && strings.Contains(s, "systemctl start ctrlz-unbound-free.service") &&
 			strings.Contains(s, "nft -f -") && strings.Contains(s, "systemctl restart chrony.service")
 	})
-	for _, p := range []string{"/etc/ctrlz/unbound/identified.conf", "/etc/ctrlz/unbound/free.conf", "/etc/ctrlz/chrony/ctrlz.conf", "/etc/ctrlz/chrony/node_ca.pem"} {
+	for _, p := range []string{"/etc/ctrlz/unbound/identified.conf", "/etc/ctrlz/unbound/free.conf", "/etc/ctrlz/chrony/ctrlz.sources", "/etc/ctrlz/chrony/node_ca.pem"} {
 		if l.files.Get(p) == "" {
 			t.Errorf("%s not written", p)
 		}
 	}
-	if !strings.Contains(l.files.Get("/etc/ctrlz/chrony/ctrlz.conf"), "server 127.0.0.1 iburst nts") {
+	if !strings.Contains(l.files.Get("/etc/ctrlz/chrony/ctrlz.sources"), "server 127.0.0.1 iburst nts") {
 		t.Error("chrony does not use the panel host as its only server")
 	}
 	var script string

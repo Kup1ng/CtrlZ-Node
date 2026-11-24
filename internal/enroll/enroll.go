@@ -22,6 +22,7 @@
 package enroll
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -442,8 +443,15 @@ func (c *Config) accept(r *enrollv1.PollResponse, roots *x509.CertPool, p *pendi
 	if leaf.IsCA || leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 || !hasEKU(leaf, x509.ExtKeyUsageClientAuth) || hasEKU(leaf, x509.ExtKeyUsageServerAuth) {
 		return nil, fmt.Errorf("%w: wrong kind of certificate", ErrBadCertificate)
 	}
-	if cn := leaf.Subject.CommonName; cn == "" || !printable(cn, 64) {
+	// The id the hub put in the answer and the id the certificate names are one node:
+	// a certificate issued for another id (a hub fault) is not accepted, and neither
+	// is a CN that is no node id, which would leave the agent with no identity.
+	cn := leaf.Subject.CommonName
+	if cn == "" || !printable(cn, 64) {
 		return nil, fmt.Errorf("%w: no node id in the subject", ErrBadCertificate)
+	}
+	if id, ok := ParseNodeID(cn); !ok || !bytes.Equal(id, r.GetNodeId()) {
+		return nil, fmt.Errorf("%w: the subject is not the node id of the answer", ErrBadCertificate)
 	}
 	if !leaf.NotAfter.After(now) || leaf.NotAfter.Sub(leaf.NotBefore) > maxLifetime {
 		return nil, fmt.Errorf("%w: expired or too long-lived", ErrBadCertificate)

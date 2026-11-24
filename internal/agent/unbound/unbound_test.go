@@ -796,3 +796,129 @@ func TestDoNotQueryChangeRefusesAChangedPinnedSetting(t *testing.T) {
 		t.Errorf("the untouched process did not follow the list (reloads %d, before %d)", reloads(r), before)
 	}
 }
+
+// p4n-MC-r1-1: a package update does not restart a unit that is masked or not
+// enabled, and the agent only reloads a running Unbound, so the process that keeps
+// serving from a replaced binary or library must be found and restarted. The agent
+// cannot read /proc/<pid>/exe of another user's process; it compares the process's
+// start with the change time of the files it runs from.
+func TestAReplacedBinaryOrLibraryRestartsTheUnit(t *testing.T) {
+	boot := time.Unix(1_700_000_000, 0)
+	// the process started 1000 s after boot (100000 ticks of 10 ms, the stat field below)
+	started := boot.Add(1000 * time.Second)
+	now := started.Add(time.Hour)
+	setup := func(change map[string]time.Time) (*Supervisor, *fake.Runner, *fake.Files, *alert.Memory) {
+		s, r, f, al := newSup(t, "1.19.2", "32768 39999\n")
+		base := r.Reply
+		r.Reply = func(c fake.Call) ([]byte, error) {
+			if c.Name == "systemctl" && len(c.Args) > 1 && c.Args[0] == "show" {
+				return []byte("4242\n"), nil
+			}
+			return base(c)
+		}
+		// a command name with a space and a ")" in it, as the kernel prints it
+		f.M["/proc/4242/stat"] = []byte("4242 (unbound (x) y) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 " + "100000" + " 1000 1000 18446744073709551615\n")
+		f.M["/proc/stat"] = []byte("cpu  1 2 3\nbtime 1700000000\nprocesses 5\n")
+		s.cfg.Now = func() time.Time { return now }
+		s.cfg.ChangeTime = func(p string) (time.Time, error) {
+			if t, ok := change[p]; ok {
+				return t, nil
+			}
+			return time.Time{}, errors.New("no such file")
+		}
+		for _, k := range []Kind{Identified, Free} {
+			if err := s.Start(context.Background(), k, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s, r, f, al
+	}
+	restarts := func(r *fake.Runner) int {
+		n := 0
+		for _, l := range r.Lines() {
+			if strings.HasPrefix(l, "systemctl restart ctrlz-unbound") {
+				n++
+			}
+		}
+		return n
+	}
+	ctx := context.Background()
+
+	t.Run("the binary replaced after the start", func(t *testing.T) {
+		s, r, _, al := setup(map[string]time.Time{BinaryPath: started.Add(10 * time.Minute)})
+		s.Check(ctx)
+		if restarts(r) != 2 || al.Count(alert.UnboundStale) != 2 {
+			t.Fatalf("restarts %d, stale alerts %d: %v", restarts(r), al.Count(alert.UnboundStale), r.Lines())
+		}
+		// a second pass inside the rate limit does nothing, whatever the clocks say
+		s.Check(ctx)
+		if restarts(r) != 2 {
+			t.Errorf("restarted again at once: %d", restarts(r))
+		}
+	})
+	t.Run("a library package replaced after the start, found by the dpkg status file", func(t *testing.T) {
+		s, r, _, _ := setup(map[string]time.Time{BinaryPath: started.Add(-time.Hour), DpkgStatus: started.Add(time.Minute)})
+		s.Check(ctx)
+		if restarts(r) != 2 {
+			t.Fatalf("restarts %d: %v", restarts(r), r.Lines())
+		}
+	})
+	t.Run("files older than the process leave it alone", func(t *testing.T) {
+		s, r, _, al := setup(map[string]time.Time{BinaryPath: started.Add(-time.Hour), DpkgStatus: started.Add(-time.Minute)})
+		s.Check(ctx)
+		if restarts(r) != 0 || al.Count(alert.UnboundStale) != 0 {
+			t.Fatalf("restarted a current process: %v", r.Lines())
+		}
+	})
+	t.Run("a change time in the future is not believed, so a stepped clock cannot loop", func(t *testing.T) {
+		s, r, _, _ := setup(map[string]time.Time{BinaryPath: now.Add(24 * time.Hour)})
+		s.Check(ctx)
+		if restarts(r) != 0 {
+			t.Fatalf("restarted for a file from the future: %v", r.Lines())
+		}
+	})
+	t.Run("a host that cannot say (no pid, no files) is left alone", func(t *testing.T) {
+		s, r, f, _ := setup(map[string]time.Time{BinaryPath: started.Add(time.Hour)})
+		delete(f.M, "/proc/stat")
+		s.Check(ctx)
+		if restarts(r) != 0 {
+			t.Fatalf("restarted without knowing the process start: %v", r.Lines())
+		}
+	})
+	t.Run("the restart waits for the same checks as a dead unit's", func(t *testing.T) {
+		s, r, _, al := setup(map[string]time.Time{BinaryPath: started.Add(time.Minute)})
+		s.cfg.Gate = func() error { return errors.New("core dumps are not ruled out") }
+		s.Check(ctx)
+		if restarts(r) != 0 || al.Count(alert.UnboundRefused) == 0 {
+			t.Fatalf("restarted past the host gate: %v", r.Lines())
+		}
+	})
+}
+
+// p4n-MC-r1-6: a repeat install with a new --free-outgoing-ip is an authorised
+// change that looks like a tampered file to the agent (the old free.conf has no
+// outgoing-interface line). The install removes the rendered file; the agent then
+// starts the unit from a fresh one. The refusal itself stays for any other change.
+func TestStartAfterTheInstallRemovedARenderedFileOfAnotherConfiguration(t *testing.T) {
+	ctx := context.Background()
+	old := render(t, Free)
+	s, _, f, al := newSup(t, "1.19.2", "32768 39999")
+	s.cfg.Free.OutgoingInterface = netip.MustParseAddr("198.51.101.7")
+	if err := f.WriteFile("/etc/ctrlz/unbound/free.conf", []byte(old), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(ctx, Free, nil); err == nil {
+		t.Fatal("the agent took a file of another configuration over silently")
+	}
+	if al.Count(alert.UnboundRefused) != 1 {
+		t.Fatalf("alerts: %v", al.Codes())
+	}
+	// what apply.sh does: remove the rendered file
+	delete(f.M, "/etc/ctrlz/unbound/free.conf")
+	if err := s.Start(ctx, Free, nil); err != nil {
+		t.Fatalf("the start after the install removed the file: %v", err)
+	}
+	if !strings.Contains(f.Get("/etc/ctrlz/unbound/free.conf"), "outgoing-interface: 198.51.101.7") {
+		t.Error("the new file lacks the outgoing interface")
+	}
+}

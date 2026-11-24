@@ -10,20 +10,29 @@ import (
 )
 
 func TestRender(t *testing.T) {
-	s, err := Render("panel.example.net", "/etc/ctrlz/chrony/node_ca.pem")
+	s, err := Render("panel.example.net")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n := strings.Count(s, "\nserver "); n != 1 {
 		t.Errorf("sources = %d, the panel must be the only one", n)
 	}
-	for _, want := range []string{"server panel.example.net iburst nts", "ntstrustedcerts /etc/ctrlz/chrony/node_ca.pem", "nosystemcert"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("missing %q", want)
+	if !strings.Contains(s, "server panel.example.net iburst nts") {
+		t.Errorf("no NTS source line in %q", s)
+	}
+	// chronyd parses this directory as root: the file the agent writes may hold a
+	// source line and comments, and no other directive (R16).
+	for _, l := range strings.Split(s, "\n") {
+		if l == "" || strings.HasPrefix(l, "#") || strings.HasPrefix(l, "server ") {
+			continue
 		}
+		t.Errorf("the agent's file holds a directive that is not a source: %q", l)
 	}
 	if strings.Contains(s, "pool") {
 		t.Error("a pool is a second source")
+	}
+	if !strings.HasSuffix(ConfName, ".sources") {
+		t.Error("chronyd reads only *.sources files from a sourcedir")
 	}
 }
 
@@ -37,7 +46,7 @@ func TestHostIsValidated(t *testing.T) {
 		if ValidHost(h) {
 			t.Errorf("%q accepted", h)
 		}
-		if _, err := Render(h, "/x"); err == nil {
+		if _, err := Render(h); err == nil {
 			t.Errorf("Render accepted %q", h)
 		}
 	}
@@ -52,7 +61,7 @@ func TestUpdateRestartsOnlyOnChange(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("changed=%v err=%v", changed, err)
 	}
-	if !strings.Contains(f.Get("/etc/ctrlz/chrony/ctrlz.conf"), "server 198.51.100.20 iburst nts") || f.Get("/etc/ctrlz/chrony/node_ca.pem") != string(ca) {
+	if !strings.Contains(f.Get("/etc/ctrlz/chrony/ctrlz.sources"), "server 198.51.100.20 iburst nts") || f.Get("/etc/ctrlz/chrony/node_ca.pem") != string(ca) {
 		t.Error("files")
 	}
 	if got := r.Lines(); len(got) != 1 || got[0] != "systemctl restart chrony.service" {

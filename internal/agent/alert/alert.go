@@ -35,6 +35,7 @@ const (
 	ConfigFallback      = "config_fallback"       // the node serves from a previous or no NodeConfig
 	UnboundUnwanted     = "unbound_unwanted"      // the unwanted.replies counter of the identified Unbound rose
 	UnboundUnsupervised = "unbound_unsupervised"  // an Unbound unit is running that the agent refused to take over: it is not supervised
+	UnboundStale        = "unbound_stale"         // an Unbound ran from a binary or library that was replaced; it was restarted
 	CertBundleRefused   = "cert_bundle_refused"   // a CertBundle did not open or did not match
 	Skew                = "clock_skew"            // the node clock differs from the hub's by more than 2 s
 	HubUnreachable      = "hub_unreachable"       // the Control stream has been down for a while

@@ -90,8 +90,7 @@ func newPKI(t *testing.T, now time.Time) *pki {
 // issue makes a node client certificate for pub, as the hub's template of 4.2 step 6.
 func (p *pki) issue(t *testing.T, pub any, now time.Time, mut func(*x509.Certificate)) []byte {
 	t.Helper()
-	id := make([]byte, 16)
-	_, _ = rand.Read(id)
+	id := testNodeID
 	tpl := &x509.Certificate{
 		SerialNumber: serial(), Subject: pkix.Name{CommonName: hex.EncodeToString(id)},
 		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(30 * 24 * time.Hour),
@@ -197,10 +196,8 @@ func (h *fakeHub) Poll(ctx context.Context, r *enrollv1.PollRequest) (*enrollv1.
 func (h *fakeHub) approved(t *testing.T, rec *record) *enrollv1.PollResponse {
 	t.Helper()
 	der := h.pki.issue(t, rec.pub, h.now(), nil)
-	id := make([]byte, 16)
-	_, _ = rand.Read(id)
 	return &enrollv1.PollResponse{
-		State: enrollv1.EnrollState_ENROLL_STATE_APPROVED, NodeId: id, ClientCertDer: der,
+		State: enrollv1.EnrollState_ENROLL_STATE_APPROVED, NodeId: testNodeID, ClientCertDer: der,
 		CaChainDer: [][]byte{h.pki.caCert.Raw},
 	}
 }
@@ -941,5 +938,49 @@ func TestProofInputGoldenVector(t *testing.T) {
 	sum := sha256.Sum256(ProofInput(id))
 	if got, want := hex.EncodeToString(sum[:]), "ed213f81920fcc9792708e93b04efd440a1feacebf0e3d7dd39ee334074208c8"; got != want {
 		t.Fatalf("SHA-256 of ProofInput = %s, want %s", got, want)
+	}
+}
+
+// testNodeID is the node id of every certificate the fake hub issues and of every
+// answer it builds: the node insists that the two agree.
+var testNodeID = []byte{0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf}
+
+// p4n-MC-r1-7: the node id of the answer and the subject CN of the certificate are
+// one node. The CN may be written as hex or as a dashed UUID; a certificate for
+// another id, or a CN that is no id at all, is refused, so the agent never runs with
+// an identity of zeros or with another node's.
+func TestTheCertificateNamesTheNodeOfTheAnswer(t *testing.T) {
+	cn := func(s string) func(*x509.Certificate) {
+		return func(c *x509.Certificate) { c.Subject.CommonName = s }
+	}
+	dashed := "a0a1a2a3-a4a5-a6a7-a8a9-aaabacadaeaf"
+	for name, tc := range map[string]struct {
+		cn string
+		ok bool
+	}{
+		"hex":                     {"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf", true},
+		"upper case hex":          {"A0A1A2A3A4A5A6A7A8A9AAABACADAEAF", true},
+		"a dashed UUID":           {dashed, true},
+		"another node":            {"b0a1a2a3a4a5a6a7a8a9aaabacadaeaf", false},
+		"another node, dashed":    {"b0a1a2a3-a4a5-a6a7-a8a9-aaabacadaeaf", false},
+		"a name":                  {"node-1", false},
+		"a UUID with a bad dash":  {"a0a1a2a3a-4a5-a6a7-a8a9-aaabacadaeaf", false},
+		"hex of the wrong length": {"a0a1a2a3a4a5a6a7a8a9aaabacadae", false},
+	} {
+		r := newRig(t)
+		r.hub.onPoll = func(n int, rec *record) (*enrollv1.PollResponse, error) {
+			p := r.hub.approved(t, rec)
+			p.ClientCertDer = r.pki.issue(t, rec.pub, r.clk.Now(), cn(tc.cn))
+			return p, nil
+		}
+		_, err := r.run(t)
+		switch {
+		case tc.ok && err != nil:
+			t.Errorf("%s: refused: %v", name, err)
+		case !tc.ok && !errors.Is(err, ErrBadCertificate):
+			t.Errorf("%s: err = %v, want ErrBadCertificate", name, err)
+		case !tc.ok && exists(filepath.Join(r.dir, NodeCertFile)):
+			t.Errorf("%s: a certificate was stored", name)
+		}
 	}
 }

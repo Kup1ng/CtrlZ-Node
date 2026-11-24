@@ -91,6 +91,11 @@ type idParts struct {
 // newIdentity makes the node's credentials. A short certificate is one a third
 // of whose life is already gone, which is when the agent renews.
 func newIdentity(t *testing.T, short bool) (*hubconn.Identity, idParts) {
+	return newIdentityCN(t, short, "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0")
+}
+
+// newIdentityCN is newIdentity with the subject CN given.
+func newIdentityCN(t *testing.T, short bool, cn string) (*hubconn.Identity, idParts) {
 	t.Helper()
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	ctmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "ca"}, NotBefore: time.Now().Add(-time.Hour),
@@ -98,7 +103,7 @@ func newIdentity(t *testing.T, short bool) (*hubconn.Identity, idParts) {
 	cder, _ := x509.CreateCertificate(rand.Reader, ctmpl, ctmpl, &caKey.PublicKey, caKey)
 	ca, _ := x509.ParseCertificate(cder)
 	nk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	ntmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"}, NotBefore: time.Now().Add(-3 * time.Hour),
+	ntmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: cn}, NotBefore: time.Now().Add(-3 * time.Hour),
 		NotAfter: lifeEnd(short), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
 	nder, _ := x509.CreateCertificate(rand.Reader, ntmpl, ca, &nk.PublicKey, caKey)
 	kder, _ := x509.MarshalPKCS8PrivateKey(nk)

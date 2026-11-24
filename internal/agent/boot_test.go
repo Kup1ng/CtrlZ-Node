@@ -59,10 +59,12 @@ type enrollHub struct {
 
 	approve atomic.Bool
 	enrolls atomic.Int32
-	mu      sync.Mutex
-	id      []byte
-	pub     *ecdsa.PublicKey
-	issued  []byte
+	// busy is how many Enroll calls the hub still answers with its limiter's code.
+	busy   atomic.Int32
+	mu     sync.Mutex
+	id     []byte
+	pub    *ecdsa.PublicKey
+	issued []byte
 }
 
 func newEnrollHub(t *testing.T) *enrollHub {
@@ -99,6 +101,9 @@ func newEnrollHub(t *testing.T) *enrollHub {
 
 func (h *enrollHub) Enroll(_ context.Context, r *enrollv1.EnrollRequest) (*enrollv1.EnrollResponse, error) {
 	h.enrolls.Add(1)
+	if h.busy.Add(-1) >= 0 {
+		return nil, status.Error(codes.ResourceExhausted, "limiter")
+	}
 	if r.Token != bootToken {
 		return nil, status.Error(codes.PermissionDenied, "token")
 	}
@@ -137,7 +142,7 @@ func (h *enrollHub) Poll(_ context.Context, r *enrollv1.PollRequest) (*enrollv1.
 		}
 		h.issued = der
 	}
-	return &enrollv1.PollResponse{State: enrollv1.EnrollState_ENROLL_STATE_APPROVED, NodeId: h.id[:16],
+	return &enrollv1.PollResponse{State: enrollv1.EnrollState_ENROLL_STATE_APPROVED, NodeId: bytes.Repeat([]byte{0xa0}, 16),
 		ClientCertDer: h.issued, CaChainDer: [][]byte{h.caCert.Raw}}, nil
 }
 
@@ -372,5 +377,113 @@ func TestBootRefusesTheLabRootInAReleaseBuild(t *testing.T) {
 	c2 := &rootCache{path: p}
 	if r, err := c2.get(); err == nil || r != nil || !errors.Is(err, labroot.ErrLabRoot) {
 		t.Errorf("the cache served the lab root: %v %v", r, err)
+	}
+}
+
+// sleeps records the waits boot asks for and makes them instant.
+type sleeps struct {
+	mu sync.Mutex
+	ds []time.Duration
+}
+
+func (s *sleeps) sleep(_ context.Context, d time.Duration) error {
+	s.mu.Lock()
+	s.ds = append(s.ds, d)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *sleeps) all() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.ds...)
+}
+
+// p4n-MC-r1-4: a hub that is busy (the limiter's ResourceExhausted), down or garbled
+// is waited out inside boot with a back-off. Leaving it to systemd's two-second restart
+// would call Enroll thirty times a minute, the whole limit of the node's /24.
+func TestBootRetriesATransientEnrolmentFailureWithABackoff(t *testing.T) {
+	eh := newEnrollHub(t)
+	eh.busy.Store(3) // the first three Enroll calls are refused by the limiter
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	hub := fakehub.New()
+	hub.Start()
+	t.Cleanup(hub.Stop)
+	sl := &sleeps{}
+	rig.env.Sleep = sl.sleep
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.PollEvery = 10 * time.Millisecond
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	rig.env.Tune = func(c *Config) {
+		c.SockGroup = ""
+		c.PeerCheck = func(net.Conn) error { return nil }
+		c.Dial = func(hubconn.Role) (*grpc.ClientConn, error) { return hub.Dial() }
+		c.Runner, c.Files = &fake.Runner{}, fake.NewFiles(nil)
+		c.NoSystem, c.SkipHostChecks = true, true
+		c.RetryEvery, c.LogPoll, c.ProbeEvery = time.Hour, time.Hour, time.Hour
+	}
+	eh.approve.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- boot(ctx, rig.env) }()
+	t.Cleanup(func() { cancel(); <-done })
+	if _, err := hub.NextSession(10 * time.Second); err != nil {
+		t.Fatalf("the node did not get past a busy hub: %v", err)
+	}
+	if got := eh.enrolls.Load(); got != 4 {
+		t.Errorf("Enroll calls = %d, want 4 (three refused by the limiter, one accepted)", got)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	got := sl.all()
+	if len(got) != len(want) {
+		t.Fatalf("waits %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("wait %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+	if strings.Contains(rig.out.String(), bootToken) {
+		t.Error("the token reached the console")
+	}
+}
+
+func TestEnrolBackoffGrowsAndStops(t *testing.T) {
+	want := []time.Duration{1, 2, 4, 8, 16, 30, 30, 30}
+	for i, w := range want {
+		if got := enrolBackoff(i); got != w*time.Second {
+			t.Errorf("enrolBackoff(%d) = %v, want %v", i, got, w*time.Second)
+		}
+	}
+	if enrolBackoff(1000) != 30*time.Second {
+		t.Error("the back-off grows without a bound")
+	}
+}
+
+// A dead enrolment (no token, no pending record) ends the process, and systemd starts
+// it again two seconds later: boot holds a minute first, so it is one line a minute.
+func TestBootHoldsADeadEnrolmentBeforeItExits(t *testing.T) {
+	eh := newEnrollHub(t)
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	if err := os.Remove(filepath.Join(rig.keys, enroll.TokenFile)); err != nil {
+		t.Fatal(err)
+	}
+	sl := &sleeps{}
+	rig.env.Sleep = sl.sleep
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	err := boot(context.Background(), rig.env)
+	if !errors.Is(err, enroll.ErrNoToken) {
+		t.Fatalf("boot with no token: %v", err)
+	}
+	if got := sl.all(); len(got) != 1 || got[0] != deadEnrolmentHold {
+		t.Errorf("waits %v, want one of %v", got, deadEnrolmentHold)
+	}
+	if eh.enrolls.Load() != 0 {
+		t.Error("a node with no token spoke to the hub")
 	}
 }

@@ -2,9 +2,13 @@
 // the panel host is the node's only time source, over NTS, trusting the node CA.
 //
 // The install script, as root and once, makes /etc/chrony/chrony.conf hold only
-// fixed settings and `confdir /etc/ctrlz/chrony`; the agent owns that directory
-// and writes /etc/ctrlz/chrony/ctrlz.conf. The CA file sits beside it because
-// keys/ is the agent's alone and chrony cannot read it.
+// fixed settings and `sourcedir /etc/ctrlz/chrony`; the agent owns that directory
+// and writes /etc/ctrlz/chrony/ctrlz.sources. chronyd parses its configuration as
+// root, and a sourcedir file takes source lines only, so what the agent writes
+// cannot carry any other directive (R16): nosystemcert, ntstrustedcerts, user and
+// the rest stay in the root-owned chrony.conf, and this package writes `server`
+// and nothing else. The CA file sits beside the source file because keys/ is the
+// agent's alone and chrony cannot read it.
 package chrony
 
 import (
@@ -23,8 +27,9 @@ import (
 
 // Files of the drop-in directory and the unit the agent restarts.
 const (
-	Dir      = "/etc/ctrlz/chrony"
-	ConfName = "ctrlz.conf"
+	Dir = "/etc/ctrlz/chrony"
+	// ConfName ends in .sources because chronyd reads no other name from a sourcedir.
+	ConfName = "ctrlz.sources"
 	CAName   = "node_ca.pem"
 	// StateName records whether the restart that follows a change has happened.
 	StateName    = "restart.state"
@@ -45,26 +50,19 @@ func ValidHost(s string) bool {
 }
 
 const tmpl = `# Written by ctrlz-agent. The panel is the only time source (p4-nodes 7.10).
+# Only a source line belongs here; chrony.conf holds every other setting.
 server {{.Host}} iburst nts
-ntstrustedcerts {{.CA}}
-# Without this, ntstrustedcerts only adds to the system CAs, and any public CA would do for NTS-KE.
-nosystemcert
-minsources 1
-makestep 1.0 3
 `
 
 var parsed = template.Must(template.New("chrony").Parse(tmpl))
 
-// Render returns the drop-in for a panel host, with the CA file at caPath.
-func Render(host, caPath string) (string, error) {
+// Render returns the source file for a panel host.
+func Render(host string) (string, error) {
 	if !ValidHost(host) {
 		return "", errors.New("chrony: the panel host is not a host name or an address")
 	}
-	if caPath == "" || strings.ContainsAny(caPath, " \t\r\n\"") {
-		return "", errors.New("chrony: bad CA path")
-	}
 	var b bytes.Buffer
-	if err := parsed.Execute(&b, struct{ Host, CA string }{host, caPath}); err != nil {
+	if err := parsed.Execute(&b, struct{ Host string }{host}); err != nil {
 		return "", err
 	}
 	return b.String(), nil
@@ -75,7 +73,7 @@ func Render(host, caPath string) (string, error) {
 // changed anything.
 func Update(ctx context.Context, files sysx.Files, run sysx.Runner, host string, caPEM []byte) (bool, error) {
 	caPath := path.Join(Dir, CAName)
-	conf, err := Render(host, caPath)
+	conf, err := Render(host)
 	if err != nil {
 		return false, err
 	}
@@ -86,7 +84,9 @@ func Update(ctx context.Context, files sysx.Files, run sysx.Runner, host string,
 	for _, f := range []struct {
 		path string
 		data []byte
-	}{{path.Join(Dir, ConfName), []byte(conf)}, {caPath, caPEM}} {
+	}{{caPath, caPEM}, {path.Join(Dir, ConfName), []byte(conf)}} {
+		// The CA goes first: a chronyd restarted between the two writes then never
+		// meets a source whose CA is not on disk yet.
 		if old, err := files.ReadFile(f.path); err == nil && bytes.Equal(old, f.data) {
 			continue
 		}

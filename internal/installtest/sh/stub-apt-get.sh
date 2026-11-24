@@ -29,7 +29,7 @@ fi
 	else
 		echo "policy-rc.d absent"
 	fi
-	grep -q '^confdir /etc/ctrlz/chrony' /etc/chrony/chrony.conf 2>/dev/null && echo "chrony.conf ours" || echo "chrony.conf not ours"
+	grep -q '^sourcedir /etc/ctrlz/chrony' /etc/chrony/chrony.conf 2>/dev/null && echo "chrony.conf ours" || echo "chrony.conf not ours"
 	grep -q '^systemctl mask unbound.service' /var/log/stub/calls.log 2>/dev/null && echo "unbound masked" || echo "unbound not masked"
 } >>/var/log/stub/apt.state
 # The first real run fails and later ones work: a lock timeout that clears.
