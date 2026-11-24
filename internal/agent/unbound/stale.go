@@ -86,9 +86,7 @@ func (s *Supervisor) restartIfStale(ctx context.Context, k Kind) {
 // binary of the start, reads them again from the binary now on disk and holds them to
 // the floor. It returns the version.
 func (s *Supervisor) recheckBinary(ctx context.Context) (string, error) {
-	s.mu.Lock()
-	s.version, s.patched = "", false
-	s.mu.Unlock()
+	s.forgetBinary()
 	v, err := s.Version(ctx)
 	if err != nil {
 		return "", err
@@ -148,4 +146,12 @@ func (s *Supervisor) processStart(ctx context.Context, k Kind) (time.Time, bool)
 		}
 	}
 	return time.Time{}, false
+}
+
+// forgetBinary drops the cached version and patched state, so the next Version asks the
+// binary on disk.
+func (s *Supervisor) forgetBinary() {
+	s.mu.Lock()
+	s.version, s.patched = "", false
+	s.mu.Unlock()
 }

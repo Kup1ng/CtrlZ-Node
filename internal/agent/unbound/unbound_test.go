@@ -1152,3 +1152,68 @@ func TestAFailedStaleCheckIsRepeatedOnTheNextPass(t *testing.T) {
 		t.Error("the stale check was not repeated on the next pass")
 	}
 }
+
+// p4n-MC-r4-2: the retry of a start that never happened judges the binary on disk now,
+// not the version cached when the agent first asked. Both directions: a build below the
+// floor that is replaced by a good one is started, and a good one replaced by a build
+// below the floor is not.
+func TestStartRetryJudgesTheBinaryOnDisk(t *testing.T) {
+	ctx := context.Background()
+	mk := func(t *testing.T) (*Supervisor, *fake.Runner, *string, *bool) {
+		s, r, _, _ := newSup(t, "1.19.2", "32768 39999\n")
+		s.cfg.StartRetry = time.Nanosecond
+		ver := "1.18.0"
+		failStart := false
+		r.Reply = func(c fake.Call) ([]byte, error) {
+			switch {
+			case c.Name == "unbound":
+				return []byte("Version " + ver + "\n"), nil
+			case c.Name == "dpkg-query":
+				return []byte(DistroFloor), nil
+			case failStart && c.Name == "systemctl" && len(c.Args) > 0 && c.Args[0] == "start":
+				return nil, errors.New("not yet")
+			}
+			return nil, nil
+		}
+		return s, r, &ver, &failStart
+	}
+	starts := func(r *fake.Runner) int {
+		n := 0
+		for _, l := range r.Lines() {
+			if l == "systemctl start ctrlz-unbound.service" {
+				n++
+			}
+		}
+		return n
+	}
+	tick := func() { time.Sleep(5 * time.Millisecond) } // StartRetry is a nanosecond; let a coarse clock move
+
+	t.Run("a build below the floor is replaced by a good one", func(t *testing.T) {
+		s, r, ver, _ := mk(t)
+		if err := s.Start(ctx, Identified, nil); err == nil {
+			t.Fatal("a build below the floor was started")
+		}
+		*ver = "1.22.0" // the operator installs an upstream build
+		tick()
+		s.Check(ctx)
+		if starts(r) != 1 {
+			t.Fatalf("start calls = %d, want 1: the retry still judges the version cached at the first start", starts(r))
+		}
+		if s.RunningVersion() != "1.22.0" {
+			t.Errorf("running version %q", s.RunningVersion())
+		}
+	})
+	t.Run("a good build is replaced by one below the floor", func(t *testing.T) {
+		s, r, ver, failStart := mk(t)
+		*ver, *failStart = "1.22.0", true
+		if err := s.Start(ctx, Identified, nil); err == nil {
+			t.Fatal("the start should have failed")
+		}
+		*ver, *failStart = "1.18.0", false
+		tick()
+		s.Check(ctx)
+		if starts(r) != 1 { // only the failed first call; the retry must not start the old build
+			t.Fatalf("start calls = %d, want 1: a build below the floor was started on the cached version", starts(r))
+		}
+	})
+}

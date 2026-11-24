@@ -209,14 +209,32 @@ func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string, ser
 		if err2 == nil {
 			return nil
 		}
-		if ctx.Err() != nil || !(errors.Is(err2, enroll.ErrHubUnreachable) || errors.Is(err2, enroll.ErrBadHub)) {
+		if ctx.Err() != nil {
 			break
 		}
-		d := enrolBackoff(attempt)
-		fmt.Fprintf(out, "ctrlz-enroll: %v; trying again in %s\n", err2, d)
-		if err := sleep(ctx, d); err != nil {
-			return err2
+		if errors.Is(err2, enroll.ErrHubUnreachable) || errors.Is(err2, enroll.ErrBadHub) {
+			d := enrolBackoff(attempt)
+			fmt.Fprintf(out, "ctrlz-enroll: %v; trying again in %s\n", err2, d)
+			if err := sleep(ctx, d); err != nil {
+				return err2
+			}
+			continue
 		}
+		if serving && resumableEnrolment(keys, err2) {
+			// The hub's answer is still good and the pending record is on disk: what failed
+			// is on this host (a full or read-only disk, a clock that is days off) and the
+			// admin mends it while the process runs. Ending the process would take the
+			// resolvers over again every minute (p4n-MC-r3-4), and holding for good would
+			// leave an approved enrolment unfinished for ever (p4n-MC-r4-1), so the
+			// enrolment is tried again here with the resolvers still supervised.
+			fmt.Fprintf(out, "ctrlz-enroll: %v; the enrolment is kept, trying again in %s\n", err2, deadEnrolmentHold)
+			if err := sleep(ctx, deadEnrolmentHold); err != nil {
+				return err2
+			}
+			attempt = -1
+			continue
+		}
+		break
 	}
 	if ctx.Err() != nil {
 		return err2
@@ -238,6 +256,20 @@ func enrolNode(ctx context.Context, env bootEnv, ac conf.Agent, keys string, ser
 	// (which stops this unit and wakes it).
 	_ = sleep(ctx, deadEnrolmentHold)
 	return err2
+}
+
+// resumableEnrolment reports whether an enrolment that failed with err can still finish
+// on its own once the host is mended: the hub has not refused it (no token, rejected,
+// timed out, refused, a key it does not hold) and the pending record, which holds the
+// key the hub's answer is for, is still on disk.
+func resumableEnrolment(keys string, err error) bool {
+	for _, final := range []error{enroll.ErrNoToken, enroll.ErrRejected, enroll.ErrTimeout, enroll.ErrEnrollRefused, enroll.ErrFingerprint} {
+		if errors.Is(err, final) {
+			return false
+		}
+	}
+	_, statErr := os.Stat(filepath.Join(keys, enroll.PendingFile))
+	return statErr == nil
 }
 
 // enrolBackoff is the wait before the n-th retry: 1 s, doubling, at most 30 s.

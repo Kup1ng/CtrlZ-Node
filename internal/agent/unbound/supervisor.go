@@ -206,6 +206,11 @@ func (s *Supervisor) Start(ctx context.Context, k Kind, doNotQuery []netip.Prefi
 	s.wanted[k] = true
 	s.lastTry[k] = time.Now()
 	s.mu.Unlock()
+	// Judge the binary that is on disk now, not the one cached at the first start: a retry
+	// exists because the host gets fixed while the agent runs, and a binary replaced since
+	// (below the floor, or a good one after a bad one) must be held to the floor as it is
+	// (p4n-MC-r4-2).
+	s.forgetBinary()
 	v, err := s.Version(ctx)
 	if err != nil {
 		return s.refuse(k.String()+": version unreadable", err)

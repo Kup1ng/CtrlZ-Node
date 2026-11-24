@@ -610,3 +610,68 @@ func TestBootKeepsTheResolversWhenTheEnrolmentIsDead(t *testing.T) {
 		t.Errorf("boot ended with %v, want the cancellation", err)
 	}
 }
+
+// p4n-MC-r4-1: an enrolment that failed on this host (the certificate cannot be written)
+// while the hub's answer is still good is not held as dead. The admin mends the host,
+// and the node finishes the enrolment in the same process, with one Enroll call.
+func TestBootFinishesAResumableEnrolmentOnceTheHostIsMended(t *testing.T) {
+	eh := newEnrollHub(t)
+	eh.approve.Store(true)
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	hub := fakehub.New()
+	hub.Start()
+	t.Cleanup(hub.Stop)
+	runner, files := unboundHost()
+	// The obstacle: node.crt is a directory, so the certificate cannot be written.
+	obstacle := filepath.Join(rig.keys, hubconn.NodeCertFile)
+	if err := os.Mkdir(obstacle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var holds atomic.Int32
+	console := &lockedBuffer{}
+	rig.env.Out = console
+	rig.env.Sleep = func(ctx context.Context, d time.Duration) error {
+		if d == deadEnrolmentHold {
+			holds.Add(1)
+			if err := os.Remove(obstacle); err != nil { // the admin mends the host while the hold runs
+				t.Errorf("remove the obstacle: %v", err)
+			}
+			return nil
+		}
+		return ctxSleep(ctx, d)
+	}
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.PollEvery = 5 * time.Millisecond
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	rig.env.Tune = func(c *Config) {
+		c.SockGroup = ""
+		c.PeerCheck = func(net.Conn) error { return nil }
+		c.Dial = func(hubconn.Role) (*grpc.ClientConn, error) { return hub.Dial() }
+		c.Runner, c.Files = runner, files
+		c.SkipHostChecks = true
+		c.UnboundEvery = 20 * time.Millisecond
+		c.HeartbeatEvery = 50 * time.Millisecond
+		c.RetryEvery, c.LogPoll, c.ProbeEvery = time.Hour, time.Hour, time.Hour
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- boot(ctx, rig.env) }()
+	t.Cleanup(func() { cancel(); <-done })
+	if _, err := hub.NextSession(15 * time.Second); err != nil {
+		t.Fatalf("the enrolment did not finish after the host was mended: %v\n%s", err, console.String())
+	}
+	if got := eh.enrolls.Load(); got != 1 {
+		t.Errorf("Enroll called %d times, want 1 (the pending record resumes the enrolment)", got)
+	}
+	if holds.Load() != 1 {
+		t.Errorf("holds = %d, want 1", holds.Load())
+	}
+	if strings.Contains(console.String(), "the enrolment is over") {
+		t.Errorf("a resumable enrolment was announced as over: %q", console.String())
+	}
+	if _, err := os.Stat(filepath.Join(rig.keys, enroll.PendingFile)); err == nil {
+		t.Error("the pending record outlived the enrolment")
+	}
+}
