@@ -68,6 +68,10 @@ type node struct {
 	// zeroOnly makes a kDropped drop the number 0 alone: a legacy key with any other
 	// value is not dropped but unknown.
 	zeroOnly bool
+	// firstOnly makes a kDropped drop only on the first outbound, the one the SOCKS inbound
+	// feeds. A hop can be handed the UDP of the outbound before it, so a key that is idle
+	// for the first outbound (mux xudp keys) is an unknown key on a hop.
+	firstOnly bool
 	// required lists keys that must be present; a missing one is a warning at its path.
 	required []string
 	// forceTrue lists boolean keys that the normal form always sets to true.
@@ -126,23 +130,24 @@ func arrN(minN, maxN int, elem *node) *node {
 	return &node{k: kArr, elem: elem, minN: minN, maxN: maxN}
 }
 
-func boolean() *node     { return &node{k: kBool} }
-func host() *node        { return &node{k: kHost} }
-func hostPort() *node    { return &node{k: kHostPort} }
-func text() *node        { return &node{k: kText} }
-func path() *node        { return &node{k: kPath} }
-func uuidText() *node    { return &node{k: kUUIDText} }
-func key32() *node       { return &node{k: kKey32} }
-func key32URL() *node    { return &node{k: kKey32URL} }
-func ipOrPrefix() *node  { return &node{k: kIP} }
-func prefixOnly() *node  { return &node{k: kPrefix} }
-func httpHost() *node    { return &node{k: kHTTPHost} }
-func pins() *node        { return &node{k: kPins} }
-func shortID() *node     { return &node{k: kShortID} }
-func spiderX() *node     { return &node{k: kSpiderX} }
-func dialerTag() *node   { return &node{k: kDialer} }
-func dropped() *node     { return &node{k: kDropped} }
-func droppedZero() *node { return &node{k: kDropped, zeroOnly: true} }
+func boolean() *node      { return &node{k: kBool} }
+func host() *node         { return &node{k: kHost} }
+func hostPort() *node     { return &node{k: kHostPort} }
+func text() *node         { return &node{k: kText} }
+func path() *node         { return &node{k: kPath} }
+func uuidText() *node     { return &node{k: kUUIDText} }
+func key32() *node        { return &node{k: kKey32} }
+func key32URL() *node     { return &node{k: kKey32URL} }
+func ipOrPrefix() *node   { return &node{k: kIP} }
+func prefixOnly() *node   { return &node{k: kPrefix} }
+func httpHost() *node     { return &node{k: kHTTPHost} }
+func pins() *node         { return &node{k: kPins} }
+func shortID() *node      { return &node{k: kShortID} }
+func spiderX() *node      { return &node{k: kSpiderX} }
+func dialerTag() *node    { return &node{k: kDialer} }
+func dropped() *node      { return &node{k: kDropped} }
+func droppedZero() *node  { return &node{k: kDropped, zeroOnly: true} }
+func droppedFirst() *node { return &node{k: kDropped, firstOnly: true} }
 
 // headers is an object of HTTP header names with one string each; headersMulti may
 // hold a list of 1 to 8 strings (the raw http header of Xray, a map of lists).

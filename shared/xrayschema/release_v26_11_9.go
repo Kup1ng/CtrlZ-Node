@@ -34,8 +34,11 @@ func outbound() *node {
 		f("streamSettings", streamSettings()),
 		f("mux", obj(
 			f("enabled", boolean()), f("concurrency", bnum(-1, 128)),
-			// No UDP comes in at the node, so neither xudp key has an effect.
-			f("xudpConcurrency", dropped()), f("xudpProxyUDP443", dropped()),
+			// No UDP comes in at the node, so on the first outbound neither xudp key has an
+			// effect. A hop can be dialed with the UDP of the outbound before it (wireguard,
+			// hysteria, xhttp over h3), and then both keys decide whether that UDP passes the
+			// mux, so on a hop they are unknown keys.
+			f("xudpConcurrency", droppedFirst()), f("xudpProxyUDP443", droppedFirst()),
 		)),
 	).withVariant("protocol", "settings", protocols).postChecked(socksOverEarlyData)
 }

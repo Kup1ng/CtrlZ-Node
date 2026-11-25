@@ -291,7 +291,14 @@ func headersFit(n *node, v *val) string {
 	return ""
 }
 
+// uuidOK accepts what uuid.ParseString of the release reads as a UUID: 32 hex digits, or
+// the 36-character form with its four dashes. The loader also takes other dash
+// placements and ignores trailing characters; those stay warnings, because a kind may
+// be narrower than the loader as long as it is never wider.
 func uuidOK(s string) bool {
+	if len(s) == 32 {
+		return allHex(s)
+	}
 	if len(s) != 36 {
 		return false
 	}
@@ -321,15 +328,17 @@ func allHex(s string) bool {
 	return true
 }
 
-// key32OK reads a WireGuard key as the loader does: 64 hex digits, or base64 of 32
-// bytes where "-" and "_" stand for "+" and "/".
+// key32OK reads a WireGuard key as ParseWireGuardKey does: 64 hex digits, or base64 of
+// 32 bytes where "-" and "_" stand for "+" and "/". The loader trims one trailing "="
+// and decodes with the Raw encodings, so a key with no padding is as valid as one with.
 func key32OK(s string) bool {
 	if len(s) == 64 && allHex(s) {
 		_, err := hex.DecodeString(s)
 		return err == nil
 	}
+	s = strings.TrimSuffix(s, "=")
 	s = strings.NewReplacer("-", "+", "_", "/").Replace(s)
-	b, err := base64.StdEncoding.DecodeString(s)
+	b, err := base64.RawStdEncoding.DecodeString(s)
 	return err == nil && len(b) == 32
 }
 

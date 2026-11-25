@@ -26,7 +26,7 @@ var requiredGroups = map[string]int{
 	// sharedtool failover-vectors and nobody edits it.
 	"zone-answer": 65, "zone-failover": 124, "pair-table-validate": 67,
 	// P4b B1 (SC 14, p4b-proxy 7.2, 7.3): the Xray allow-list and the share link converter.
-	"xray": 133, "sharelink": 46, "grants": 39,
+	"xray": 142, "sharelink": 46, "grants": 39,
 }
 
 // extraGroups are groups the module has that section 15 does not list by name:

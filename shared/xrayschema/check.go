@@ -574,15 +574,32 @@ func (c *ctx) walk(n *node, v *val, path string) {
 		}
 	case kEnum:
 		c.walkEnum(n, v, path)
+	case kOneOf:
+		// The loader folds the case of an enum that sits in a choice (fragment.packets
+		// is lower-cased), so it is written in its canonical form like a plain enum.
+		if v.k == 's' {
+			for _, a := range n.alts {
+				if canon, ok := a.enum[strings.ToLower(v.s)]; a.k == kEnum && ok && canon != v.s {
+					c.changed(path, "value written in its canonical form")
+					v.s = canon
+					break
+				}
+			}
+		}
+		c.walkLeaf(n, v, path)
 	case kHeaders:
 		c.walkHeaders(n, v, path)
 	default:
-		if v.k == 's' && !c.checkString(path, v.s) {
-			return
-		}
-		if why := fits(n, v); why != "" {
-			c.unfit(path, why, v)
-		}
+		c.walkLeaf(n, v, path)
+	}
+}
+
+func (c *ctx) walkLeaf(n *node, v *val, path string) {
+	if v.k == 's' && !c.checkString(path, v.s) {
+		return
+	}
+	if why := fits(n, v); why != "" {
+		c.unfit(path, why, v)
 	}
 }
 
@@ -757,10 +774,11 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 			switch {
 			case emptyValue(it.m.v, false):
 				c.drop(it.m, p, "null or empty, the default of Xray")
-			case g.child != nil && g.child.k == kDropped && (!g.child.zeroOnly || isZero(it.m.v)):
+			case g.child != nil && g.child.k == kDropped && (!g.child.zeroOnly || isZero(it.m.v)) && (!g.child.firstOnly || c.out == 0):
 				c.drop(it.m, p, "it has no effect on this node")
 			case g.child != nil && g.child.k == kDropped:
-				// A legacy key with a value that is not its dropped one is unknown.
+				// A legacy key with a value that is not its dropped one, or a key that is idle
+				// on the first outbound alone and sits on a hop, is unknown.
 				c.warn(p, "unknown key")
 				c.scanRaw(it.m.v, p)
 				live = append(live, it)
@@ -955,6 +973,17 @@ func (c *ctx) chain(outs *val) {
 	}
 	if len(c.res.Rejected) != 0 {
 		return
+	}
+	// A hysteria outbound that is a hop is handed the UDP of the outbound before it
+	// (wireguard, hysteria, xhttp over h3, kcp, and any socks or shadowsocks hop between
+	// them dial UDP), and it sends that as QUIC datagrams cut to the size the exit
+	// announces, with no lower bound. FragUDPMessage counts the fragments in a uint8, so a
+	// small size indexes past its slice and ends the process that all locations share
+	// (B1n-r3-2). The closed rule is the simple one: hysteria anywhere but first is unknown.
+	for i := 1; i < len(outs.items); i++ {
+		if p := memberOf(outs.items[i], "protocol"); p != nil && p.k == 's' && p.s == "hysteria" {
+			c.warn("outbounds["+strconv.Itoa(i)+"].settings", "a hysteria outbound used as a hop can be handed UDP, which it sends as datagrams of a size the exit chooses")
+		}
 	}
 	for i, o := range outs.items {
 		set := false
