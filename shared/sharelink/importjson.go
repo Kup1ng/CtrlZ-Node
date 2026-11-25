@@ -76,14 +76,36 @@ func FromJSON(data []byte) (ImportResult, error) {
 			byTag[in.tag] = append(byTag[in.tag], i)
 		}
 	}
+	// An outbound is named when another outbound (not itself) has its tag as a
+	// dialerProxy. The references are counted per tag first, each outbound once per tag,
+	// so the work is the number of outbounds plus the number of links: walking every
+	// outbound of a tag for every link made one paste of 364 KB cost seven seconds
+	// (B1-r3-7).
+	refs := map[string]int{}
+	for i := range info {
+		// inspect sorts the dialers, so a repeat is the neighbour of its twin.
+		for k, d := range info[i].dialers {
+			if k > 0 && info[i].dialers[k-1] == d {
+				continue
+			}
+			refs[d]++
+		}
+	}
 	named := map[int]bool{}
 	for i := range info {
+		t := info[i].tag
+		if t == "" || refs[t] == 0 {
+			continue
+		}
+		self := 0
 		for _, d := range info[i].dialers {
-			for _, j := range byTag[d] {
-				if j != i {
-					named[j] = true
-				}
+			if d == t {
+				self = 1
+				break
 			}
+		}
+		if refs[t]-self > 0 {
+			named[i] = true
 		}
 	}
 	for i := range outs {

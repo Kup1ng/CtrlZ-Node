@@ -148,6 +148,9 @@ enum NodeFault {
   NODE_FAULT_XRAY_DOWN = 2;
   NODE_FAULT_BLOCK_KEY_MISSING = 3;
   NODE_FAULT_GRANTS_FULL = 4;
+  // Set while any remote is under the backoff of p4b-proxy 5.5. It takes 5, the next free
+  // number, so the numbers 1 to 4 that nodes already send stay; p6-ops 7.4 starts at 6.
+  NODE_FAULT_XRAY_STUCK = 5;
 }
 
 // fetched is the newest verified Xray bundle on the node, version the last upgrade

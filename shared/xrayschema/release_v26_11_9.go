@@ -10,6 +10,17 @@ package xrayschema
 // register it in tables.go, keep this one. A node may stay on any release that was
 // ever shipped (7.2), so no table is ever deleted.
 
+// Bounds of the numbers that size a buffer, a slice or a wait (B1-r3-3, B1-r3-4). Each
+// is far above any real use and far below what one process of 5 GiB shared by every
+// location can take from a single connection.
+const (
+	maxFragment   = 65535    // a fragment or a rand is cut from a packet of at most this size
+	maxSplits     = 4096     // pieces one write may be cut into
+	maxWaitMs     = 10000    // one pause between two writes or posts
+	maxWindow     = 16 << 20 // a flow-control or receive window
+	maxQuicWindow = 32 << 20 // the same for QUIC: the Hysteria 2 default connection window is 20 MiB
+)
+
 func outbound() *node {
 	protocols := map[string]*node{
 		"vless":       vlessSettings(),
@@ -28,7 +39,7 @@ func outbound() *node {
 		f("settings", raw()),
 		f("streamSettings", streamSettings()),
 		f("mux", obj(
-			f("enabled", boolean()), f("concurrency", num()), f("xudpConcurrency", num()), f("xudpProxyUDP443", str()),
+			f("enabled", boolean()), f("concurrency", bnum(-1, 1024)), f("xudpConcurrency", bnum(-1, 1024)), f("xudpProxyUDP443", str()),
 		)),
 		f("targetStrategy", str()),
 	).withVariant("protocol", "settings", protocols)
@@ -121,7 +132,7 @@ func wireguardSettings() *node {
 		f("allowedIPs", arr(str())), f("level", num()), f("email", str()))
 	return obj(
 		f("noKernelTun", boolean()), f("secretKey", str()), f("address", arr(str())), f("peers", arr(peer)),
-		f("mtu", num()), f("reserved", arr(num())), f("remoteDNS", arr(str())),
+		f("mtu", bnum(0, 9000)), f("reserved", arr(num())), f("remoteDNS", arr(str())),
 	).refusing("isClient", "turns the client into a server").forcing("noKernelTun")
 }
 
@@ -129,11 +140,11 @@ func wireguardSettings() *node {
 // ours: the agent writes the rules of 7.4 on every freedom outbound, so a rule of the
 // user's would only suggest that it applies.
 func freedomSettings() *node {
-	noise := obj(f("type", str()), f("packet", str()), f("delay", rng()), f("applyTo", str()))
+	noise := obj(f("type", str()), f("packet", str()), f("delay", brange(0, maxWaitMs)), f("applyTo", str()))
 	return obj(
 		f("targetStrategy", str()), f("domainStrategy", str()), f("userLevel", num()),
-		f("fragment", obj(f("packets", str()), f("length", rng()), f("interval", rng()), f("maxSplit", rng()))),
-		f("noise", noise), f("noises", arr(noise)), f("proxyProtocol", num()),
+		f("fragment", obj(f("packets", str()), f("length", brange(1, maxFragment)), f("interval", brange(0, maxWaitMs)), f("maxSplit", brange(0, maxSplits)))),
+		f("noise", noise), f("noises", arr(noise)), f("proxyProtocol", bnum(0, 2)),
 	).refusing("finalRules", "the node writes the final rules of every freedom outbound").
 		refusing("ipsBlocked", "the node writes the final rules of every freedom outbound")
 }
@@ -154,7 +165,7 @@ func streamSettings() *node {
 		f("grpcSettings", grpcSettings()),
 		f("wsSettings", wsSettings()),
 		f("httpupgradeSettings", httpUpgradeSettings()),
-		f("hysteriaSettings", obj(f("version", num()), f("auth", str()), f("udpIdleTimeout", num()))),
+		f("hysteriaSettings", obj(f("version", num()), f("auth", str()), f("udpIdleTimeout", bnum(0, 3600)))),
 		f("sockopt", sockopt()),
 	).aliased("method", "network").
 		aliased("rawSettings", "tcpSettings").
@@ -202,18 +213,18 @@ func rawSettings() *node {
 }
 
 func xhttpSettings() *node {
-	xmux := obj(f("maxConcurrency", rng()), f("maxConnections", rng()), f("cMaxReuseTimes", rng()),
-		f("hMaxRequestTimes", rng()), f("hMaxReusableSecs", rng()), f("hKeepAlivePeriod", num()))
+	xmux := obj(f("maxConcurrency", brange(0, 1024)), f("maxConnections", brange(0, 256)), f("cMaxReuseTimes", brange(0, 1<<20)),
+		f("hMaxRequestTimes", brange(0, 1<<20)), f("hMaxReusableSecs", brange(0, 86400)), f("hKeepAlivePeriod", bnum(-1, 3600)))
 	return obj(
 		f("host", str()), f("path", str()), f("mode", str()), f("headers", strMap()),
-		f("xPaddingBytes", rng()), f("xPaddingObfsMode", boolean()), f("xPaddingKey", str()),
+		f("xPaddingBytes", brange(0, 8192)), f("xPaddingObfsMode", boolean()), f("xPaddingKey", str()),
 		f("xPaddingHeader", str()), f("xPaddingPlacement", str()), f("xPaddingMethod", str()),
 		f("uplinkHTTPMethod", str()), f("sessionIDPlacement", str()), f("sessionIDKey", str()),
-		f("sessionIDTable", str()), f("sessionIDLength", rng()), f("seqPlacement", str()), f("seqKey", str()),
-		f("uplinkDataPlacement", str()), f("uplinkDataKey", str()), f("uplinkChunkSize", rng()),
-		f("noGRPCHeader", boolean()), f("noSSEHeader", boolean()), f("scMaxEachPostBytes", rng()),
-		f("scMinPostsIntervalMs", rng()), f("scMaxBufferedPosts", num()), f("scStreamUpServerSecs", rng()),
-		f("serverMaxHeaderBytes", num()), f("xmux", xmux),
+		f("sessionIDTable", str()), f("sessionIDLength", brange(0, 1024)), f("seqPlacement", str()), f("seqKey", str()),
+		f("uplinkDataPlacement", str()), f("uplinkDataKey", str()), f("uplinkChunkSize", brange(0, 1<<20)),
+		f("noGRPCHeader", boolean()), f("noSSEHeader", boolean()), f("scMaxEachPostBytes", brange(1, 4<<20)),
+		f("scMinPostsIntervalMs", brange(0, maxWaitMs)), f("scMaxBufferedPosts", bnum(0, 1024)), f("scStreamUpServerSecs", brange(0, 3600)),
+		f("serverMaxHeaderBytes", bnum(0, 1<<20)), f("xmux", xmux),
 		f("downloadSettings", lazy(streamSettings)),
 		// "extra" is read again by the loader as xhttp settings, so it is judged as such.
 		f("extra", lazy(xhttpSettings)),
@@ -223,21 +234,21 @@ func xhttpSettings() *node {
 
 func kcpSettings() *node {
 	return obj(
-		f("mtu", num()), f("tti", num()), f("uplinkCapacity", num()), f("downlinkCapacity", num()),
-		f("cwndMultiplier", num()), f("maxSendingWindow", num()), f("header", raw()), f("seed", str()),
+		f("mtu", bnum(21, 1500)), f("tti", bnum(0, 1000)), f("uplinkCapacity", bnum(0, 1000)), f("downlinkCapacity", bnum(0, 1000)),
+		f("cwndMultiplier", bnum(0, 256)), f("maxSendingWindow", bnum(0, 16384)), f("header", raw()), f("seed", str()),
 	)
 }
 
 func grpcSettings() *node {
 	return obj(
-		f("authority", str()), f("serviceName", str()), f("multiMode", boolean()), f("idle_timeout", num()),
-		f("health_check_timeout", num()), f("permit_without_stream", boolean()), f("initial_windows_size", num()),
+		f("authority", str()), f("serviceName", str()), f("multiMode", boolean()), f("idle_timeout", bnum(0, 86400)),
+		f("health_check_timeout", bnum(0, 86400)), f("permit_without_stream", boolean()), f("initial_windows_size", bnum(0, maxWindow)),
 		f("user_agent", str()),
 	)
 }
 
 func wsSettings() *node {
-	return obj(f("host", str()), f("path", str()), f("headers", strMap()), f("heartbeatPeriod", num()))
+	return obj(f("host", str()), f("path", str()), f("headers", strMap()), f("heartbeatPeriod", bnum(0, 3600)))
 }
 
 func httpUpgradeSettings() *node {
@@ -249,10 +260,10 @@ func httpUpgradeSettings() *node {
 func sockopt() *node {
 	return obj(
 		f("tcpFastOpen", anyScalar()), f("domainStrategy", str()), f("dialerProxy", dialerTag()),
-		f("tcpKeepAliveInterval", num()), f("tcpKeepAliveIdle", num()), f("tcpCongestion", str()),
-		f("tcpWindowClamp", num()), f("tcpMaxSeg", num()), f("penetrate", boolean()), f("tcpUserTimeout", num()),
+		f("tcpKeepAliveInterval", bnum(-1, 86400)), f("tcpKeepAliveIdle", bnum(-1, 86400)), f("tcpCongestion", str()),
+		f("tcpWindowClamp", bnum(0, maxWindow)), f("tcpMaxSeg", bnum(0, 65535)), f("penetrate", boolean()), f("tcpUserTimeout", bnum(0, 3600000)),
 		f("v6only", boolean()), f("tcpMptcp", boolean()),
-		f("happyEyeballs", obj(f("prioritizeIPv6", boolean()), f("tryDelayMs", num()), f("interleave", num()), f("maxConcurrentTry", num()))),
+		f("happyEyeballs", obj(f("prioritizeIPv6", boolean()), f("tryDelayMs", bnum(0, maxWaitMs)), f("interleave", bnum(0, 64)), f("maxConcurrentTry", bnum(0, 16)))),
 		f("trustedXForwardedFor", arr(str())),
 	)
 }
@@ -269,29 +280,28 @@ func finalmask() *node {
 		}
 		return obj(f("type", enumOf(true, kinds...)), f("settings", raw())).withVariant("type", "settings", settings)
 	}
-	rg := rng()
 	tcp := mask(map[string]*node{
 		"filter": obj(f("blockedSourceIPs", arr(str())), f("allowedSourceIPs", arr(str()))),
-		"fragment": obj(f("packets", str()), f("length", rg), f("delay", rg), f("lengths", arr(rg)), f("delays", arr(rg)),
-			f("maxSplit", rg)),
+		"fragment": obj(f("packets", str()), f("length", brange(1, maxFragment)), f("delay", brange(0, maxWaitMs)),
+			f("lengths", arr(brange(1, maxFragment))), f("delays", arr(brange(0, maxWaitMs))), f("maxSplit", brange(0, maxSplits))),
 		"sudoku": sudoku(),
 	})
-	noiseItem := obj(f("rand", rg), f("randRange", rg), f("type", str()), f("packet", raw()), f("delay", rg))
+	noiseItem := obj(f("rand", brange(0, 65535)), f("randRange", brange(0, 255)), f("type", str()), f("packet", raw()), f("delay", brange(0, maxWaitMs)))
 	udp := mask(map[string]*node{
 		"filter":      obj(f("blockedSourceIPs", arr(str())), f("allowedSourceIPs", arr(str()))),
 		"mkcp-legacy": obj(f("header", str()), f("value", str())),
-		"noise":       obj(f("reset", rg), f("noise", arr(noiseItem))),
-		"salamander":  obj(f("password", str()), f("packetSize", rg)),
+		"noise":       obj(f("reset", brange(0, 86400)), f("noise", arr(noiseItem))),
+		"salamander":  obj(f("password", str()), f("packetSize", brange(0, 65535))),
 		"sudoku":      sudoku(),
-		"udphop":      obj(f("mode", str()), f("interval", rg), f("remoteIPs", arr(str())), f("remotePorts", rng())),
+		"udphop":      obj(f("mode", str()), f("interval", brange(1, 86400)), f("remoteIPs", arr(str())), f("remotePorts", ports())),
 	})
 	quic := obj(
 		f("congestion", str()), f("bbrProfile", str()), f("brutalUp", anyScalar()),
 		f("brutalDown", anyScalar()), f("brutalDisableLossCompensation", boolean()),
-		f("initStreamReceiveWindow", num()), f("maxStreamReceiveWindow", num()),
-		f("initConnectionReceiveWindow", num()), f("maxConnectionReceiveWindow", num()),
-		f("maxIdleTimeout", num()), f("keepAlivePeriod", num()), f("disablePathMTUDiscovery", boolean()),
-		f("disableChromeParrot", boolean()), f("disableGSO", boolean()), f("maxIncomingStreams", num()),
+		f("initStreamReceiveWindow", bnum(0, maxQuicWindow)), f("maxStreamReceiveWindow", bnum(0, maxQuicWindow)),
+		f("initConnectionReceiveWindow", bnum(0, maxQuicWindow)), f("maxConnectionReceiveWindow", bnum(0, maxQuicWindow)),
+		f("maxIdleTimeout", bnum(0, 3600)), f("keepAlivePeriod", bnum(0, 3600)), f("disablePathMTUDiscovery", boolean()),
+		f("disableChromeParrot", boolean()), f("disableGSO", boolean()), f("maxIncomingStreams", bnum(0, 8192)),
 		f("disableStatelessReset", boolean()),
 	).refusing("debug", "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process")
 	return obj(f("tcp", arr(tcp)), f("udp", arr(udp)), f("quicParams", quic))
@@ -309,7 +319,9 @@ func sudoku() *node {
 
 // statefulRules classifies every protocol and every transport of the table (7.2,
 // finding 4): rmo only drops the tag of an outbound and never closes its handler, so
-// a wireguard device with its UDP socket, a hysteria session and an xhttp session over
+// a wireguard device with its UDP socket, a hysteria session, a grpc ClientConn (the
+// process-wide globalDialerMap of transport/internet/grpc keeps it up to 30 min after
+// its last call, with keepalive pings, and redials a dead exit; read, not run) and an xhttp session over
 // h3 stay up until the process ends. A change to such a config therefore rebuilds in
 // the idle slot (7.5 step 5). Each protocol and transport of the table is named here,
 // so a release that adds one fails TestEveryProtocolAndTransportIsClassified until
@@ -321,7 +333,7 @@ func statefulRules() statefulSet {
 			"http": false, "freedom": false, "hysteria": true, "wireguard": true,
 		},
 		transports: map[string]transportState{
-			"raw": never, "kcp": never, "grpc": never, "ws": never, "httpupgrade": never,
+			"raw": never, "kcp": never, "ws": never, "httpupgrade": never, "grpc": always,
 			"hysteria": always, "xhttp": withH3,
 		},
 	}

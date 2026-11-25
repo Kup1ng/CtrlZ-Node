@@ -270,7 +270,7 @@ func validateHeartbeatP4b(h *hubv1.Heartbeat) error {
 	}
 	faults := map[hubv1.NodeFault]bool{}
 	for _, f := range h.Faults {
-		if f < hubv1.NodeFault_NODE_FAULT_NFT_FAILED || f > hubv1.NodeFault_NODE_FAULT_GRANTS_FULL {
+		if f < hubv1.NodeFault_NODE_FAULT_NFT_FAILED || f > hubv1.NodeFault_NODE_FAULT_XRAY_STUCK {
 			return bad(reason.BadEnum, w, "fault %d", f)
 		}
 		if faults[f] {

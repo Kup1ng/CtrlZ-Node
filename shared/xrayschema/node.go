@@ -58,6 +58,8 @@ type node struct {
 	check func(string) string
 	// forceTrue lists boolean keys that the normal form always sets to true.
 	forceTrue []string
+	// lim bounds the values of a kNum or a kRange (see limit); nil leaves them free.
+	lim *limit
 }
 
 func (n *node) resolve() *node {
@@ -146,3 +148,33 @@ func (n *node) withVariant(selKey, selOn string, by map[string]*node) *node {
 	n.selKey, n.selOn, n.sel = selKey, selOn, by
 	return n
 }
+
+// limit is the closed range of values a number or a range of a release table may
+// hold. The loader of Xray checks few of them, and a value outside what the code
+// below it expects is not a refused config but a panic in the one process every
+// location of the node shares (a negative length sliced from a buffer, a window that
+// sizes a pipe), so a key that sizes a buffer, a slice or a wait is bounded here.
+type limit struct {
+	lo, hi int64
+	// list lets a range hold several parts joined by commas (Xray's PortList).
+	list bool
+}
+
+// within bounds a number (kNum) or a range (kRange) to [lo, hi].
+func (n *node) within(lo, hi int64) *node {
+	n.lim = &limit{lo: lo, hi: hi}
+	return n
+}
+
+// ports is a range of ports that may also hold a list of ranges.
+func ports() *node {
+	n := rng().within(1, 65535)
+	n.lim.list = true
+	return n
+}
+
+// bnum is a number in [lo, hi].
+func bnum(lo, hi int64) *node { return num().within(lo, hi) }
+
+// brange is a range of numbers (a number, or "a-b") with both ends in [lo, hi].
+func brange(lo, hi int64) *node { return rng().within(lo, hi) }

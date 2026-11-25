@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"sort"
 	"strconv"
@@ -504,6 +505,11 @@ func convertVMess(rest string) (map[string]any, string, error) {
 	if err := dec.Decode(&j); err != nil || j == nil {
 		return nil, "", errors.New("the vmess link does not hold a JSON object")
 	}
+	// Decode reads one value and ignores what follows it, so a second object or a stray
+	// word after the first would be dropped without a word (R14).
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, "", errors.New("the vmess link has text after its JSON object")
+	}
 	if repeatsAKey(b) {
 		return nil, "", errors.New("the vmess JSON gives a field twice")
 	}
@@ -564,12 +570,22 @@ func convertVMess(rest string) (map[string]any, string, error) {
 	case "ws", "httpupgrade", "xhttp":
 		p.m["type"] = net
 		p.m["host"], p.m["path"] = lower["host"], lower["path"]
+		// v2rayN keeps the xhttp mode in "type"; for ws and httpupgrade it holds only none.
+		switch t := strings.ToLower(lower["type"]); {
+		case t == "" || t == "none":
+		case net == "xhttp":
+			p.m["mode"] = lower["type"]
+		default:
+			return nil, "", errors.New("field \"type\" must be none or empty for ws and httpupgrade")
+		}
 	case "grpc":
 		p.m["type"] = "grpc"
 		p.m["servicename"], p.m["authority"], p.m["mode"] = lower["path"], lower["host"], lower["type"]
 	case "kcp", "mkcp":
 		p.m["type"] = "kcp"
 		p.m["seed"], p.m["headertype"] = lower["path"], lower["type"]
+		// host has no place in kcp; stream refuses it by name, so it is not lost silently.
+		p.m["host"] = lower["host"]
 	default:
 		p.m["type"] = net
 	}

@@ -18,15 +18,15 @@ import (
 // added to this list in the same change; until then a file of that name is an
 // unlisted file and fails TestGroupFilesAreTheListedOnes.
 var requiredGroups = map[string]int{
-	"hash": 17, "names": 57, "identity": 68, "tokens": 54, "precedence": 18, "specificity": 19, "merge": 13,
+	"hash": 17, "names": 57, "identity": 69, "tokens": 54, "precedence": 18, "specificity": 19, "merge": 13,
 	"schedule": 15, "client-order": 4, "expiry": 7, "geo-order": 10, "dest-geo": 17, "cname": 13,
-	"qtype-matrix": 61, "options": 40, "safe-search": 9, "dnssec": 20, "sysnames": 19, "locations": 9,
+	"qtype-matrix": 62, "options": 43, "safe-search": 15, "dnssec": 24, "sysnames": 19, "locations": 9,
 	"auto-random": 13, "route": 18, "upload": 8, "blob": 37, "gtable": 23, "quarantine": 14, "no-redirect": 36,
 	// P4 W1 (SC 8a.10): the zone package. zone-failover is written by
 	// sharedtool failover-vectors and nobody edits it.
-	"zone-answer": 65, "zone-failover": 119, "pair-table-validate": 67,
+	"zone-answer": 65, "zone-failover": 124, "pair-table-validate": 67,
 	// P4b B1 (SC 14, p4b-proxy 7.2, 7.3): the Xray allow-list and the share link converter.
-	"xray": 72, "sharelink": 29, "grants": 36,
+	"xray": 95, "sharelink": 36, "grants": 39,
 }
 
 // extraGroups are groups the module has that section 15 does not list by name:
@@ -34,7 +34,7 @@ var requiredGroups = map[string]int{
 var extraGroups = map[string]int{
 	"locations-sets": 26, "schedule-zones": 6, "traffic-cat": 5, "manifest": 26,
 	// P3 (SC 14 and 15): the Apple DNS profile request, its stored form and its identity.
-	"appleprofile": 23,
+	"appleprofile": 31,
 	// P4 W1b: the activity entry of three forms and the free part of a counters batch.
 	"telemetry-validate": 35,
 	// P4 W1b (D42, T-524): a Redirect for an Iranian name is a Bypass at every stage.

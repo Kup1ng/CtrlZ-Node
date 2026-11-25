@@ -261,7 +261,7 @@ func TestValidateHeartbeatP4b(t *testing.T) {
 			}
 		},
 		"fault 0":             func(h *hubv1.Heartbeat) { h.Faults = []hubv1.NodeFault{0} },
-		"fault 5":             func(h *hubv1.Heartbeat) { h.Faults = []hubv1.NodeFault{5} },
+		"fault 6":             func(h *hubv1.Heartbeat) { h.Faults = []hubv1.NodeFault{6} },
 		"a fault twice":       func(h *hubv1.Heartbeat) { h.Faults = []hubv1.NodeFault{2, 2} },
 		"bind_error 5":        func(h *hubv1.Heartbeat) { h.BindError = 5 },
 		"upgrade version bad": func(h *hubv1.Heartbeat) { h.XrayUpgrade = &hubv1.XrayUpgradeState{Version: "a\nb"} },
@@ -373,4 +373,34 @@ func FuzzValidateP4bMessages(f *testing.F) {
 			}
 		}
 	})
+}
+
+// A value the enum has and the validator refuses would drop the whole Heartbeat of
+// a node in exactly the incident that value reports (B1-r3-1, xray_stuck), so every
+// value the generated enum holds is sent, and the one above the last is refused.
+func TestValidateHeartbeatEveryNodeFault(t *testing.T) {
+	values := hubv1.NodeFault(0).Descriptor().Values()
+	last := hubv1.NodeFault(0)
+	for i := 0; i < values.Len(); i++ {
+		f := hubv1.NodeFault(values.Get(i).Number())
+		if f > last {
+			last = f
+		}
+		if f == hubv1.NodeFault_NODE_FAULT_UNSPECIFIED {
+			continue
+		}
+		h := goodHeartbeat()
+		h.Faults = []hubv1.NodeFault{f}
+		if err := ValidateHeartbeat(h); err != nil {
+			t.Errorf("fault %s: %v", f, err)
+		}
+	}
+	h := goodHeartbeat()
+	h.Faults = []hubv1.NodeFault{last + 1}
+	if ValidateHeartbeat(h) == nil {
+		t.Errorf("fault %d above the last value accepted", last+1)
+	}
+	if hubv1.NodeFault_NODE_FAULT_XRAY_STUCK != 5 {
+		t.Errorf("xray_stuck is %d; p6-ops 7.4 starts its faults at 6", hubv1.NodeFault_NODE_FAULT_XRAY_STUCK)
+	}
 }

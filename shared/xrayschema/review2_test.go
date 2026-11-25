@@ -77,6 +77,8 @@ func TestStatefulConfigs(t *testing.T) {
 		"hysteria protocol":      `{"outbounds":[` + hyOutbound + `]}`,
 		"hysteria transport":     `{"outbounds":[` + vlessPrefix + `,"streamSettings":{"method":"hysteria"}}]}`,
 		"transport, old name":    `{"outbounds":[` + vlessPrefix + `,"streamSettings":{"network":"Hysteria"}}]}`,
+		"grpc transport":         `{"outbounds":[` + vlessPrefix + `,"streamSettings":{"method":"grpc"}}]}`,
+		"grpc, old case":         `{"outbounds":[` + vlessPrefix + `,"streamSettings":{"network":"GRPC"}}]}`,
 		"wireguard as a hop":     `{"outbounds":[` + vlessPrefix + `,"streamSettings":{"sockopt":{"dialerProxy":"w"}}},` + strings.Replace(wgOutbound, `"protocol"`, `"tag":"w","protocol"`, 1) + `]}`,
 		"protocol in any case":   `{"outbounds":[{"PROTOCOL":"WireGuard"}]}`,
 		"xhttp h3 array":         xhttp(`,"alpn":["h3"]`, ""),

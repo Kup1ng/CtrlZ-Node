@@ -7,7 +7,7 @@ type transportState uint8
 
 const (
 	never  transportState = iota // nothing outlives the handler
-	always                       // a session in a map of the process, kept open by the transport itself
+	always                       // a session or connection in a map of the process that nothing closes (hysteria, grpc)
 	withH3                       // only with h3 in the alpn of its TLS settings (xhttp)
 )
 
@@ -19,7 +19,7 @@ type statefulSet struct {
 
 // Stateful reports whether the config holds an outbound, at any depth, whose handler
 // keeps a device, a socket or a session that rmo leaves up (p4b-proxy 7.2): protocol
-// wireguard or hysteria, transport hysteria, or xhttp with h3 in an alpn anywhere
+// wireguard or hysteria, transport hysteria or grpc, or xhttp with h3 in an alpn anywhere
 // inside its stream settings (tlsSettings, downloadSettings and extra included). B5
 // rebuilds such a config in the idle slot on every change, removal or disable.
 //

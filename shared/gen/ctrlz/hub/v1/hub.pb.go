@@ -144,6 +144,9 @@ const (
 	NodeFault_NODE_FAULT_XRAY_DOWN         NodeFault = 2
 	NodeFault_NODE_FAULT_BLOCK_KEY_MISSING NodeFault = 3
 	NodeFault_NODE_FAULT_GRANTS_FULL       NodeFault = 4
+	// Set while any remote is under the backoff of p4b-proxy 5.5. It takes 5, the next free
+	// number, so the numbers 1 to 4 that nodes already send stay; p6-ops 7.4 starts at 6.
+	NodeFault_NODE_FAULT_XRAY_STUCK NodeFault = 5
 )
 
 // Enum value maps for NodeFault.
@@ -154,6 +157,7 @@ var (
 		2: "NODE_FAULT_XRAY_DOWN",
 		3: "NODE_FAULT_BLOCK_KEY_MISSING",
 		4: "NODE_FAULT_GRANTS_FULL",
+		5: "NODE_FAULT_XRAY_STUCK",
 	}
 	NodeFault_value = map[string]int32{
 		"NODE_FAULT_UNSPECIFIED":       0,
@@ -161,6 +165,7 @@ var (
 		"NODE_FAULT_XRAY_DOWN":         2,
 		"NODE_FAULT_BLOCK_KEY_MISSING": 3,
 		"NODE_FAULT_GRANTS_FULL":       4,
+		"NODE_FAULT_XRAY_STUCK":        5,
 	}
 )
 
@@ -3537,13 +3542,14 @@ const file_ctrlz_hub_v1_hub_proto_rawDesc = "" +
 	"\x1eXRAY_CONFIG_STATE_KIND_PENDING\x10\x01\x12\"\n" +
 	"\x1eXRAY_CONFIG_STATE_KIND_APPLIED\x10\x02\x12\"\n" +
 	"\x1eXRAY_CONFIG_STATE_KIND_REFUSED\x10\x03\x12$\n" +
-	" XRAY_CONFIG_STATE_KIND_LAST_GOOD\x10\x04*\x9a\x01\n" +
+	" XRAY_CONFIG_STATE_KIND_LAST_GOOD\x10\x04*\xb5\x01\n" +
 	"\tNodeFault\x12\x1a\n" +
 	"\x16NODE_FAULT_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15NODE_FAULT_NFT_FAILED\x10\x01\x12\x18\n" +
 	"\x14NODE_FAULT_XRAY_DOWN\x10\x02\x12 \n" +
 	"\x1cNODE_FAULT_BLOCK_KEY_MISSING\x10\x03\x12\x1a\n" +
-	"\x16NODE_FAULT_GRANTS_FULL\x10\x04*\x9d\x01\n" +
+	"\x16NODE_FAULT_GRANTS_FULL\x10\x04\x12\x19\n" +
+	"\x15NODE_FAULT_XRAY_STUCK\x10\x05*\x9d\x01\n" +
 	"\tBindError\x12\x1a\n" +
 	"\x16BIND_ERROR_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18BIND_ERROR_DNS_NOT_LOCAL\x10\x01\x12\x19\n" +

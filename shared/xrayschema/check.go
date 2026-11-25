@@ -574,6 +574,8 @@ func (c *ctx) walk(n *node, v *val, path string) {
 	case kNum:
 		if v.k != 'n' {
 			c.reject(path, "expected a number")
+		} else if n.lim != nil && !inLimit(v.s, n.lim) {
+			c.reject(path, limitText(n.lim))
 		}
 	case kBool:
 		if v.k != 'b' {
@@ -599,8 +601,13 @@ func (c *ctx) walk(n *node, v *val, path string) {
 	case kRange:
 		switch v.k {
 		case 'n':
+			if n.lim != nil && !inLimit(v.s, n.lim) {
+				c.reject(path, limitText(n.lim))
+			}
 		case 's':
-			c.checkString(path, v.s)
+			if c.checkString(path, v.s) && n.lim != nil && !rangeInLimit(v.s, n.lim) {
+				c.reject(path, limitText(n.lim))
+			}
 		default:
 			c.reject(path, "expected a number or a string")
 		}
@@ -975,4 +982,70 @@ func writeString(b *bytes.Buffer, s string) {
 	_ = e.Encode(s)
 	// Encode ends the value with a newline.
 	b.Truncate(b.Len() - 1)
+}
+
+// ---- bounded numbers ---------------------------------------------------------------
+
+// inLimit says whether the number written as text lies in [lo, hi]. An exponent or a
+// fraction is read as a float, because Go's decoder takes 1e3 for an integer field,
+// and the bound is what counts.
+func inLimit(text string, l *limit) bool {
+	if i, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return i >= l.lo && i <= l.hi
+	}
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return false
+	}
+	return f >= float64(l.lo) && f <= float64(l.hi)
+}
+
+// rangeInLimit judges the text of a range: "a", "a-b", and for a port list several of
+// them joined by commas. Either end may carry a minus sign, so "-1" and "-5-3" are
+// read as the negative numbers Xray's parser would make of them and refused by the
+// bound, never taken for a dash. A text that no reading gives whole numbers for is
+// refused too: Xray would fail it at -test, but only after the check had said OK.
+func rangeInLimit(s string, l *limit) bool {
+	parts := []string{s}
+	if l.list {
+		parts = strings.Split(s, ",")
+	}
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return false
+		}
+		if i, err := strconv.ParseInt(p, 10, 64); err == nil {
+			if i < l.lo || i > l.hi {
+				return false
+			}
+			continue
+		}
+		ok := false
+		// The separator is a dash that is not the sign of the first number.
+		for i := 1; i < len(p); i++ {
+			if p[i] != '-' {
+				continue
+			}
+			a, errA := strconv.ParseInt(strings.TrimSpace(p[:i]), 10, 64)
+			b, errB := strconv.ParseInt(strings.TrimSpace(p[i+1:]), 10, 64)
+			if errA != nil || errB != nil {
+				continue
+			}
+			if a < l.lo || a > l.hi || b < l.lo || b > l.hi {
+				return false
+			}
+			ok = true
+			break
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// limitText is the reason of a refused number. It names the bounds and never the value.
+func limitText(l *limit) string {
+	return "must be a whole number from " + strconv.FormatInt(l.lo, 10) + " to " + strconv.FormatInt(l.hi, 10) + ": the node's one Xray process serves every location"
 }
