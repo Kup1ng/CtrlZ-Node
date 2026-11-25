@@ -3,7 +3,7 @@
   "items": [
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=none\u0026flow=xtls-rprx-vision\u0026security=reality\u0026sni=www.example.com\u0026fp=chrome\u0026pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\u0026sid=ab12\u0026spx=%2F\u0026type=tcp#reality-vision",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=none\u0026security=tls\u0026sni=a.example\u0026alpn=h2%2Chttp%2F1.1\u0026fp=chrome\u0026type=ws\u0026path=%2Fws\u0026host=a.example#ws-tls",
-    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@[2001:db8::1]:8443?encryption=none\u0026security=tls\u0026sni=a.example\u0026type=grpc\u0026serviceName=svc\u0026authority=a.example\u0026mode=multi#grpc-v6",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@[2001:db8::1]:8443?encryption=none\u0026security=tls\u0026sni=a.example\u0026type=grpc\u0026serviceName=svc\u0026authority=a.example#grpc-v6",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=none\u0026security=tls\u0026sni=a.example\u0026type=xhttp\u0026path=%2Fx\u0026mode=auto#xhttp",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=none\u0026security=tls\u0026sni=a.example\u0026pcs=abababababababababababababababababababababababababababababababab~cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\u0026type=ws\u0026path=%2Fws\u0026host=a.example#ws-two-pins",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:80?encryption=none\u0026security=none\u0026type=tcp\u0026headerType=http\u0026host=a.example\u0026path=%2F#http-header",

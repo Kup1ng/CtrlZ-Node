@@ -774,7 +774,14 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 			}
 			if child == nil {
 				// The selector is not in the table: the rejection of the selector
-				// stands, and the settings are only scanned.
+				// stands, and the settings are only scanned. A soft selector (a mask
+				// type, say) is only a warning that the admin may accept, and an
+				// acceptance passes the thing at exactly its path. The settings that
+				// no table judged get a path of their own, or one acceptance would
+				// carry a whole unseen subtree into the stored fragment (B1n-r2-5).
+				if sel := n.fields[n.selKey]; n.sel != nil && g.canon == n.selOn && sel != nil && (sel.soft || sel.softVals[selCanon]) {
+					c.warn(p, "unknown key")
+				}
 				c.scanRaw(it.m.v, p)
 			} else {
 				c.walk(child, it.m.v, p)

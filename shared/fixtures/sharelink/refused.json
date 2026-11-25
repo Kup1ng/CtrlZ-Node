@@ -21,6 +21,7 @@
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=reality\u0026sni=a.example\u0026pbk=ZmFrZQ\u0026spx=%2F%3Fp%3D9000000000000000000",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=none\u0026type=kcp",
     "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=mlkem768x25519plus.native.0rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\u0026security=none",
-    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=none\u0026type=xhttp\u0026extra=%7B%22downloadSettings%22%3A%7B%7D%7D"
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=none\u0026type=xhttp\u0026extra=%7B%22downloadSettings%22%3A%7B%7D%7D",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?encryption=none\u0026security=tls\u0026sni=a.example\u0026type=grpc\u0026serviceName=svc\u0026mode=multi#grpc-multi"
   ]
 }

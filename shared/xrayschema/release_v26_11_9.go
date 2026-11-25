@@ -245,9 +245,14 @@ func xhttpSettings() *node {
 	)
 }
 
+// grpcSettings leaves multiMode off the list on purpose (B1n-r2-3). In multi mode the
+// client takes one 8192-byte buffer for every element of a MultiHunk, and the only bound
+// is the 4 MiB message limit of gRPC, so one message of one-byte elements makes Xray
+// allocate gigabytes. multiMode true is an unknown key, and false is the default that
+// the check drops.
 func grpcSettings() *node {
 	return obj(
-		f("authority", text()), f("serviceName", text()), f("multiMode", boolean()), f("permit_without_stream", boolean()),
+		f("authority", text()), f("serviceName", text()), f("permit_without_stream", boolean()),
 		f("idle_timeout", bnum(0, 3600)), f("health_check_timeout", bnum(0, 3600)), f("initial_windows_size", bnum(0, 0)),
 	)
 }

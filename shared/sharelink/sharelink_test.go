@@ -50,8 +50,12 @@ func TestVLESS(t *testing.T) {
 	}
 	got = norm(t, "vless://"+uuid+"@[2001:db8::1]:8443?type=ws&path=%2Fws&host=cdn.example.com&security=tls&sni=cdn.example.com&alpn=h2%2Chttp%2F1.1&fp=firefox&allowInsecure=0")
 	has(t, got, `"address":"2001:db8::1"`, `"method":"ws"`, `"path":"/ws"`, `"host":"cdn.example.com"`, `"alpn":["h2","http/1.1"]`, `"fingerprint":"firefox"`)
-	got = norm(t, "vless://"+uuid+"@a.example:443?type=grpc&serviceName=svc&authority=a.example&mode=multi&security=tls&sni=a.example")
-	has(t, got, `"method":"grpc"`, `"serviceName":"svc"`, `"multiMode":true`)
+	got = norm(t, "vless://"+uuid+"@a.example:443?type=grpc&serviceName=svc&authority=a.example&mode=gun&security=tls&sni=a.example")
+	has(t, got, `"method":"grpc"`, `"serviceName":"svc"`)
+	// B1n-r2-3: multi mode is not on the list, so its link is an error of its line.
+	if _, _, _, err := Convert("vless://" + uuid + "@a.example:443?type=grpc&serviceName=svc&mode=multi&security=tls&sni=a.example"); err == nil {
+		t.Error("grpc mode=multi converted")
+	}
 	got = norm(t, "vless://"+uuid+"@a.example:443?type=xhttp&path=%2Fx&mode=stream-up&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D&security=tls&sni=a.example")
 	has(t, got, `"method":"xhttp"`, `"mode":"stream-up"`, `"extra":{"xPaddingBytes":"100-200"}`)
 	got = norm(t, "vless://"+uuid+"@a.example:80?type=tcp&headerType=http&host=a.example%2Cb.example&path=%2Fa")
@@ -79,9 +83,13 @@ func TestVMess(t *testing.T) {
 		}
 	}
 	// Port as a number, and grpc with its service name in "path".
-	js = `{"v":2,"ps":"g","add":"a.example","port":443,"id":"` + uuid + `","aid":0,"net":"grpc","type":"multi","host":"a.example","path":"svc","tls":"tls"}`
+	js = `{"v":2,"ps":"g","add":"a.example","port":443,"id":"` + uuid + `","aid":0,"net":"grpc","type":"gun","host":"a.example","path":"svc","tls":"tls"}`
 	got := norm(t, "vmess://"+base64.StdEncoding.EncodeToString([]byte(js)))
-	has(t, got, `"serviceName":"svc"`, `"multiMode":true`, `"authority":"a.example"`)
+	has(t, got, `"serviceName":"svc"`, `"authority":"a.example"`)
+	// B1n-r2-3: a vmess exit in multi mode is an error of its line like the vless one.
+	if _, _, _, err := Convert("vmess://" + base64.StdEncoding.EncodeToString([]byte(strings.Replace(js, `"gun"`, `"multi"`, 1)))); err == nil {
+		t.Error("vmess grpc multi converted")
+	}
 	// The URI form.
 	got = norm(t, "vmess://"+uuid+"@a.example:443?encryption=aes-128-gcm&type=ws&path=%2Fp&security=tls&sni=a.example")
 	has(t, got, `"security":"aes-128-gcm"`, `"method":"ws"`)

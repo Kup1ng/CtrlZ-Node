@@ -249,7 +249,9 @@ func TestUnknownKeyIsABlockingWarningUntilItsPathIsAccepted(t *testing.T) {
 		t.Errorf("outbound key: %v", r.Warnings)
 	}
 	r = check(t, outboundWith(`,"streamSettings":{"finalmask":{"udp":[{"type":"noise","settings":{"reset":1}}]}}`))
-	if len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.finalmask.udp[0].type" {
+	// The settings of the unknown type have a warning of their own (B1n-r2-5).
+	if len(r.Warnings) != 2 || r.Warnings[0].Path != "outbounds[0].streamSettings.finalmask.udp[0].type" ||
+		r.Warnings[1].Path != "outbounds[0].streamSettings.finalmask.udp[0].settings" {
 		t.Errorf("unknown mask type: %v %v", r.Warnings, r.Rejected)
 	}
 	// The text of a warning says what accepting it is worth.
@@ -500,7 +502,7 @@ func TestListedKeysPass(t *testing.T) {
 	mustOK(t, outboundWith(`,"streamSettings":{"network":"xhttp",`+tls+`,
 		"xhttpSettings":{"host":"a.example","path":"/x","mode":"auto","headers":{"A":"b"},"noGRPCHeader":true,"xPaddingBytes":"100-1000","scMaxEachPostBytes":1000000,
 		"extra":{"xPaddingBytes":"100-1000","headers":{"A":"b"},"noGRPCHeader":false,"scMaxEachPostBytes":"20000-30000"}}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example","multiMode":true,"permit_without_stream":false,"idle_timeout":60,"health_check_timeout":20,"initial_windows_size":0}}`))
+	mustOK(t, outboundWith(`,"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example","multiMode":false,"permit_without_stream":false,"idle_timeout":60,"health_check_timeout":20,"initial_windows_size":0}}`))
 	mustOK(t, outboundWith(`,"streamSettings":{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"version":"1.1","method":"GET","path":["/a","/b"],"headers":{"Host":["a.example","b.example"],"X":"y"}}}}}`))
 	mustOK(t, outboundWith(`,"streamSettings":{"security":"reality","realitySettings":{"serverName":"a.example","fingerprint":"firefox","publicKey":"`+realityKey+`","shortId":"ab12","spiderX":"/a/b_c-d.e~f"}}`))
 	mustOK(t, `{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"203.0.113.7","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"tlsSettings":{"serverName":"h.example","alpn":["h3"]},

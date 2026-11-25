@@ -298,10 +298,13 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 		setIf(g, "authority", rd("authority"))
 		switch strings.ToLower(rd("mode")) {
 		case "multi":
-			g["multiMode"] = true
+			// Not on the list (7.2): one message of the exit makes the client of the
+			// release allocate gigabytes, so a multi exit is pasted as JSON, where the
+			// admin accepts it knowing that (B1n-r2-3).
+			return nil, errors.New("parameter \"mode\" is multi for grpc, which is not on the list of the allow-list: use gun, or paste the exit as JSON")
 		case "", "gun":
 		default:
-			return nil, errors.New("parameter \"mode\" is not gun or multi for grpc")
+			return nil, errors.New("parameter \"mode\" is not gun for grpc")
 		}
 		ss["grpcSettings"] = g
 	case "xhttp", "splithttp":

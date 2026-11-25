@@ -106,7 +106,8 @@ func TestEveryLeadingBangIsStrippedBeforeThePrefixIsRead(t *testing.T) {
 // type) is still judged for what is never allowed: a dialerProxy escapes the chain
 // check, and quicConfig.debug of an xdns resolver calls os.Setenv.
 func TestAnAcceptedMaskCannotCarryWhatTheTableRefuses(t *testing.T) {
-	accept := []string{"outbounds[0].streamSettings.finalmask.udp[0].type"}
+	// The type and its settings are two paths, and the admin accepts both (B1n-r2-5).
+	accept := []string{"outbounds[0].streamSettings.finalmask.udp[0].type", "outbounds[0].streamSettings.finalmask.udp[0].settings"}
 	mask := func(settings string) string {
 		return outboundWith(`,"streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":` + settings + `}]}}`)
 	}
