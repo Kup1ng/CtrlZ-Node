@@ -16,6 +16,7 @@ package querypath_test
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -276,11 +277,22 @@ func TestFreeJoinWaitsForTheImageOfTheAppliedSeq(t *testing.T) {
 	})
 	_ = l.srv.Publish(&sock.Msg{Type: sock.TypeFacts, Facts: freeFacts(2)})
 	notCaught := freeCountKey{commonv1.Protocol_PROTOCOL_TCP, telemetryv1.FreeOutcome_FREE_OUTCOME_NOT_CAUGHT_UP, uint32(dns.RcodeRefused)}
+	// Publish reaches dns over the socket after it returns, so the first query of the
+	// loop may still be served at seq 1 (and looked up, rightly). Each try has a name of
+	// its own, and the check is on the name of the try that was refused as not caught up.
+	var refused string
+	tries := 0
 	eventually(t, 10*time.Second, "REFUSED while the image is behind", func() bool {
-		r, err := l.ask("seq-two.example.net", true)
-		return err == nil && r.Rcode == dns.RcodeRefused && l.counted(notCaught) >= 1
+		tries++
+		name := fmt.Sprintf("seq-two-%d.example.net", tries)
+		r, err := l.ask(name, true)
+		if err == nil && r.Rcode == dns.RcodeRefused && l.counted(notCaught) >= 1 {
+			refused = name
+			return true
+		}
+		return false
 	})
-	if free.asked("seq-two.example.net") != 0 {
+	if free.asked(refused) != 0 {
 		t.Fatal("a free query was looked up while dns served an image behind the applied seq")
 	}
 }
