@@ -22,11 +22,11 @@ func TestVMessJSONDropsNothing(t *testing.T) {
 	norm(t, vmessLink(base(`,"net":"xhttp","type":"none"`)))
 	norm(t, vmessLink(base(`,"net":"ws","type":"none","path":"/p"`)))
 	norm(t, vmessLink(base(`,"net":"httpupgrade","type":"","path":"/p"`)))
-	norm(t, vmessLink(base(`,"net":"kcp","type":"none"`)))
 	for name, j := range map[string]string{
 		"ws with a type":          base(`,"net":"ws","type":"http"`),
 		"httpupgrade with a type": base(`,"net":"httpupgrade","type":"http"`),
 		"kcp with a host":         base(`,"net":"kcp","host":"a.example"`),
+		"kcp":                     base(`,"net":"kcp","type":"none"`),
 		"text after the object":   base(`,"net":"ws"`) + `{"add":"x"}`,
 		"a word after the object": base(`,"net":"ws"`) + ` junk`,
 	} {

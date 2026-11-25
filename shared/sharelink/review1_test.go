@@ -76,14 +76,9 @@ func TestRepeatedKeysInTheJSONOfALinkAreRefused(t *testing.T) {
 	if _, _, _, err := Convert(extra(`{"xPaddingBytes":"1-2","xPaddingBytes":"3-4"}`)); err == nil {
 		t.Error("extra with a key twice")
 	}
-	// The same key in another case is the checker's: the converter hands it on and the
-	// allow-list refuses it.
-	frag, _, _, err := Convert(extra(`{"xPaddingBytes":"1-2","XPADDINGBYTES":"3-4"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r := xrayschema.Newest().Check(frag, nil); len(r.Rejected) == 0 {
-		t.Error("two cases of one key in extra pass the allow-list")
+	// The same key in another case is a key twice for Go's decoder, and the converter refuses it.
+	if _, _, _, err := Convert(extra(`{"xPaddingBytes":"1-2","XPADDINGBYTES":"3-4"}`)); err == nil {
+		t.Error("two cases of one key in extra convert")
 	}
 }
 

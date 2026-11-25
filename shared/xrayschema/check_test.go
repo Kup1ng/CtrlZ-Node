@@ -6,9 +6,15 @@ import (
 	"testing"
 )
 
+// realityKey is 32 bytes in base64url, the kind of a REALITY key.
+const realityKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// wgKey is 32 bytes in base64, the kind of a WireGuard key.
+const wgKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 const (
 	vlessReality = `{"outbounds":[{"protocol":"vless","settings":{"address":"203.0.113.7","port":443,"id":"5783a3e7-e373-51cd-8642-c83782b807c5","encryption":"none","flow":"xtls-rprx-vision"},
-		"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"www.example.com","fingerprint":"chrome","publicKey":"PUBKEY","shortId":"ab12"}}}]}`
+		"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"www.example.com","fingerprint":"chrome","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":"ab12"}}}]}`
 )
 
 func newest(t *testing.T) Table {
@@ -78,12 +84,8 @@ func TestKeysAndValuesAreFoldedLikeTheLoader(t *testing.T) {
 		}
 	}
 	// Unicode simple folding, as in Go's decoder: the Kelvin sign is a "k".
-	r = check(t, outboundWith(`,"streamSettings":{"sockopt":{"tcpKeepAliveIdle":1}}`))
-	if !r.OK() {
-		t.Fatal(r.Rejected, r.Warnings)
-	}
-	r = check(t, outboundWith(`,"streamSettings":{"sockopt":{"tcpKeepAliveIdle":1}}`))
-	if !r.OK() || !strings.Contains(string(r.Normalized), `"tcpKeepAliveIdle"`) {
+	r = check(t, outboundWith(`,"streamSettings":{"security":"reality","realitySettings":{"public`+"\u212A"+`ey":"`+realityKey+`"}}`))
+	if !r.OK() || !strings.Contains(string(r.Normalized), `"publicKey"`) {
 		t.Errorf("a key spelled with the Kelvin sign is not the key: %v %v", r.Warnings, r.Rejected)
 	}
 }
@@ -134,7 +136,7 @@ func TestAlwaysRejectedKeys(t *testing.T) {
 	}
 	keys := []string{"xdriveSettings", "script", "webhook", "env", "metrics", "geodata", "process", "redirect", "reverse",
 		"masterKeyLog", "certificateFile", "keyFile", "dir", "sendThrough", "mark", "interface", "tproxy", "customSockopt",
-		"acceptProxyProtocol", "proxySettings"}
+		"acceptProxyProtocol", "proxySettings", "isClient", "finalRules", "ipsBlocked", "masqueSettings", "portMapping", "debug"}
 	for _, key := range keys {
 		for _, form := range []string{key, strings.ToLower(key), strings.ToUpper(key)} {
 			for spot, tmpl := range spots {
@@ -246,9 +248,13 @@ func TestUnknownKeyIsABlockingWarningUntilItsPathIsAccepted(t *testing.T) {
 	if r := check(t, outboundWith(`,"surprise":1`)); len(r.Warnings) != 1 {
 		t.Errorf("outbound key: %v", r.Warnings)
 	}
-	r = check(t, outboundWith(`,"streamSettings":{"finalmask":{"tcp":[{"type":"header-custom","settings":{"clients":[]}}]}}`))
-	if len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.finalmask.tcp[0].type" {
+	r = check(t, outboundWith(`,"streamSettings":{"finalmask":{"udp":[{"type":"noise","settings":{"reset":1}}]}}`))
+	if len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.finalmask.udp[0].type" {
 		t.Errorf("unknown mask type: %v %v", r.Warnings, r.Rejected)
+	}
+	// The text of a warning says what accepting it is worth.
+	if !strings.Contains(r.Warnings[0].Msg, "does not judge") || !strings.Contains(r.Warnings[0].Msg, "Xray process") {
+		t.Errorf("the warning does not say what it means: %s", r.Warnings[0].Msg)
 	}
 }
 
@@ -269,19 +275,37 @@ func TestValuesThatReachTheHostAreRefused(t *testing.T) {
 	mustOK(t, `{"outbounds":[{"protocol":"trojan","settings":{"address":"203.0.113.7","port":443,"password":"next:env:ext"},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"a.example"}}}]}`)
 }
 
+const wgFull = `{"protocol":"wireguard","settings":{"secretKey":"` + wgKey + `","address":["10.0.0.2/32"],"peers":[{"publicKey":"` + wgKey + `","endpoint":"203.0.113.9:51820","allowedIPs":["0.0.0.0/0"],"keepAlive":25}],"mtu":1280,"reserved":[1,2,3]%s}}`
+
+func wireguard(extra string) string {
+	return `{"outbounds":[` + strings.Replace(wgFull, "%s", extra, 1) + `]}`
+}
+
 func TestWireguardAndFreedomRules(t *testing.T) {
-	r := mustOK(t, `{"outbounds":[{"protocol":"wireguard","settings":{"secretKey":"K","address":["10.0.0.2/32"],"peers":[{"publicKey":"P","endpoint":"203.0.113.9:51820"}],"noKernelTun":false}}]}`)
+	r := mustOK(t, wireguard(`,"noKernelTun":false`))
 	if !strings.Contains(string(r.Normalized), `"noKernelTun":true`) || len(r.Diff) == 0 {
 		t.Errorf("noKernelTun not forced: %s %v", r.Normalized, r.Diff)
 	}
-	r = mustOK(t, `{"outbounds":[{"protocol":"wireguard","settings":{"secretKey":"K"}}]}`)
+	r = mustOK(t, wireguard(``))
 	if !strings.Contains(string(r.Normalized), `"noKernelTun":true`) {
 		t.Errorf("noKernelTun not added: %s", r.Normalized)
+	}
+	// The client reads Peers[0] with no check: none, or two, is a warning, and so is a
+	// missing list.
+	for name, peers := range map[string]string{"none": `"peers":[]`, "two": `"peers":[{"publicKey":"` + wgKey + `"},{"publicKey":"` + wgKey + `"}]`} {
+		frag := `{"outbounds":[{"protocol":"wireguard","settings":{"secretKey":"` + wgKey + `",` + peers + `}}]}`
+		if r := check(t, frag); r.OK() || len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].settings.peers" {
+			t.Errorf("%s: %v %v", name, r.Warnings, r.Rejected)
+		}
+	}
+	if r := check(t, `{"outbounds":[{"protocol":"wireguard","settings":{"secretKey":"`+wgKey+`"}}]}`); r.OK() || len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].settings.peers" {
+		t.Errorf("missing peers: %v %v", r.Warnings, r.Rejected)
 	}
 	mustReject(t, "isClient", `{"outbounds":[{"protocol":"wireguard","settings":{"isClient":false,"secretKey":"K"}}]}`)
 	mustReject(t, "IsClient", `{"outbounds":[{"protocol":"wireguard","settings":{"IsClient":false}}]}`)
 	// A freedom hop may fragment, and may not bring rules of its own.
 	mustOK(t, `{"outbounds":[{"protocol":"vless","streamSettings":{"sockopt":{"dialerProxy":"frag"}}},{"protocol":"freedom","tag":"frag","settings":{"fragment":{"packets":"tlshello","length":"100-200","interval":"10-20"}}}]}`)
+	mustOK(t, freedomHop(`"fragment":{"packets":"1-3","length":100,"interval":0}`))
 	mustReject(t, "finalRules", `{"outbounds":[{"protocol":"vless","streamSettings":{"sockopt":{"dialerProxy":"f"}}},{"protocol":"freedom","tag":"f","settings":{"finalRules":[{"action":"allow"}]}}]}`)
 	mustReject(t, "ipsBlocked", `{"outbounds":[{"protocol":"vless","streamSettings":{"sockopt":{"dialerProxy":"f"}}},{"protocol":"freedom","tag":"f","settings":{"ipsBlocked":["geoip:private"]}}]}`)
 }
@@ -312,16 +336,12 @@ func TestChains(t *testing.T) {
 	mustReject(t, "ambiguous target", frag(hop("a", "b"), hop("b", ""), hop("b", "")))
 	mustReject(t, "an outbound nothing reaches", frag(hop("a", ""), hop("b", "")))
 	mustReject(t, "freedom first", `{"outbounds":[{"protocol":"freedom","tag":"x"}]}`)
-	// The same through a nested downloadSettings, and through echSockopt.
+	// A link inside a subtree the table does not list (downloadSettings, echSockopt) cannot
+	// join the chain check, so it is refused even when the subtree is accepted.
 	nested := `{"protocol":"vless","tag":"a","streamSettings":{"xhttpSettings":{"downloadSettings":{"address":"203.0.113.9","method":"xhttp","sockopt":{"dialerProxy":"b"}}}}}`
-	mustOK(t, frag(nested, hop("b", "")))
-	cyc := `{"protocol":"vless","tag":"b","streamSettings":{"xhttpSettings":{"downloadSettings":{"address":"203.0.113.9","method":"xhttp","sockopt":{"dialerProxy":"a"}}}}}`
-	mustReject(t, "cycle through downloadSettings", frag(nested, cyc))
+	mustReject(t, "downloadSettings link", frag(nested, hop("b", "")), "outbounds[0].streamSettings.xhttpSettings.downloadSettings")
 	ech := `{"protocol":"vless","tag":"a","streamSettings":{"security":"tls","tlsSettings":{"echSockopt":{"dialerProxy":"b"}}}}`
-	r = mustOK(t, frag(ech, hop("b", "")))
-	if !strings.Contains(string(r.Normalized), `"dialerProxy":"1"`) {
-		t.Errorf("echSockopt link not rewritten: %s", r.Normalized)
-	}
+	mustReject(t, "echSockopt link", frag(ech, hop("b", "")), "outbounds[0].streamSettings.tlsSettings.echSockopt")
 	// An empty dialerProxy is no link.
 	mustOK(t, frag(hop("a", "")))
 }
@@ -360,19 +380,74 @@ func TestShapeLimits(t *testing.T) {
 	deep := outboundWith(`,"streamSettings":{"newThing":` + strings.Repeat(`[`, 40) + strings.Repeat(`]`, 40) + `}`)
 	mustReject(t, "depth 40", deep)
 	mustOK(t, `{"outbounds":[{"protocol":"vless","streamSettings":{"newThing":`+strings.Repeat(`[`, 20)+strings.Repeat(`]`, 20)+`}}]}`, "outbounds[0].streamSettings.newThing")
-	mustReject(t, "null", outboundWith(`,"tag":null`))
 	mustReject(t, "trailing data", vlessReality+` {}`)
 	mustReject(t, "trailing garbage", vlessReality+`x`)
 	mustReject(t, "truncated", vlessReality[:40])
-	mustReject(t, "invalid UTF-8", strings.Replace(vlessReality, "PUBKEY", "\xff\xfe", 1))
-	mustReject(t, "over 32 KiB", outboundWith(`,"tag":"`+strings.Repeat("a", MaxFragmentBytes)+`"`))
-	mustReject(t, "a string where a number is", `{"outbounds":[{"protocol":"vless","settings":{"port":"443"}}]}`)
-	mustReject(t, "a number where a string is", `{"outbounds":[{"protocol":"vless","tag":5}]}`)
-	mustReject(t, "an array where an object is", `{"outbounds":[{"protocol":"vless","settings":[]}]}`)
+	mustReject(t, "invalid UTF-8", strings.Replace(vlessReality, "chrome", "\xff\xfe", 1))
+	mustReject(t, "over 32 KiB", outboundWith(`,"surprise":"`+strings.Repeat("a", MaxFragmentBytes)+`"`), "outbounds[0].surprise")
 	mustReject(t, "an outbound that is a string", `{"outbounds":["vless"]}`)
+	mustReject(t, "an outbound that is null", `{"outbounds":[null]}`)
+	mustReject(t, "outbounds that is null", `{"outbounds":null}`)
+	// A value that is not of its kind is a warning at its path, a wrong JSON type included,
+	// and that path passes it.
+	for path, frag := range map[string]string{
+		"outbounds[0].settings.port":         `{"outbounds":[{"protocol":"vless","settings":{"port":"443"}}]}`,
+		"outbounds[0].tag":                   `{"outbounds":[{"protocol":"vless","tag":5}]}`,
+		"outbounds[0].settings":              `{"outbounds":[{"protocol":"vless","settings":[]}]}`,
+		"outbounds[0].settings.address":      `{"outbounds":[{"protocol":"vless","settings":{"address":"fromMitm"}}]}`,
+		"outbounds[0].settings.vnext":        `{"outbounds":[{"protocol":"vless","settings":{"vnext":[]}}]}`,
+		"outbounds[0].mux.concurrency":       `{"outbounds":[{"protocol":"vless","mux":{"concurrency":129}}]}`,
+		"outbounds[0].settings.encryption":   `{"outbounds":[{"protocol":"vless","settings":{"encryption":"mlkem768x25519plus.native.0rtt.` + realityKey + `"}}]}`,
+		"outbounds[0].settings.flow":         `{"outbounds":[{"protocol":"vless","settings":{"flow":"xtls-rprx-direct"}}]}`,
+		"outbounds[0].streamSettings.method": `{"outbounds":[{"protocol":"vless","streamSettings":{"network":"kcp"}}]}`,
+	} {
+		r := check(t, frag)
+		found := false
+		for _, w := range r.Warnings {
+			if w.Path == path {
+				found = true
+			}
+		}
+		if len(r.Rejected) != 0 || !found {
+			t.Errorf("%s: warnings=%v rejected=%v", path, r.Warnings, r.Rejected)
+		}
+		if r.Normalized != nil {
+			t.Errorf("%s: a fragment with a warning has a normal form", path)
+		}
+		if got := check(t, frag, path); !got.OK() {
+			t.Errorf("%s: not accepted by its path: %v %v", path, got.Warnings, got.Rejected)
+		}
+	}
+	// Two elements of vnext warn at the array, and each element is judged too.
+	if r := check(t, `{"outbounds":[{"protocol":"vless","settings":{"vnext":[{},{}]}}]}`); len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].settings.vnext" {
+		t.Errorf("two vnext: %v %v", r.Warnings, r.Rejected)
+	}
+	// null, false and empty values are the loader's defaults: dropped with a line in Diff,
+	// for a listed key and for an unlisted one.
+	r := mustOK(t, outboundWith(`,"tag":null,"surprise":null,"other":false,"third":"","streamSettings":{"security":"","sockopt":{"dialerProxy":""}}`))
+	for _, key := range []string{`"tag":null`, `"surprise"`, `"other"`, `"third"`, `"security"`, `"dialerProxy"`} {
+		if strings.Contains(string(r.Normalized), key) {
+			t.Errorf("%s was kept: %s", key, r.Normalized)
+		}
+	}
+	if len(r.Diff) < 6 {
+		t.Errorf("a dropped key has no line in Diff: %v", r.Diff)
+	}
+	// The same null is kept as pasted inside a subtree the admin accepted.
+	r = mustOK(t, outboundWith(`,"surprise":{"a":null,"b":false}`), "outbounds[0].surprise")
+	if !strings.Contains(string(r.Normalized), `"surprise":{"a":null,"b":false}`) {
+		t.Errorf("an accepted subtree is not stored as pasted: %s", r.Normalized)
+	}
+	// An unlisted key with true or 0 is not a default.
+	if r := check(t, outboundWith(`,"surprise":true,"other":0`)); len(r.Warnings) != 2 {
+		t.Errorf("true and 0 are values: %v", r.Warnings)
+	}
+	// The always-rejected list is judged before the rule: a null does not drop one.
+	mustReject(t, "null env", outboundWith(`,"env":null`))
+	mustReject(t, "empty script", outboundWith(`,"script":""`))
 	// The limit is on bytes in: exactly the limit is judged.
-	pad := strings.Repeat("a", MaxFragmentBytes-len(outboundWith(`,"tag":""`)))
-	mustOK(t, outboundWith(`,"tag":"`+pad+`"`))
+	pad := strings.Repeat("a", MaxFragmentBytes-len(outboundWith(`,"surprise":""`)))
+	mustOK(t, outboundWith(`,"surprise":"`+pad+`"`), "outbounds[0].surprise")
 }
 
 func TestReleases(t *testing.T) {
@@ -420,26 +495,84 @@ func TestValidReleaseTagAndPath(t *testing.T) {
 	}
 }
 
-func TestFinalmaskAndTransportsPass(t *testing.T) {
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"a.example","alpn":["h2"],"fingerprint":"chrome"},
-		"xhttpSettings":{"path":"/x","mode":"auto","xmux":{"maxConcurrency":"16-32"},"extra":{"xPaddingBytes":"100-1000","headers":{"A":["b"]}}},
-		"finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","length":"100-200","delay":"10-20"}}],"udp":[{"type":"salamander","settings":{"password":"p"}}],"quicParams":{"congestion":"bbr"}}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"kcp","kcpSettings":{"mtu":1350,"tti":20,"header":{"type":"none"},"seed":"s"}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"s","multiMode":true}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"httpupgrade","httpupgradeSettings":{"host":"h","path":"/p"}}`))
-	mustOK(t, `{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"203.0.113.7","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"tlsSettings":{"serverName":"h.example"}}}]}`)
-	mustOK(t, `{"outbounds":[{"protocol":"shadowsocks","settings":{"address":"203.0.113.7","port":8388,"method":"2022-BLAKE3-AES-128-GCM","password":"x"}}]}`)
-	mustOK(t, `{"outbounds":[{"protocol":"socks","settings":{"servers":[{"address":"203.0.113.7","port":1080,"users":[{"user":"u","pass":"p"}]}]}}]}`)
-	mustOK(t, `{"outbounds":[{"protocol":"vmess","settings":{"vnext":[{"address":"203.0.113.7","port":443,"users":[{"id":"5783a3e7-e373-51cd-8642-c83782b807c5","security":"auto"}]}]},"mux":{"enabled":true,"concurrency":8}}]}`)
-	mustOK(t, `{"outbounds":[{"protocol":"http","settings":{"address":"203.0.113.7","port":3128,"headers":{"X-A":"b"}}}]}`)
-	mustReject(t, "noise script", outboundWith(`,"streamSettings":{"finalmask":{"udp":[{"type":"noise","settings":{"script":"os.execute('x')"}}]}}`))
+func TestListedKeysPass(t *testing.T) {
+	tls := `"security":"tls","tlsSettings":{"serverName":"a.example","alpn":["h2","http/1.1"],"fingerprint":"chrome","pinnedPeerCertSha256":"` + strings.Repeat("ab", 32) + `"}`
+	mustOK(t, outboundWith(`,"streamSettings":{"network":"xhttp",`+tls+`,
+		"xhttpSettings":{"host":"a.example","path":"/x","mode":"auto","headers":{"A":"b"},"noGRPCHeader":true,"xPaddingBytes":"100-1000","scMaxEachPostBytes":1000000,
+		"extra":{"xPaddingBytes":"100-1000","headers":{"A":"b"},"noGRPCHeader":false,"scMaxEachPostBytes":"20000-30000"}}}`))
+	mustOK(t, outboundWith(`,"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example","multiMode":true,"permit_without_stream":false,"idle_timeout":60,"health_check_timeout":20,"initial_windows_size":0}}`))
+	mustOK(t, outboundWith(`,"streamSettings":{"network":"httpupgrade","httpupgradeSettings":{"host":"h","path":"/p","headers":{"A":"b"}}}`))
+	mustOK(t, outboundWith(`,"streamSettings":{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"version":"1.1","method":"GET","path":["/a","/b"],"headers":{"Host":["a.example","b.example"],"X":"y"}}}}}`))
+	mustOK(t, outboundWith(`,"streamSettings":{"security":"reality","realitySettings":{"serverName":"a.example","fingerprint":"firefox","publicKey":"`+realityKey+`","shortId":"ab12","spiderX":"/a/b_c-d.e~f"}}`))
+	mustOK(t, `{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"203.0.113.7","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"tlsSettings":{"serverName":"h.example","alpn":["h3"]},
+		"finalmask":{"udp":[{"type":"salamander","settings":{"password":"p"}},{"type":"udphop","settings":{"mode":"intervalRemote","interval":"5-600","remotePorts":"20000-30000"}}]}}}]}`)
+	mustOK(t, `{"outbounds":[{"protocol":"shadowsocks","settings":{"address":"203.0.113.7","port":8388,"method":"2022-BLAKE3-AES-128-GCM","password":"x","ota":true,"level":3}}]}`)
+	mustOK(t, `{"outbounds":[{"protocol":"socks","settings":{"servers":[{"address":"203.0.113.7","port":1080,"users":[{"user":"u","pass":"p","level":1}]}]}}]}`)
+	mustOK(t, `{"outbounds":[{"protocol":"vmess","settings":{"vnext":[{"address":"203.0.113.7","port":443,"users":[{"id":"5783a3e7-e373-51cd-8642-c83782b807c5","security":"auto","alterId":0}]}]},"mux":{"enabled":true,"concurrency":8,"xudpConcurrency":16}}]}`)
+	mustOK(t, `{"outbounds":[{"protocol":"http","settings":{"address":"203.0.113.7","port":3128,"user":"u","pass":"p"}}]}`)
+	mustOK(t, `{"outbounds":[{"protocol":"trojan","settings":{"servers":[{"address":"a.example","port":443,"password":"p"}]}}]}`)
+	mustReject(t, "noise script", outboundWith(`,"streamSettings":{"finalmask":{"udp":[{"type":"noise","settings":{"script":"os.execute('x')"}}]}}`), "outbounds[0].streamSettings.finalmask.udp[0].type")
+	// Dropped with a line in Diff: keys that have no effect on this node.
+	r := mustOK(t, outboundWith(`,"mux":{"xudpProxyUDP443":"reject"},"streamSettings":{"sockopt":{"domainStrategy":"UseIP","tcpNoDelay":true}}`))
+	for _, key := range []string{"xudpProxyUDP443", "domainStrategy", "tcpNoDelay"} {
+		if strings.Contains(string(r.Normalized), key) {
+			t.Errorf("%s was kept: %s", key, r.Normalized)
+		}
+	}
+	// A legacy alterId that is not 0 is not dropped: it is unknown.
+	if r := check(t, `{"outbounds":[{"protocol":"vmess","settings":{"alterId":4}}]}`); len(r.Warnings) != 1 {
+		t.Errorf("alterId 4: %v", r.Warnings)
+	}
 }
 
-// quicParams.debug makes the release call os.Setenv in the Xray process (found in
-// the source of infra/conf for v26.11.9): refused, and the other quic parameters pass.
+// kcp is the one transport that is an unknown value; any other unlisted transport is
+// refused for good.
+func TestKcpIsUnknownAndOtherTransportsAreRefused(t *testing.T) {
+	for _, n := range []string{"kcp", "mkcp", "KCP"} {
+		r := check(t, outboundWith(`,"streamSettings":{"network":"`+n+`"}`))
+		if len(r.Rejected) != 0 || len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.method" {
+			t.Errorf("%s: %v %v", n, r.Warnings, r.Rejected)
+		}
+		r = check(t, outboundWith(`,"streamSettings":{"network":"`+n+`","kcpSettings":{"mtu":1350}}`), "outbounds[0].streamSettings.method")
+		if len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.kcpSettings" {
+			t.Errorf("%s with settings: %v", n, r.Warnings)
+		}
+		mustOK(t, outboundWith(`,"streamSettings":{"network":"`+n+`","kcpSettings":{"mtu":1350}}`), "outbounds[0].streamSettings.method", "outbounds[0].streamSettings.kcpSettings")
+	}
+	mustReject(t, "quic", outboundWith(`,"streamSettings":{"network":"quic"}`), "outbounds[0].streamSettings.method")
+}
+
+// A mask other than the one salamander and the one udphop, in that order, is not on the
+// list: another type, a third mask, a repeat and the wrong order each warn.
+func TestMaskOrder(t *testing.T) {
+	sal := `{"type":"salamander","settings":{"password":"p"}}`
+	hop := `{"type":"udphop","settings":{"mode":"intervalRemote","interval":30,"remotePorts":"1000-2000"}}`
+	udp := func(masks ...string) string {
+		return outboundWith(`,"streamSettings":{"finalmask":{"udp":[` + strings.Join(masks, ",") + `]}}`)
+	}
+	mustOK(t, udp())
+	mustOK(t, udp(sal))
+	mustOK(t, udp(hop))
+	mustOK(t, udp(sal, hop))
+	for name, frag := range map[string]string{"hop first": udp(hop, sal), "two salamanders": udp(sal, sal), "three": udp(sal, hop, hop)} {
+		if r := check(t, frag); r.OK() || len(r.Rejected) != 0 {
+			t.Errorf("%s: %v %v", name, r.Warnings, r.Rejected)
+		}
+	}
+	if r := check(t, outboundWith(`,"streamSettings":{"finalmask":{"tcp":[{"type":"fragment","settings":{}}]}}`)); len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.finalmask.tcp" {
+		t.Errorf("tcp masks: %v", r.Warnings)
+	}
+	// The order is one more thing a warning can pass.
+	mustOK(t, udp(hop, sal), "outbounds[0].streamSettings.finalmask.udp")
+}
+
+// quicParams.debug makes the release call os.Setenv in the Xray process: refused at any
+// depth. The other quic parameters are unknown.
 func TestQuicDebugSetsTheEnvironmentAndIsRefused(t *testing.T) {
-	mustReject(t, "quic debug", outboundWith(`,"streamSettings":{"finalmask":{"quicParams":{"debug":true}}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"finalmask":{"quicParams":{"congestion":"bbr","bbrProfile":"standard"}}}`))
+	mustReject(t, "quic debug", outboundWith(`,"streamSettings":{"finalmask":{"quicParams":{"debug":true}}}`), "outbounds[0].streamSettings.finalmask.quicParams")
+	if r := check(t, outboundWith(`,"streamSettings":{"finalmask":{"quicParams":{"congestion":"bbr"}}}`)); len(r.Warnings) != 1 {
+		t.Errorf("quicParams: %v", r.Warnings)
+	}
 }
 
 // FuzzCheck: whatever bytes arrive, Check never panics, the normal form of an accepted

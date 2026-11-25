@@ -86,7 +86,7 @@ func (t Table) Release() string { return t.tag }
 // ---- parsing ----------------------------------------------------------------------
 
 type val struct {
-	k       byte // 'o' object, 'a' array, 's' string, 'n' number, 'b' boolean
+	k       byte // 'o' object, 'a' array, 's' string, 'n' number, 'b' boolean, 'z' null
 	members []member
 	items   []*val
 	s       string // a string, or the text of a number
@@ -175,10 +175,12 @@ func parseValue(dec *json.Decoder, depth int) (*val, error) {
 		return &val{k: 'n', s: t.String()}, nil
 	case bool:
 		return &val{k: 'b', b: t}, nil
+	case nil:
+		// null means "absent" to Go's decoder. A listed or unlisted key with it is dropped
+		// with a line in Diff (7.2); inside an accepted unknown subtree it stays as pasted.
+		return &val{k: 'z'}, nil
 	}
-	// null, or anything else: a member that is null means "absent" to Go's decoder,
-	// and one spelling of "absent" is enough.
-	return nil, errors.New("null is not accepted")
+	return nil, errSyntax
 }
 
 // ---- the checker ------------------------------------------------------------------
@@ -201,12 +203,24 @@ func (c *ctx) reject(path, msg string) {
 	c.res.Rejected = append(c.res.Rejected, Issue{path, msg})
 }
 
+// unknownText ends every warning: the admin who accepts a path must know what the
+// acceptance is worth (D11). It names what can go wrong and never a value.
+const unknownText = "; Ctrl Z does not judge this, and it can stop the Xray process that every location of the node shares, also later and at a time the exit chooses"
+
 func (c *ctx) warn(path, msg string) {
 	if c.accept[path] {
 		c.res.Diff = append(c.res.Diff, Change{path, "accepted as unknown by the admin: " + msg})
 		return
 	}
-	c.res.Warnings = append(c.res.Warnings, Issue{path, msg})
+	c.res.Warnings = append(c.res.Warnings, Issue{path, msg + unknownText})
+}
+
+// unfit is the warning of a value that is not of the kind of its key. A structure that
+// holds keys is still scanned for what is never allowed, whether or not the path is
+// accepted.
+func (c *ctx) unfit(path, why string, v *val) {
+	c.warn(path, why)
+	c.scanRaw(v, path)
 }
 
 func (c *ctx) changed(path, msg string) {
@@ -259,6 +273,12 @@ func (t Table) Check(fragment []byte, accept []string) Result {
 		c.reject("outbounds", "missing")
 	case outs.k != 'a' || len(outs.items) == 0 || len(outs.items) > MaxOutbounds:
 		c.reject("outbounds", "must be an array of 1 to 8 outbounds")
+	default:
+		for i, o := range outs.items {
+			if o.k != 'o' {
+				c.reject("outbounds["+strconv.Itoa(i)+"]", "an outbound must be an object")
+			}
+		}
 	}
 	if len(res.Rejected) != 0 {
 		return res
@@ -309,8 +329,10 @@ func isFreedom(o *val) bool {
 }
 
 // globalRejected are the keys that reach a file, the environment, a process or a
-// script engine of the host, or the sockets of the host, at any depth of an outbound
-// (7.2). A key of a free-form map is a value and is not judged here.
+// script engine of the host, or the sockets of the host, or that the node writes
+// itself, at any depth of an outbound (7.2). It is judged before everything else, so a
+// null or an empty value does not drop one of them. A key of a free-form map is a value
+// and is not judged here.
 func globalRejected() map[string]string {
 	return map[string]string{
 		"xdrivesettings":      "the xdrive transport reads and writes files of the host",
@@ -337,44 +359,34 @@ func globalRejected() map[string]string {
 		"addressportstrategy": "makes the node resolve SRV or TXT records to choose an address or a port",
 		"debug":               "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process",
 		// One dial would race up to maxConcurrentTry ports and as many tracked connections,
-		// which the dial limits of the node (p4b-proxy 5.5) are not sized for (B1-r4-1).
+		// which the dial limits of the node (p4b-proxy 5.5) are not sized for.
 		"happyeyeballs": "races several ports for one dial, which the dial limits of the node do not cover",
 		// A warning would not do: an exact path in accept_unknown passes a warning, and each
 		// testpre starts endless pre-dial goroutines that survive rmo (finding 4).
 		"testpre": "starts goroutines that dial the exit for ever and outlive the config",
+		// An echConfigList with :// is judged by value (keyedChecks); the rest of the list
+		// is unknown like any key.
+		"isclient":       "turns the WireGuard client into a server",
+		"finalrules":     "the node writes the final rules of every freedom outbound",
+		"ipsblocked":     "the node writes the final rules of every freedom outbound",
+		"masquesettings": "the masque transport belongs to the masque outbound, which is not allowed",
 	}
 }
 
-// keyedChecks are the keys whose string value is judged wherever the key sits: in
-// the table at its node, in a subtree the table has no node for, and as an unknown key.
-// Both are free text to Xray's loader and read by code that reaches beyond the dial:
-//
-//   - tlsSettings.echConfigList: a value with "://" makes Xray query a DoH, h2c or
-//     plain UDP server for the exit's ECH record with socket options of its own, and
-//     resolve that server's name by the host resolver (7.2, 7.4). Only a standard
-//     base64 list (what Xray decodes with base64.StdEncoding) passes.
-//   - realitySettings.spiderX: the loader parses p, c, t, i and r of its query as
-//     unbounded int64 and a REALITY fallback then runs that many crawler goroutines
-//     (and strings.Repeat of that length, which panics) in the shared Xray process,
-//     after the trial passed, whenever the server answers with its real certificate.
-//     A path with no query part is all a link needs.
+// keyedChecks are the keys whose string value is judged wherever the key sits, in a
+// subtree of an accepted unknown key too. echConfigList with "://" makes Xray query a
+// DoH, h2c or plain UDP server for the exit's ECH record with socket options of its own,
+// and resolve that server's name by the host resolver (7.2, 7.4). Only a standard base64
+// list (what Xray decodes with base64.StdEncoding) passes, and then only as an unknown key.
 func keyedChecks() map[string]func(string) string {
 	return map[string]func(string) string{
 		"echconfiglist": checkECHList,
-		"spiderx":       checkSpiderX,
 	}
 }
 
 func checkECHList(s string) string {
 	if _, err := base64.StdEncoding.DecodeString(s); err != nil {
 		return "echConfigList must be a base64 list: a value with :// or a name makes Xray query a server of its own"
-	}
-	return ""
-}
-
-func checkSpiderX(s string) string {
-	if strings.Contains(s, "?") {
-		return "spiderX must be a path with no query part: Xray reads p, c, t, i and r of it as crawler settings"
 	}
 	return ""
 }
@@ -394,21 +406,19 @@ func keyedCheck(key string, v *val) (string, bool) {
 	return "", false
 }
 
-func (c *ctx) forbiddenKey(n *node, key string) (string, bool) {
+// forbiddenKey judges a key with its value: the always-rejected keys at any depth, a
+// true allowInsecure (the release refuses it), and a dialerProxy of a freedom outbound.
+func (c *ctx) forbiddenKey(key string, v *val) (string, bool) {
 	for k, why := range globalRejected() {
 		if strings.EqualFold(key, k) {
 			return why, true
 		}
 	}
+	if strings.EqualFold(key, "allowInsecure") && v.k == 'b' && v.b {
+		return "the release refuses allowInsecure; pin the certificate with pinnedPeerCertSha256", true
+	}
 	if c.freedom && strings.EqualFold(key, "dialerProxy") {
 		return "a freedom outbound is the last hop and has no dialerProxy", true
-	}
-	if n != nil {
-		for k, why := range n.reject {
-			if strings.EqualFold(key, k) {
-				return why, true
-			}
-		}
 	}
 	return "", false
 }
@@ -440,22 +450,13 @@ func (c *ctx) checkString(path, s string) bool {
 	return true
 }
 
-// rawRejected lists the keys that the table refuses at one node and that a subtree
-// without a node must refuse too, because the Go struct behind it (an xdns resolver
-// holds a tlsConfig and a quicConfig, realm a tlsConfig) reads them just the same.
-// dialerProxy is refused rather than rewritten: a link inside a subtree the table does
-// not know cannot join the chain check, so it could name another config's outbound.
+// rawRejected lists the keys that a subtree without a node must refuse on top of the
+// global list. dialerProxy is refused rather than rewritten: a link inside a subtree
+// the table does not know cannot join the chain check, so it could name another
+// config's outbound.
 func rawRejected(key string) (string, bool) {
-	for _, r := range [][2]string{
-		{"dialerproxy", "a link in a subtree the table does not know escapes the chain check"},
-		{"isclient", "turns the client into a server"},
-		{"finalrules", "the node writes the final rules of every freedom outbound"},
-		{"ipsblocked", "the node writes the final rules of every freedom outbound"},
-		{"masquesettings", "the masque transport belongs to the masque outbound, which is not allowed"},
-	} {
-		if strings.EqualFold(key, r[0]) {
-			return r[1], true
-		}
+	if strings.EqualFold(key, "dialerproxy") {
+		return "a link in a subtree the table does not know escapes the chain check", true
 	}
 	return "", false
 }
@@ -474,8 +475,9 @@ func repeatedKey(ms []member) (string, bool) {
 	return "", false
 }
 
-// scanRaw judges a subtree the table has no node for: the keys and values that are
-// never allowed are refused in it too.
+// scanRaw judges a subtree the table has no node for (an unknown key, or a value that
+// is not of its kind): the keys and values that are never allowed are refused in it
+// too, whatever the admin accepted. No bound, pattern or combination is judged there.
 func (c *ctx) scanRaw(v *val, path string) {
 	switch v.k {
 	case 'o':
@@ -485,7 +487,7 @@ func (c *ctx) scanRaw(v *val, path string) {
 		}
 		for _, m := range v.members {
 			p := path + "." + clip(m.key)
-			if why, bad := c.forbiddenKey(nil, m.key); bad {
+			if why, bad := c.forbiddenKey(m.key, m.v); bad {
 				c.reject(p, "key is never allowed: "+why)
 				continue
 			}
@@ -497,14 +499,6 @@ func (c *ctx) scanRaw(v *val, path string) {
 				c.reject(p, why)
 				continue
 			}
-			if why, bad := rawValueRejected(m.key, m.v); bad {
-				c.reject(p, why)
-				continue
-			}
-			if strings.EqualFold(m.key, "headers") && subtreeHasTemplate(m.v) {
-				c.reject(p, templateWhy)
-				continue
-			}
 			c.scanRaw(m.v, p)
 		}
 	case 'a':
@@ -514,39 +508,6 @@ func (c *ctx) scanRaw(v *val, path string) {
 	case 's':
 		c.checkString(path, v.s)
 	}
-}
-
-// templateWhy is the reason of a header value with "{{" (B1-r5-2): proxy/http/client.go
-// parses each header value of an http outbound with text/template and runs it for every
-// connection with the source and the target, and nothing in text/template is bounded by
-// a context or a size, so a value can allocate until the one process every location
-// shares is killed, after a branch on the target that no probe takes.
-const templateWhy = "a header value holding {{ is a Go template that the http outbound runs on every connection"
-
-func hasTemplate(s string) bool { return strings.Contains(s, "{{") }
-
-// subtreeHasTemplate looks at every string under a member called headers in a subtree
-// the table has no node for. Only the http outbound runs its header values as
-// templates, but such a subtree may be the settings of one the table could not place,
-// so the spelling is refused wherever a headers member sits.
-func subtreeHasTemplate(v *val) bool {
-	switch v.k {
-	case 's':
-		return hasTemplate(v.s)
-	case 'a':
-		for _, it := range v.items {
-			if subtreeHasTemplate(it) {
-				return true
-			}
-		}
-	case 'o':
-		for _, m := range v.members {
-			if subtreeHasTemplate(m.v) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // lookup finds the canonical key of a member in an object node. Go's decoder takes
@@ -583,144 +544,110 @@ func lookup(n *node, key string) (canon string, child *node, viaAlias bool, ok b
 }
 
 func (c *ctx) walk(n *node, v *val, path string) {
-	n = n.resolve()
 	switch n.k {
 	case kObj:
 		if v.k != 'o' {
-			c.reject(path, "expected an object")
+			c.unfit(path, "must be an object", v)
 			return
 		}
 		c.walkObject(n, v, path)
 	case kArr:
 		if v.k != 'a' {
-			c.reject(path, "expected an array")
+			c.unfit(path, "must be an array", v)
 			return
+		}
+		if len(v.items) < n.minN || len(v.items) > n.maxN {
+			c.warn(path, "must hold "+strconv.Itoa(n.minN)+" to "+strconv.Itoa(n.maxN)+" items")
 		}
 		for i, it := range v.items {
 			c.walk(n.elem, it, path+"["+strconv.Itoa(i)+"]")
 		}
-	case kStr:
+	case kDialer:
+		// A link that is no string cannot join the chain check, and it is no kind
+		// problem the admin can judge: it is refused.
 		if v.k != 's' {
-			c.reject(path, "expected a string")
+			c.reject(path, "dialerProxy must be a string: it names another outbound of the fragment")
 			return
 		}
 		if c.checkString(path, v.s) {
-			if n.check != nil {
-				if why := n.check(v.s); why != "" {
-					c.reject(path, why)
-					return
-				}
-			}
-			if n.dialer {
-				c.dialers = append(c.dialers, dialRef{c.out, path, v})
-			}
-		}
-	case kNum:
-		if v.k != 'n' {
-			c.reject(path, "expected a number")
-		} else if n.lim != nil && !inLimit(v.s, n.lim) {
-			c.reject(path, limitText(n.lim))
-		}
-	case kBool:
-		if v.k != 'b' {
-			c.reject(path, "expected true or false")
-		} else if v.b && n.noTrue != "" {
-			c.reject(path, n.noTrue)
-		}
-	case kStrList:
-		switch v.k {
-		case 's':
-			c.checkString(path, v.s)
-		case 'a':
-			for i, it := range v.items {
-				if it.k != 's' {
-					c.reject(path+"["+strconv.Itoa(i)+"]", "expected a string")
-					continue
-				}
-				c.checkString(path+"["+strconv.Itoa(i)+"]", it.s)
-			}
-		default:
-			c.reject(path, "expected a string or an array of strings")
-		}
-	case kRange:
-		switch v.k {
-		case 'n':
-			if n.lim != nil && !inLimit(v.s, n.lim) {
-				c.reject(path, limitText(n.lim))
-			}
-		case 's':
-			if c.checkString(path, v.s) && n.lim != nil && !rangeInLimit(v.s, n.lim) {
-				c.reject(path, limitText(n.lim))
-			}
-		default:
-			c.reject(path, "expected a number or a string")
-		}
-	case kAny:
-		switch v.k {
-		case 'n', 'b':
-		case 's':
-			c.checkString(path, v.s)
-		default:
-			c.reject(path, "expected a string, a number or a boolean")
-		}
-	case kRaw:
-		c.scanRaw(v, path)
-	case kStrMap:
-		if v.k != 'o' {
-			c.reject(path, "expected an object")
-			return
-		}
-		// Header names that differ in case are different keys of a Go map, but the
-		// same key twice would be dropped without a word.
-		seenKey := make(map[string]bool, len(v.members))
-		for _, m := range v.members {
-			p := path + "." + clip(m.key)
-			if seenKey[m.key] {
-				c.reject(p, "key given twice")
-				continue
-			}
-			seenKey[m.key] = true
-			switch m.v.k {
-			case 's':
-				if c.checkString(p, m.v.s) && n.noTemplate && hasTemplate(m.v.s) {
-					c.reject(p, templateWhy)
-				}
-			case 'a':
-				for i, it := range m.v.items {
-					if it.k != 's' {
-						c.reject(p, "expected a string or an array of strings")
-						break
-					}
-					if c.checkString(p+"["+strconv.Itoa(i)+"]", it.s) && n.noTemplate && hasTemplate(it.s) {
-						c.reject(p+"["+strconv.Itoa(i)+"]", templateWhy)
-					}
-				}
-			default:
-				c.reject(p, "expected a string or an array of strings")
-			}
+			c.dialers = append(c.dialers, dialRef{c.out, path, v})
 		}
 	case kEnum:
-		if v.k != 's' {
-			c.reject(path, "expected a string")
-			return
-		}
-		canon, ok := n.enum[strings.ToLower(v.s)]
-		if !ok {
-			if n.soft {
-				c.warn(path, "unknown value")
-			} else {
-				// A protocol, transport, security or cipher outside the table can never
-				// be accepted: the table is the list of what a node may run.
-				c.reject(path, "value is not allowed")
-			}
-			return
-		}
-		if canon != v.s {
-			c.changed(path, "value written in its canonical form")
-			v.s = canon
-		}
+		c.walkEnum(n, v, path)
+	case kHeaders:
+		c.walkHeaders(n, v, path)
 	default:
-		c.reject(path, "internal: node without a kind")
+		if v.k == 's' && !c.checkString(path, v.s) {
+			return
+		}
+		if why := fits(n, v); why != "" {
+			c.unfit(path, why, v)
+		}
+	}
+}
+
+// walkEnum folds the value as the loader of the release folds it and writes it in its
+// canonical form. A protocol, a security, a cipher or a transport that the table does not
+// name can never be accepted, except the values the node lists as soft (kcp).
+func (c *ctx) walkEnum(n *node, v *val, path string) {
+	if v.k != 's' {
+		if n.soft {
+			c.unfit(path, "must be a string", v)
+		} else {
+			c.reject(path, "value is not allowed")
+		}
+		return
+	}
+	if !c.checkString(path, v.s) {
+		return
+	}
+	canon, ok := n.enum[strings.ToLower(v.s)]
+	switch {
+	case !ok && n.soft:
+		c.warn(path, "unknown value")
+	case !ok:
+		c.reject(path, "value is not allowed")
+	case n.softVals[canon]:
+		// Left as pasted: it is not on the list, so it is not written in a form of ours.
+		c.warn(path, "unknown value")
+	case canon != v.s:
+		c.changed(path, "value written in its canonical form")
+		v.s = canon
+	}
+}
+
+// walkHeaders judges an object of header names. Two equal names are one key of a Go
+// map twice, and the first value would be dropped without a word, so they are refused;
+// names that differ in case are two keys and stay.
+func (c *ctx) walkHeaders(n *node, v *val, path string) {
+	if v.k != 'o' {
+		c.unfit(path, "must be an object", v)
+		return
+	}
+	seen := make(map[string]bool, len(v.members))
+	for _, m := range v.members {
+		p := path + "." + clip(m.key)
+		if seen[m.key] {
+			c.reject(p, "key given twice")
+			return
+		}
+		seen[m.key] = true
+		switch m.v.k {
+		case 's':
+			c.checkString(p, m.v.s)
+		case 'a':
+			for i, it := range m.v.items {
+				if it.k == 's' {
+					c.checkString(p+"["+strconv.Itoa(i)+"]", it.s)
+				}
+			}
+		}
+		if m.v.k == 'o' || m.v.k == 'a' {
+			c.scanRaw(m.v, p)
+		}
+	}
+	if why := fits(n, v); why != "" {
+		c.warn(path, why)
 	}
 }
 
@@ -746,24 +673,37 @@ type gmember struct {
 	viaAlias bool
 }
 
+// emptyValue is the loader's own default for a key: null, or an empty string. A listed
+// key with such a value is dropped, and so is an unlisted key whose value is also false.
+func emptyValue(v *val, unlisted bool) bool {
+	switch v.k {
+	case 'z':
+		return true
+	case 's':
+		return v.s == ""
+	case 'b':
+		return unlisted && !v.b
+	}
+	return false
+}
+
+func (c *ctx) drop(m *member, path, why string) {
+	m.dead = true
+	c.changed(path, "removed: "+why)
+}
+
 func (c *ctx) walkObject(n *node, v *val, path string) {
 	// The selector of a variant is read first so the member that depends on it
 	// gets the right node.
 	selCanon := ""
 	if n.sel != nil {
-		for _, m := range v.members {
-			if strings.EqualFold(m.key, n.selKey) && m.v.k == 's' {
-				if sn, ok := n.fields[n.selKey]; ok {
-					selCanon = sn.resolve().enum[strings.ToLower(m.v.s)]
-				}
-			}
-		}
-	}
-	if n.sel != nil {
 		has := false
 		for _, m := range v.members {
-			if strings.EqualFold(m.key, n.selKey) {
+			if strings.EqualFold(m.key, n.selKey) && !emptyValue(m.v, false) {
 				has = true
+				if m.v.k == 's' {
+					selCanon = n.fields[n.selKey].enum[strings.ToLower(m.v.s)]
+				}
 			}
 		}
 		if !has {
@@ -777,7 +717,7 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 	var unknown []*member
 	for i := range v.members {
 		m := &v.members[i]
-		if why, bad := c.forbiddenKey(n, m.key); bad {
+		if why, bad := c.forbiddenKey(m.key, m.v); bad {
 			c.reject(path+"."+clip(m.key), "key is never allowed: "+why)
 			continue
 		}
@@ -812,7 +752,26 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 			c.reject(p, "key given twice")
 			continue
 		}
+		live := make([]gmember, 0, len(g.items))
 		for _, it := range g.items {
+			switch {
+			case emptyValue(it.m.v, false):
+				c.drop(it.m, p, "null or empty, the default of Xray")
+			case g.child != nil && g.child.k == kDropped && (!g.child.zeroOnly || isZero(it.m.v)):
+				c.drop(it.m, p, "it has no effect on this node")
+			case g.child != nil && g.child.k == kDropped:
+				// A legacy key with a value that is not its dropped one is unknown.
+				c.warn(p, "unknown key")
+				c.scanRaw(it.m.v, p)
+				live = append(live, it)
+			default:
+				live = append(live, it)
+			}
+		}
+		for _, it := range live {
+			if g.child != nil && g.child.k == kDropped {
+				continue
+			}
 			if child == nil {
 				// The selector is not in the table: the rejection of the selector
 				// stands, and the settings are only scanned.
@@ -821,23 +780,23 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 				c.walk(child, it.m.v, p)
 			}
 		}
-		if len(g.items) == 2 {
-			a, b := g.items[0].m, g.items[1].m
+		if len(live) == 2 {
+			a, b := live[0].m, live[1].m
 			if !bytes.Equal(encode(a.v), encode(b.v)) {
 				c.reject(p, "the old and the new spelling of the key hold different values")
 				continue
 			}
 			c.changed(p, "the old and the new spelling of the key held one value; written once")
 		}
-		for _, it := range g.items {
+		for _, it := range live {
 			if it.m.key != g.canon {
 				c.changed(p, "key written in its canonical spelling")
 			}
 			it.m.key = g.canon
 		}
-		if len(g.items) == 2 {
+		if len(live) == 2 {
 			// Drop the second one; both are equal and now share a key.
-			g.items[1].m.dead = true
+			live[1].m.dead = true
 		}
 	}
 	if key, dup := repeatedUnknown(unknown); dup {
@@ -853,10 +812,14 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 			c.reject(p, why)
 			continue
 		}
+		if emptyValue(m.v, true) {
+			c.drop(m, p, "null, false or empty, the default of Xray")
+			continue
+		}
 		c.warn(p, "unknown key")
 		c.scanRaw(m.v, p)
 	}
-	// Remove the merged duplicates, then force what the normal form forces.
+	// Remove the merged and dropped members, then judge what is missing.
 	kept := v.members[:0]
 	for _, m := range v.members {
 		if !m.dead {
@@ -864,9 +827,14 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 		}
 	}
 	v.members = kept
+	for _, key := range n.required {
+		if memberOf(v, key) == nil {
+			c.warn(path+"."+key, "missing")
+		}
+	}
 	if n.post != nil {
 		if key, why := n.post(v); why != "" {
-			c.reject(path+key, why)
+			c.warn(path+key, why)
 		}
 	}
 	for _, key := range n.forceTrue {
@@ -887,6 +855,22 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 	}
 	sort.SliceStable(v.members, func(i, j int) bool { return v.members[i].key < v.members[j].key })
 }
+
+// memberOf finds a member of an object by key, in any case. An object that was walked
+// has no key twice.
+func memberOf(v *val, key string) *val {
+	if v == nil || v.k != 'o' {
+		return nil
+	}
+	for i := range v.members {
+		if strings.EqualFold(v.members[i].key, key) {
+			return v.members[i].v
+		}
+	}
+	return nil
+}
+
+func isZero(v *val) bool { return v.k == 'n' && v.s == "0" }
 
 // chain judges the dialerProxy links of the fragment (7.2): each names the tag of
 // exactly one other outbound, there is no cycle, every outbound is reached from the
@@ -1026,6 +1010,8 @@ func write(b *bytes.Buffer, v *val) {
 		} else {
 			b.WriteString("false")
 		}
+	case 'z':
+		b.WriteString("null")
 	}
 }
 
@@ -1035,80 +1021,4 @@ func writeString(b *bytes.Buffer, s string) {
 	_ = e.Encode(s)
 	// Encode ends the value with a newline.
 	b.Truncate(b.Len() - 1)
-}
-
-// ---- bounded numbers ---------------------------------------------------------------
-
-// inLimit says whether the number written as text lies in [lo, hi]. An exponent or a
-// fraction is read as a float, because Go's decoder takes 1e3 for an integer field,
-// and the bound is what counts.
-func inLimit(text string, l *limit) bool {
-	if i, err := strconv.ParseInt(text, 10, 64); err == nil {
-		return i >= l.lo && i <= l.hi
-	}
-	f, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		return false
-	}
-	return f >= float64(l.lo) && f <= float64(l.hi)
-}
-
-// rangeInLimit judges the text of a range: "a", "a-b", and for a port list several of
-// them joined by commas. Either end may carry a minus sign, so "-1" and "-5-3" are
-// read as the negative numbers Xray's parser would make of them and refused by the
-// bound, never taken for a dash. A text that no reading gives whole numbers for is
-// refused too: Xray would fail it at -test, but only after the check had said OK.
-func rangeInLimit(s string, l *limit) bool {
-	parts := []string{s}
-	if l.list {
-		parts = strings.Split(s, ",")
-	}
-	var total int64
-	for _, p := range parts {
-		a, b, ok := rangeEnds(p)
-		if !ok || a < l.lo || a > l.hi || b < l.lo || b > l.hi {
-			return false
-		}
-		// Xray expands a port list into one slice of every port of every part, repeats
-		// included (B1-r5-8), so the parts are bounded in sum as well.
-		total += max(a, b) - min(a, b) + 1
-		if l.list && total > l.hi-l.lo+1 {
-			return false
-		}
-	}
-	return true
-}
-
-// rangeEnds reads one range text as Xray's ParseRangeString does: "a", or "a-b" where
-// either number may carry a minus sign (the separator is a dash that is not the sign of
-// the first number). The ends are given as written, not put in order.
-func rangeEnds(p string) (a, b int64, ok bool) {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return 0, 0, false
-	}
-	if i, err := strconv.ParseInt(p, 10, 64); err == nil {
-		return i, i, true
-	}
-	for i := 1; i < len(p); i++ {
-		if p[i] != '-' {
-			continue
-		}
-		x, errA := strconv.ParseInt(strings.TrimSpace(p[:i]), 10, 64)
-		y, errB := strconv.ParseInt(strings.TrimSpace(p[i+1:]), 10, 64)
-		if errA != nil || errB != nil {
-			continue
-		}
-		return x, y, true
-	}
-	return 0, 0, false
-}
-
-// limitText is the reason of a refused number. It names the bounds and never the value.
-func limitText(l *limit) string {
-	if l.list {
-		return "must be whole port numbers from " + strconv.FormatInt(l.lo, 10) + " to " + strconv.FormatInt(l.hi, 10) + ", at most " +
-			strconv.FormatInt(l.hi-l.lo+1, 10) + " ports in all: Xray expands the list into one slice"
-	}
-	return "must be a whole number from " + strconv.FormatInt(l.lo, 10) + " to " + strconv.FormatInt(l.hi, 10) + ": the node's one Xray process serves every location"
 }

@@ -13,6 +13,9 @@ import (
 
 const uuid = "5783a3e7-e373-51cd-8642-c83782b807c5"
 
+// realityKey is 32 bytes in base64url, the kind of a REALITY key.
+const realityKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 // norm converts a link and runs the fragment through the allow-list, as the panel
 // does, and returns the normal form.
 func norm(t *testing.T, link string) string {
@@ -38,9 +41,9 @@ func has(t *testing.T, got string, wants ...string) {
 }
 
 func TestVLESS(t *testing.T) {
-	got := norm(t, "vless://"+uuid+"@203.0.113.7:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk=PUB&sid=ab12&spx=%2F&type=tcp&headerType=none#my%20node")
+	got := norm(t, "vless://"+uuid+"@203.0.113.7:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com&fp=chrome&pbk="+realityKey+"&sid=ab12&spx=%2F&type=tcp&headerType=none#my%20node")
 	has(t, got, `"protocol":"vless"`, `"address":"203.0.113.7"`, `"port":443`, `"id":"`+uuid+`"`, `"flow":"xtls-rprx-vision"`,
-		`"security":"reality"`, `"publicKey":"PUB"`, `"shortId":"ab12"`, `"spiderX":"/"`, `"method":"raw"`)
+		`"security":"reality"`, `"publicKey":"`+realityKey+`"`, `"shortId":"ab12"`, `"spiderX":"/"`, `"method":"raw"`)
 	_, note, proto, _ := Convert("vless://" + uuid + "@203.0.113.7:443?security=none#my%20node")
 	if note != "my node" || proto != "vless" {
 		t.Errorf("note %q protocol %q", note, proto)
@@ -136,7 +139,7 @@ func TestUnknownParametersAndFailuresAreNamedWithoutValues(t *testing.T) {
 		"no host":                   "vless://" + uuid + "@:443?security=none",
 		"no user":                   "vless://a.example:443?security=none",
 		"trojan flow":               "trojan://" + secret + "@a.example:443?flow=xtls-rprx-vision",
-		"hy2 mport":                 "hysteria2://" + secret + "@a.example:443?mport=1000-2000",
+		"hy2 mport list":            "hysteria2://" + secret + "@a.example:443?mport=1000,2000",
 		"hy2 obfs":                  "hysteria2://" + secret + "@a.example:443?obfs=other&obfs-password=x",
 		"hy2 pin":                   "hysteria2://" + secret + "@a.example:443?pinSHA256=zz",
 		"vmess aid":                 "vmess://" + base64.StdEncoding.EncodeToString([]byte(`{"add":"a.example","port":"1","id":"`+secret+`","aid":"4"}`)),

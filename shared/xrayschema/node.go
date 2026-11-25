@@ -2,21 +2,34 @@ package xrayschema
 
 import "strings"
 
-// kind is the JSON shape a table node accepts.
+// kind is the shape and the bound of what a table node accepts. Every leaf kind is
+// closed: it has a bound that holds for any value, so a listed key never lets a value
+// through that nobody sized (p4b-proxy 7.2). A value that is not of its kind is not
+// a rejection: it is the same per-path warning as an unknown key.
 type kind uint8
 
 const (
-	kObj     kind = iota + 1 // object with the keys of fields
-	kArr                     // array of elem
-	kStr                     // string
-	kNum                     // number
-	kBool                    // true or false
-	kStrList                 // a string, or an array of strings (Xray's StringList)
-	kRange                   // a number or a string such as "1-2" (Xray's Int32Range, PortList)
-	kAny                     // a string, a number or a boolean
-	kRaw                     // any JSON value; still scanned for forbidden keys and values
-	kStrMap                  // an object whose keys are free (HTTP headers); its values are strings or string lists
-	kEnum                    // a string that must be one of enum
+	kObj      kind = iota + 1 // object with the keys of fields
+	kArr                      // array of elem, minN to maxN items
+	kBool                     // true or false
+	kInt                      // a whole number within lim
+	kRange                    // a whole number, or "x-y" with both ends within lim and x not above y
+	kEnum                     // a string that must be one of enum
+	kHost                     // an IP literal, or a DNS name with a dot, at most 253 bytes
+	kHostPort                 // host:port, or [v6]:port
+	kText                     // 1 to 255 bytes, no control character
+	kPath                     // 1 to 255 printable ASCII characters, no space
+	kHeaders                  // an object of at most 16 HTTP tokens with short printable values
+	kUUIDText                 // a UUID, or text of at most 30 bytes
+	kKey32                    // 32 bytes as hex or base64 (a WireGuard key)
+	kKey32URL                 // 32 bytes as base64url with no padding (a REALITY key)
+	kIP                       // an IP address or a prefix, no zone
+	kPins                     // 1 to 4 SHA-256 in hex
+	kShortID                  // at most 16 hex digits
+	kSpiderX                  // "/" and at most 254 of A-Z a-z 0-9 / . _ ~ -
+	kOneOf                    // any one of alts
+	kDialer                   // a string that names another outbound by its tag (judged by the chain)
+	kDropped                  // removed from the fragment with a line in Diff
 )
 
 // node is one place of a release table. The tables are built by functions and
@@ -29,53 +42,40 @@ type node struct {
 	// alias maps an old spelling to the canonical (new) one. A member under either
 	// is stored under the new one; both with different values is a rejection.
 	alias map[string]string
-	// reject lists keys (lower case) that are refused in this object on top of the
-	// global list, each with a reason that is about this object alone.
-	reject map[string]string
-	elem   *node
-	max    int // longest array, 0 for the default
+	elem  *node
+	// minN and maxN bound the items of a kArr.
+	minN, maxN int
 	// enum maps the lower-case spelling of a value to its canonical form. The loader
 	// of the release folds these values with strings.ToLower before it compares, and so
 	// does Check. soft says that an unknown value is a warning that accept_unknown can
-	// pass; a hard enum refuses it for good.
-	enum map[string]string
-	soft bool
-	// lazy defers the node to the first use, so a table can contain itself
-	// (downloadSettings holds stream settings). Depth is bounded by MaxDepth.
-	lazy func() *node
+	// pass; a hard enum refuses it for good. softVals lists canonical values of a hard
+	// enum that are an unknown value and not a rejection (the transport kcp).
+	enum     map[string]string
+	soft     bool
+	softVals map[string]bool
 	// A variant picks the node of one member by the value of another: selKey is the
 	// member that holds the selector (an enum), selOn the member that depends on it.
 	selKey, selOn string
 	sel           map[string]*node
-	// strict makes an unknown key a rejection and not a warning (the top level).
-	strict bool
-	// dialer marks the string that names another outbound by its tag.
-	dialer bool
-	// noTrue refuses the value true of a boolean, with the reason.
-	noTrue string
-	// check judges the text of a string that no table of keys can judge, and returns
-	// the reason it is refused or "". It never echoes the value.
-	check func(string) string
+	// lim bounds a kInt, and the ends of a kRange.
+	lim *limit
+	// multi lets a kHeaders value be a list of 1 to 8 strings (the raw http header).
+	multi bool
+	// alts are the choices of a kOneOf, each a leaf node.
+	alts []*node
+	// zeroOnly makes a kDropped drop the number 0 alone: a legacy key with any other
+	// value is not dropped but unknown.
+	zeroOnly bool
+	// required lists keys that must be present; a missing one is a warning at its path.
+	required []string
 	// forceTrue lists boolean keys that the normal form always sets to true.
 	forceTrue []string
-	// noTemplate makes a kStrMap refuse any value with "{{": the headers of an http
-	// outbound are Go text/template programs that Xray runs on every connection.
-	noTemplate bool
-	// lim bounds the values of a kNum or a kRange (see limit); nil leaves them free.
-	lim *limit
 	// post judges a whole object after its members were walked and written in their
-	// canonical form, for a limit that depends on several members at once (the window a
-	// kcp connection may hold is a product of three keys). It returns the path below the
-	// object ("" or ".key") and the reason, or an empty reason. It never echoes a value
-	// and must cope with members the nodes have already rejected.
+	// canonical form, for a rule that depends on several members at once. It returns
+	// the path below the object ("" or ".key") and the reason, or an empty reason; the
+	// reason is a warning, like any value that is not of its kind. It never echoes a
+	// value.
 	post func(v *val) (key, why string)
-}
-
-func (n *node) resolve() *node {
-	for n.lazy != nil {
-		n = n.lazy()
-	}
-	return n
 }
 
 type fd struct {
@@ -102,20 +102,6 @@ func (n *node) aliased(key, old string) *node {
 	return n
 }
 
-func (n *node) refusing(key, why string) *node {
-	if n.reject == nil {
-		n.reject = map[string]string{}
-	}
-	n.reject[strings.ToLower(key)] = why
-	return n
-}
-
-// refusingTrue marks a boolean that the release always refuses when it is true.
-func (n *node) refusingTrue(why string) *node {
-	n.noTrue = why
-	return n
-}
-
 // postChecked attaches a check of the whole object (see post).
 func (n *node) postChecked(fn func(v *val) (string, string)) *node {
 	n.post = fn
@@ -127,40 +113,43 @@ func (n *node) forcing(keys ...string) *node {
 	return n
 }
 
-func arr(elem *node) *node { return &node{k: kArr, elem: elem} }
-
-func str() *node                { return &node{k: kStr} }
-func num() *node                { return &node{k: kNum} }
-func boolean() *node            { return &node{k: kBool} }
-func strList() *node            { return &node{k: kStrList} }
-func rng() *node                { return &node{k: kRange} }
-func anyScalar() *node          { return &node{k: kAny} }
-func raw() *node                { return &node{k: kRaw} }
-func strMap() *node             { return &node{k: kStrMap} }
-func lazy(f func() *node) *node { return &node{lazy: f} }
-
-// templateMap is a strMap whose values Xray parses as text/template (the headers of an
-// http outbound), so none may hold the opening delimiter (B1-r5-2).
-func templateMap() *node { return &node{k: kStrMap, noTemplate: true} }
-
-// maxBytes is a string of at most n bytes, for a field that the wire format sizes in one
-// byte (B1-r5-3). The reason names the limit and never the value.
-func maxBytes(n int, why string) *node {
-	return checked(func(s string) string {
-		if len(s) > n {
-			return why
-		}
-		return ""
-	})
+// needing lists keys that an object must have.
+func (n *node) needing(keys ...string) *node {
+	n.required = append(n.required, keys...)
+	return n
 }
 
-func dialerTag() *node { return &node{k: kStr, dialer: true} }
+// arrN is an array of minN to maxN items of elem. No array of a table is unbounded.
+func arrN(minN, maxN int, elem *node) *node {
+	return &node{k: kArr, elem: elem, minN: minN, maxN: maxN}
+}
 
-// checked is a string whose text a function judges (see keyedChecks).
-func checked(fn func(string) string) *node { return &node{k: kStr, check: fn} }
+func boolean() *node     { return &node{k: kBool} }
+func host() *node        { return &node{k: kHost} }
+func hostPort() *node    { return &node{k: kHostPort} }
+func text() *node        { return &node{k: kText} }
+func path() *node        { return &node{k: kPath} }
+func uuidText() *node    { return &node{k: kUUIDText} }
+func key32() *node       { return &node{k: kKey32} }
+func key32URL() *node    { return &node{k: kKey32URL} }
+func ipOrPrefix() *node  { return &node{k: kIP} }
+func pins() *node        { return &node{k: kPins} }
+func shortID() *node     { return &node{k: kShortID} }
+func spiderX() *node     { return &node{k: kSpiderX} }
+func dialerTag() *node   { return &node{k: kDialer} }
+func dropped() *node     { return &node{k: kDropped} }
+func droppedZero() *node { return &node{k: kDropped, zeroOnly: true} }
 
-// enumOf builds a hard enum. Each argument is "spelling=canonical" or just the
-// canonical spelling.
+// headers is an object of HTTP header names with one string each; headersMulti may
+// hold a list of 1 to 8 strings (the raw http header of Xray, a map of lists).
+func headers() *node      { return &node{k: kHeaders} }
+func headersMulti() *node { return &node{k: kHeaders, multi: true} }
+
+// oneOf accepts a value that any one of the alternatives accepts.
+func oneOf(alts ...*node) *node { return &node{k: kOneOf, alts: alts} }
+
+// enumOf builds an enum. Each argument is "spelling=canonical" or just the
+// canonical spelling. soft says an unknown value is a warning and not a rejection.
 func enumOf(soft bool, vals ...string) *node {
 	n := &node{k: kEnum, soft: soft, enum: make(map[string]string, len(vals))}
 	for _, v := range vals {
@@ -173,6 +162,15 @@ func enumOf(soft bool, vals ...string) *node {
 	return n
 }
 
+// softening marks canonical values of a hard enum that are unknown, not refused.
+func (n *node) softening(canon ...string) *node {
+	n.softVals = map[string]bool{}
+	for _, c := range canon {
+		n.softVals[c] = true
+	}
+	return n
+}
+
 // withVariant makes the member selOn depend on the enum member selKey.
 func (n *node) withVariant(selKey, selOn string, by map[string]*node) *node {
 	n.selKey, n.selOn, n.sel = selKey, selOn, by
@@ -181,30 +179,56 @@ func (n *node) withVariant(selKey, selOn string, by map[string]*node) *node {
 
 // limit is the closed range of values a number or a range of a release table may
 // hold. The loader of Xray checks few of them, and a value outside what the code
-// below it expects is not a refused config but a panic in the one process every
-// location of the node shares (a negative length sliced from a buffer, a window that
-// sizes a pipe), so a key that sizes a buffer, a slice or a wait is bounded here.
+// below it expects can end the one process every location of the node shares.
 type limit struct {
 	lo, hi int64
-	// list lets a range hold several parts joined by commas (Xray's PortList).
-	list bool
 }
 
-// within bounds a number (kNum) or a range (kRange) to [lo, hi].
-func (n *node) within(lo, hi int64) *node {
-	n.lim = &limit{lo: lo, hi: hi}
-	return n
+// bnum is a whole number in [lo, hi].
+func bnum(lo, hi int64) *node { return &node{k: kInt, lim: &limit{lo, hi}} }
+
+// brange is a whole number, or "x-y", with both ends in [lo, hi] and x not above y.
+func brange(lo, hi int64) *node { return &node{k: kRange, lim: &limit{lo, hi}} }
+
+// port is a whole number from 1 to 65535.
+func port() *node { return bnum(1, 65535) }
+
+// problem names what is wrong with a node of a table, or "". The table of a release
+// is walked by a test with it: a leaf of no kind, a number with no bound, an array with
+// no upper limit and an enum with no value are refused at build time of the tests, so
+// a key can never join a table unbounded (7.2, G4).
+func (n *node) problem() string {
+	switch n.k {
+	case kObj:
+		return ""
+	case kArr:
+		if n.elem == nil || n.maxN < 1 || n.minN < 0 || n.minN > n.maxN {
+			return "an array with no bound"
+		}
+	case kInt, kRange:
+		if n.lim == nil || n.lim.lo > n.lim.hi {
+			return "a number with no bound"
+		}
+	case kEnum:
+		if len(n.enum) == 0 {
+			return "an enum with no value"
+		}
+	case kOneOf:
+		if len(n.alts) == 0 {
+			return "a choice with no alternative"
+		}
+		for _, a := range n.alts {
+			if p := a.problem(); p != "" {
+				return p
+			}
+			if a.k == kObj || a.k == kArr {
+				return "a choice of a structure"
+			}
+		}
+	case kBool, kHost, kHostPort, kText, kPath, kHeaders, kUUIDText, kKey32, kKey32URL, kIP, kPins, kShortID, kSpiderX, kDialer, kDropped:
+		// Each of these has a bound written into its check.
+	default:
+		return "a node of no kind"
+	}
+	return ""
 }
-
-// ports is a range of ports that may also hold a list of ranges.
-func ports() *node {
-	n := rng().within(1, 65535)
-	n.lim.list = true
-	return n
-}
-
-// bnum is a number in [lo, hi].
-func bnum(lo, hi int64) *node { return num().within(lo, hi) }
-
-// brange is a range of numbers (a number, or "a-b") with both ends in [lo, hi].
-func brange(lo, hi int64) *node { return rng().within(lo, hi) }

@@ -19,40 +19,76 @@ import (
 // note is the remark of the link, protocol the Xray protocol of the outbound. The
 // error never holds a value of the link, only the name of a parameter.
 func Convert(link string) (fragment []byte, note, protocol string, err error) {
+	c, err := convert(link)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return c.fragment, c.note, c.protocol, nil
+}
+
+// converted is what one link gives. omitted names what the link carries and the
+// fragment leaves out because the exit works without it: the panel lists each in the diff
+// of the candidate (7.3).
+type converted struct {
+	fragment []byte
+	note     string
+	protocol string
+	omitted  []string
+}
+
+func convert(link string) (converted, error) {
 	if len(link) > MaxLineBytes {
-		return nil, "", "", errors.New("the link is too long")
+		return converted{}, errors.New("the link is too long")
 	}
 	if !utf8.ValidString(link) {
-		return nil, "", "", errors.New("the link is not valid UTF-8")
+		return converted{}, errors.New("the link is not valid UTF-8")
 	}
 	scheme, rest, ok := strings.Cut(link, "://")
 	if !ok || rest == "" {
-		return nil, "", "", errors.New("not a share link: no scheme")
+		return converted{}, errors.New("not a share link: no scheme")
 	}
-	var ob map[string]any
+	var (
+		ob      map[string]any
+		note    string
+		omitted []string
+		err     error
+	)
 	switch strings.ToLower(scheme) {
 	case "vless":
-		ob, note, err = convertVLESS(rest)
+		ob, note, omitted, err = convertVLESS(rest)
 	case "vmess":
-		ob, note, err = convertVMess(rest)
+		ob, note, omitted, err = convertVMess(rest)
 	case "trojan":
-		ob, note, err = convertTrojan(rest)
+		ob, note, omitted, err = convertTrojan(rest)
 	case "ss":
-		ob, note, err = convertSS(rest)
+		ob, note, omitted, err = convertSS(rest)
 	case "hysteria2", "hy2":
-		ob, note, err = convertHysteria2(rest)
+		ob, note, omitted, err = convertHysteria2(rest)
 	default:
-		return nil, "", "", errors.New("unknown scheme: the converter knows vless, vmess, trojan, ss and hysteria2")
+		return converted{}, errors.New("unknown scheme: the converter knows vless, vmess, trojan, ss and hysteria2")
 	}
 	if err != nil {
-		return nil, "", "", err
+		return converted{}, err
 	}
-	protocol, _ = ob["protocol"].(string)
-	fragment, err = json.Marshal(map[string]any{"outbounds": []any{ob}})
+	protocol, _ := ob["protocol"].(string)
+	fragment, err := json.Marshal(map[string]any{"outbounds": []any{ob}})
 	if err != nil {
-		return nil, "", "", err
+		return converted{}, err
 	}
-	return fragment, clipNote(note), protocol, nil
+	// A link gives keys of the allow-list alone, so its candidate never carries a warning
+	// (7.3): a value that is not of the kind of its key is an error of the line, because
+	// the exit may not work without it. The reason names the key and its kind, never the
+	// value.
+	r := xrayschema.Newest().Check(fragment, nil)
+	switch {
+	case len(r.Rejected) != 0:
+		return converted{}, fmt.Errorf("%s: %s", r.Rejected[0].Path, r.Rejected[0].Msg)
+	case len(r.Warnings) != 0:
+		reason, _, _ := strings.Cut(r.Warnings[0].Msg, "; Ctrl Z does not judge")
+		return converted{}, fmt.Errorf("%s: %s; the link cannot be used as it is, and an exit like this is pasted as JSON", r.Warnings[0].Path, reason)
+	}
+	sort.Strings(omitted)
+	return converted{fragment: fragment, note: clipNote(note), protocol: protocol, omitted: omitted}, nil
 }
 
 func clipNote(s string) string {
@@ -76,7 +112,11 @@ func clipNote(s string) string {
 type params struct {
 	m    map[string]string
 	used map[string]bool
+	// omitted names what the link carries and the converter leaves out (7.3).
+	omitted []string
 }
+
+func (p *params) omit(name string) { p.omitted = append(p.omitted, name) }
 
 func newParams() *params { return &params{m: map[string]string{}, used: map[string]bool{}} }
 
@@ -280,19 +320,19 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			if repeatsAKey([]byte(e)) {
 				return nil, errors.New("parameter \"extra\" gives a key twice")
 			}
-			x["extra"] = extra
+			kept, err := filterExtra(p, extra)
+			if err != nil {
+				return nil, err
+			}
+			if len(kept) > 0 {
+				x["extra"] = kept
+			}
 		}
 		ss["xhttpSettings"] = x
 	case "kcp", "mkcp":
-		// seed and the header type moved to the mkcp-legacy mask in this release, and a
-		// guess at their mapping would be a setting the admin believes is on.
-		ss["method"] = "kcp"
-		if rd("seed") != "" {
-			return nil, errors.New("parameter \"seed\" of kcp is not supported by the converter")
-		}
-		if h := strings.ToLower(rd("headertype")); h != "" && h != "none" {
-			return nil, errors.New("parameter \"headertype\" of kcp is not supported by the converter")
-		}
+		// kcp is an unknown value of 7.2 and its settings moved to masks in this release, so
+		// a link cannot carry it: the exit is pasted as JSON, where the admin accepts it.
+		return nil, errors.New("parameter \"type\" is kcp, which is not on the list of the allow-list: paste the exit as JSON")
 	case "h2", "http", "quic":
 		return nil, errors.New("this transport was removed from Xray: use xhttp")
 	default:
@@ -323,15 +363,11 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			return nil, errNoInsecure("allowinsecure", "pcs")
 		}
 		setIf(t, "pinnedPeerCertSha256", rd("pcs"))
-		// Xray reads an echConfigList with :// as the address of a DoH, h2c or UDP server to
-		// ask for the exit's ECH record, with socket options of its own and the host
-		// resolver for a name (7.2, 7.4). Only a base64 list is passed on; the checker says
-		// the same, and the converter names the parameter.
-		if ech := rd("ech"); ech != "" {
-			if _, err := base64.StdEncoding.DecodeString(ech); err != nil {
-				return nil, errors.New("parameter \"ech\" is not a base64 ECH config list (a server address or a name is refused)")
-			}
-			t["echConfigList"] = ech
+		// ECH is not on the list (7.2), and the exit may not work without it, so the link is
+		// an error of its line and the exit is pasted as JSON. A value with :// would also
+		// make Xray ask a DoH, h2c or UDP server for the record, which is refused for good.
+		if rd("ech") != "" {
+			return nil, errors.New("parameter \"ech\" is not on the list of the allow-list: paste the exit as JSON")
 		}
 		ss["tlsSettings"] = t
 	case "reality":
@@ -348,7 +384,11 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 		} else {
 			setIf(r, "spiderX", spx)
 		}
-		setIf(r, "mldsa65Verify", rd("pqv"))
+		// The post-quantum verification only adds a check of the server; the exit works
+		// without it, so it is left out with a line in the diff (7.3).
+		if rd("pqv") != "" {
+			p.omit("pqv")
+		}
 		if r["publicKey"] == nil {
 			return nil, errors.New("security reality needs parameter \"pbk\"")
 		}
@@ -411,78 +451,79 @@ func newOutbound(protocol string, settings, ss map[string]any) map[string]any {
 	return ob
 }
 
-func convertVLESS(rest string) (map[string]any, string, error) {
+func convertVLESS(rest string) (map[string]any, string, []string, error) {
 	u, err := parseURL("vless", rest)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	host, port, err := hostPortOf(u)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	id := u.User.Username()
 	if id == "" || len(id) > 64 {
-		return nil, "", errors.New("the user id is empty or too long")
+		return nil, "", nil, errors.New("the user id is empty or too long")
 	}
 	if err := noPassword(u); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	enc := p.get("encryption")
 	if enc == "" {
 		enc = "none"
 	}
-	// A gap of the padding text is a sleep inside the handshake that nothing cancels.
-	if why := xrayschema.CheckVLESSEncryption(enc); why != "" {
-		return nil, "", errors.New("parameter \"encryption\": " + why)
+	// Only none is on the list (7.2): the post-quantum text carries sleeps that nothing
+	// cancels, and the exit may not work without it, so the link is an error of its line.
+	if enc != "none" {
+		return nil, "", nil, errors.New("parameter \"encryption\" is not none: paste the exit as JSON")
 	}
 	settings := map[string]any{"address": host, "port": port, "id": id, "encryption": enc}
 	setIf(settings, "flow", p.get("flow"))
 	ss, err := stream(p, "none")
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if err := p.leftover(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	return newOutbound("vless", settings, ss), remark(u), nil
+	return newOutbound("vless", settings, ss), remark(u), p.omitted, nil
 }
 
-func convertTrojan(rest string) (map[string]any, string, error) {
+func convertTrojan(rest string) (map[string]any, string, []string, error) {
 	u, err := parseURL("trojan", rest)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	host, port, err := hostPortOf(u)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	pw := u.User.Username()
 	if p, ok := u.User.Password(); ok {
 		pw += ":" + p
 	}
 	if pw == "" {
-		return nil, "", errors.New("the password is empty")
+		return nil, "", nil, errors.New("the password is empty")
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if p.has("flow") {
-		return nil, "", errors.New("parameter \"flow\" is not supported for trojan in this release")
+		return nil, "", nil, errors.New("parameter \"flow\" is not supported for trojan in this release")
 	}
 	ss, err := stream(p, "tls")
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if err := p.leftover(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	settings := map[string]any{"address": host, "port": port, "password": pw}
-	return newOutbound("trojan", settings, ss), remark(u), nil
+	return newOutbound("trojan", settings, ss), remark(u), p.omitted, nil
 }
 
 // decodeBase64 takes the four spellings a link may use: standard or URL alphabet,
@@ -496,28 +537,28 @@ func decodeBase64(s string) ([]byte, bool) {
 	return nil, false
 }
 
-func convertVMess(rest string) (map[string]any, string, error) {
+func convertVMess(rest string) (map[string]any, string, []string, error) {
 	if strings.Contains(rest, "@") {
 		return convertVMessURI(rest)
 	}
 	body, _, _ := strings.Cut(rest, "#")
 	b, ok := decodeBase64(strings.TrimSpace(body))
 	if !ok {
-		return nil, "", errors.New("the vmess link is neither base64 JSON nor a URI")
+		return nil, "", nil, errors.New("the vmess link is neither base64 JSON nor a URI")
 	}
 	var j map[string]any
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.UseNumber()
 	if err := dec.Decode(&j); err != nil || j == nil {
-		return nil, "", errors.New("the vmess link does not hold a JSON object")
+		return nil, "", nil, errors.New("the vmess link does not hold a JSON object")
 	}
 	// Decode reads one value and ignores what follows it, so a second object or a stray
 	// word after the first would be dropped without a word (R14).
 	if _, err := dec.Token(); err != io.EOF {
-		return nil, "", errors.New("the vmess link has text after its JSON object")
+		return nil, "", nil, errors.New("the vmess link has text after its JSON object")
 	}
 	if repeatsAKey(b) {
-		return nil, "", errors.New("the vmess JSON gives a field twice")
+		return nil, "", nil, errors.New("the vmess JSON gives a field twice")
 	}
 	str := func(k string) (string, error) {
 		v, ok := j[k]
@@ -545,26 +586,26 @@ func convertVMess(rest string) (map[string]any, string, error) {
 	for _, k := range keys {
 		lk := strings.ToLower(k)
 		if !known[lk] {
-			return nil, "", fmt.Errorf("unknown field %q", clipName(k))
+			return nil, "", nil, fmt.Errorf("unknown field %q", clipName(k))
 		}
 		if _, dup := lower[lk]; dup {
-			return nil, "", fmt.Errorf("field %q is given twice", clipName(lk))
+			return nil, "", nil, fmt.Errorf("field %q is given twice", clipName(lk))
 		}
 		s, err := str(k)
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 		lower[lk] = s
 	}
 	if aid := lower["aid"]; aid != "" && aid != "0" {
-		return nil, "", errors.New("field \"aid\" must be 0: legacy VMess is not supported")
+		return nil, "", nil, errors.New("field \"aid\" must be 0: legacy VMess is not supported")
 	}
 	host, port, err := checkHostPort(lower["add"], lower["port"])
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if lower["id"] == "" || len(lower["id"]) > 64 {
-		return nil, "", errors.New("the user id is empty or too long")
+		return nil, "", nil, errors.New("the user id is empty or too long")
 	}
 	p := newParams()
 	net := strings.ToLower(lower["net"])
@@ -582,7 +623,7 @@ func convertVMess(rest string) (map[string]any, string, error) {
 		case net == "xhttp":
 			p.m["mode"] = lower["type"]
 		default:
-			return nil, "", errors.New("field \"type\" must be none or empty for ws and httpupgrade")
+			return nil, "", nil, errors.New("field \"type\" must be none or empty for ws and httpupgrade")
 		}
 	case "grpc":
 		p.m["type"] = "grpc"
@@ -601,41 +642,41 @@ func convertVMess(rest string) (map[string]any, string, error) {
 	case "tls":
 		p.m["security"] = "tls"
 	default:
-		return nil, "", errors.New("field \"tls\" is not tls or empty")
+		return nil, "", nil, errors.New("field \"tls\" is not tls or empty")
 	}
 	p.m["sni"], p.m["alpn"], p.m["fp"] = lower["sni"], lower["alpn"], lower["fp"]
 	p.m["allowinsecure"] = lower["allowinsecure"]
 	ss, err := stream(p, "none")
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	scy := lower["scy"]
 	if scy == "" {
 		scy = "auto"
 	}
 	settings := map[string]any{"address": host, "port": port, "id": lower["id"], "security": scy}
-	return newOutbound("vmess", settings, ss), lower["ps"], nil
+	return newOutbound("vmess", settings, ss), lower["ps"], p.omitted, nil
 }
 
-func convertVMessURI(rest string) (map[string]any, string, error) {
+func convertVMessURI(rest string) (map[string]any, string, []string, error) {
 	u, err := parseURL("vmess", rest)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	host, port, err := hostPortOf(u)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	id := u.User.Username()
 	if id == "" || len(id) > 64 {
-		return nil, "", errors.New("the user id is empty or too long")
+		return nil, "", nil, errors.New("the user id is empty or too long")
 	}
 	if err := noPassword(u); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	scy := p.get("encryption")
 	if scy == "" {
@@ -643,23 +684,23 @@ func convertVMessURI(rest string) (map[string]any, string, error) {
 	}
 	ss, err := stream(p, "none")
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if err := p.leftover(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	settings := map[string]any{"address": host, "port": port, "id": id, "security": scy}
-	return newOutbound("vmess", settings, ss), remark(u), nil
+	return newOutbound("vmess", settings, ss), remark(u), p.omitted, nil
 }
 
 // convertSS reads SIP002 (base64url or percent-encoded user info before @), SIP022
 // (a plain "method:password" with a base64 key, percent-encoded) and the old whole-link
 // base64 form. A plugin is refused: it would run a program on the node.
-func convertSS(rest string) (map[string]any, string, error) {
+func convertSS(rest string) (map[string]any, string, []string, error) {
 	rest, frag, _ := strings.Cut(rest, "#")
 	note, err := url.PathUnescape(frag)
 	if err != nil {
-		return nil, "", errors.New("the remark is not percent-encoded correctly")
+		return nil, "", nil, errors.New("the remark is not percent-encoded correctly")
 	}
 	rest, query, _ := strings.Cut(rest, "?")
 	rest = strings.TrimSuffix(rest, "/")
@@ -667,13 +708,13 @@ func convertSS(rest string) (map[string]any, string, error) {
 	if i := strings.LastIndex(rest, "@"); i >= 0 {
 		ui, err := url.PathUnescape(rest[:i])
 		if err != nil {
-			return nil, "", errors.New("the user info is not percent-encoded correctly")
+			return nil, "", nil, errors.New("the user info is not percent-encoded correctly")
 		}
 		hostport = rest[i+1:]
 		if !strings.Contains(ui, ":") {
 			b, ok := decodeBase64(ui)
 			if !ok {
-				return nil, "", errors.New("the user info is neither base64 nor method:password")
+				return nil, "", nil, errors.New("the user info is neither base64 nor method:password")
 			}
 			ui = string(b)
 		}
@@ -681,63 +722,68 @@ func convertSS(rest string) (map[string]any, string, error) {
 	} else {
 		b, ok := decodeBase64(rest)
 		if !ok {
-			return nil, "", errors.New("the ss link is neither SIP002 nor base64")
+			return nil, "", nil, errors.New("the ss link is neither SIP002 nor base64")
 		}
 		whole := string(b)
 		i := strings.LastIndex(whole, "@")
 		if i < 0 {
-			return nil, "", errors.New("the decoded ss link has no @")
+			return nil, "", nil, errors.New("the decoded ss link has no @")
 		}
 		method, password, _ = strings.Cut(whole[:i], ":")
 		hostport = whole[i+1:]
 	}
 	if method == "" || password == "" {
-		return nil, "", errors.New("the method or the password is empty")
+		return nil, "", nil, errors.New("the method or the password is empty")
 	}
 	host, port, err := splitHostPort(hostport)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	p, err := parseQuery(query)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if p.has("plugin") {
-		return nil, "", errors.New("parameter \"plugin\" is refused: a plugin would run a program on the node")
+		return nil, "", nil, errors.New("parameter \"plugin\" is refused: a plugin would run a program on the node")
 	}
 	ss, err := stream(p, "none")
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	if err := p.leftover(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	settings := map[string]any{"address": host, "port": port, "method": strings.ToLower(method), "password": password}
-	return newOutbound("shadowsocks", settings, ss), note, nil
+	return newOutbound("shadowsocks", settings, ss), note, p.omitted, nil
 }
 
-func convertHysteria2(rest string) (map[string]any, string, error) {
+func convertHysteria2(rest string) (map[string]any, string, []string, error) {
 	u, err := parseURL("hysteria2", rest)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	host, port, err := hysteria2HostPort(u)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	auth := u.User.Username()
 	if pw, ok := u.User.Password(); ok {
 		auth += ":" + pw
 	}
 	if auth == "" {
-		return nil, "", errors.New("the auth is empty")
+		return nil, "", nil, errors.New("the auth is empty")
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
+	// mport of one port or one a-b is the udphop mask of 7.2; a list is not of its kind.
+	hop := ""
 	if p.has("mport") {
-		return nil, "", errors.New("parameter \"mport\" (port hopping) is not supported by the converter")
+		hop = p.get("mport")
+		if !hopPorts(hop) {
+			return nil, "", nil, errors.New("parameter \"mport\" is not one port or one range a-b")
+		}
 	}
 	tls := map[string]any{}
 	setIf(tls, "serverName", p.get("sni"))
@@ -745,14 +791,14 @@ func convertHysteria2(rest string) (map[string]any, string, error) {
 		tls["alpn"] = splitList(a)
 	}
 	if ins, err := p.boolean("insecure"); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	} else if ins {
-		return nil, "", errNoInsecure("insecure", "pinsha256")
+		return nil, "", nil, errNoInsecure("insecure", "pinsha256")
 	}
 	if pin := p.get("pinsha256"); pin != "" {
 		hex := strings.ToLower(strings.ReplaceAll(pin, ":", ""))
 		if len(hex) != 64 || strings.Trim(hex, "0123456789abcdef") != "" {
-			return nil, "", errors.New("parameter \"pinsha256\" is not a SHA-256 in hex")
+			return nil, "", nil, errors.New("parameter \"pinsha256\" is not a SHA-256 in hex")
 		}
 		tls["pinnedPeerCertSha256"] = hex
 	}
@@ -760,33 +806,90 @@ func convertHysteria2(rest string) (map[string]any, string, error) {
 		"method": "hysteria", "security": "tls", "tlsSettings": tls,
 		"hysteriaSettings": map[string]any{"version": 2, "auth": auth},
 	}
+	var masks []any
 	switch obfs := strings.ToLower(p.get("obfs")); obfs {
 	case "":
 		if p.has("obfs-password") {
-			return nil, "", errors.New("parameter \"obfs-password\" needs obfs=salamander")
+			return nil, "", nil, errors.New("parameter \"obfs-password\" needs obfs=salamander")
 		}
 	case "salamander":
 		pw := p.get("obfs-password")
 		if pw == "" {
-			return nil, "", errors.New("obfs salamander needs parameter \"obfs-password\"")
+			return nil, "", nil, errors.New("obfs salamander needs parameter \"obfs-password\"")
 		}
-		ss["finalmask"] = map[string]any{"udp": []any{map[string]any{"type": "salamander", "settings": map[string]any{"password": pw}}}}
+		masks = append(masks, map[string]any{"type": "salamander", "settings": map[string]any{"password": pw}})
 	default:
-		return nil, "", errors.New("parameter \"obfs\" is not salamander")
+		return nil, "", nil, errors.New("parameter \"obfs\" is not salamander")
+	}
+	if hop != "" {
+		// The URI carries no hop interval, so the default of Hysteria 2 (30 s) is written
+		// down: the exit hops the way the client of the link does. The salamander mask comes
+		// first, because the release writes the list in reverse and the hop must dial.
+		masks = append(masks, map[string]any{"type": "udphop", "settings": map[string]any{"mode": "intervalRemote", "interval": 30, "remotePorts": hop}})
+	}
+	if len(masks) > 0 {
+		ss["finalmask"] = map[string]any{"udp": masks}
 	}
 	if err := p.leftover(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	settings := map[string]any{"version": 2, "address": host, "port": port}
-	return newOutbound("hysteria", settings, ss), remark(u), nil
+	return newOutbound("hysteria", settings, ss), remark(u), p.omitted, nil
 }
 
 // hysteria2HostPort is hostPortOf with the default of the URI form: the port of
 // hysteria2://[auth@]host[:port]/ is optional and 443. A list or a range of ports is
-// not a URL port at all (net/url refuses it), so port hopping stays refused.
+// not a URL port at all (net/url refuses it), so it comes in the mport parameter.
 func hysteria2HostPort(u *url.URL) (string, int, error) {
 	if u.Port() == "" {
 		return checkHostPort(u.Hostname(), "443")
 	}
 	return hostPortOf(u)
+}
+
+// extraKept are the members of the extra object of an xhttp link that the allow-list
+// lists; extraOmitted are the ones that the exit works without, which the candidate
+// leaves out with a line in its diff (7.3). Any other member is an error of the line:
+// the exit may not work without it (downloadSettings, the padding and placement keys).
+func extraKept() map[string]string {
+	return map[string]string{"headers": "headers", "nogrpcheader": "noGRPCHeader", "xpaddingbytes": "xPaddingBytes", "scmaxeachpostbytes": "scMaxEachPostBytes"}
+}
+
+func extraOmitted() map[string]string {
+	return map[string]string{"xmux": "xmux", "scminpostsintervalms": "scMinPostsIntervalMs", "scmaxbufferedposts": "scMaxBufferedPosts",
+		"scstreamupserversecs": "scStreamUpServerSecs", "nosseheader": "noSSEHeader", "servermaxheaderbytes": "serverMaxHeaderBytes"}
+}
+
+func filterExtra(p *params, extra map[string]any) (map[string]any, error) {
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	kept := map[string]any{}
+	for _, k := range keys {
+		lk := strings.ToLower(k)
+		if canon, ok := extraKept()[lk]; ok {
+			if _, dup := kept[canon]; dup {
+				return nil, fmt.Errorf("parameter \"extra\" gives member %q twice", canon)
+			}
+			kept[canon] = extra[k]
+		} else if canon, ok := extraOmitted()[lk]; ok {
+			p.omit("extra." + canon)
+		} else {
+			return nil, fmt.Errorf("parameter \"extra\" has the member %q, which is not on the list of the allow-list: paste the exit as JSON", clipName(k))
+		}
+	}
+	return kept, nil
+}
+
+// hopPorts reads the mport of a Hysteria 2 link: one port or one a-b, which is the form
+// of the udphop mask. A list is not.
+func hopPorts(s string) bool {
+	a, b, two := strings.Cut(s, "-")
+	ok := func(x string) bool {
+		n, err := strconv.Atoi(x)
+		return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == x
+	}
+	return ok(a) && (!two || ok(b))
 }

@@ -39,10 +39,9 @@ func sourceKeys(t *testing.T, tag string) map[string]bool {
 
 // tableKeys walks a table and returns every key it names, with where it is used.
 func tableKeys(n *node, depth int, out map[string]string, where string) {
-	if depth > 6 {
+	if depth > 12 {
 		return
 	}
-	n = n.resolve()
 	add := func(k string) {
 		if _, ok := out[k]; !ok {
 			out[k] = where
@@ -55,14 +54,14 @@ func tableKeys(n *node, depth int, out map[string]string, where string) {
 	for old := range n.alias {
 		add(old)
 	}
-	for k := range n.reject {
-		add(k)
-	}
 	for _, c := range n.sel {
 		tableKeys(c, depth+1, out, where+".<variant>")
 	}
 	if n.elem != nil {
 		tableKeys(n.elem, depth+1, out, where+"[]")
+	}
+	for _, a := range n.alts {
+		tableKeys(a, depth+1, out, where+"|")
 	}
 }
 
@@ -75,9 +74,9 @@ func TestTableKeysAreKeysOfTheSource(t *testing.T) {
 		tb, _ := For(tag)
 		used := map[string]string{}
 		tableKeys(tb.build(), 0, used, "outbound")
-		// Fields whose Go name, not a tag, is the key: WireGuardConfig.IsClient has the
-		// empty tag json:"".
-		goName := map[string]bool{"isclient": true}
+		// Keys that links and older configs carry and that are not a key of this release
+		// any more: the table lists them only to drop them (7.2).
+		goName := map[string]bool{"ota": true, "alterid": true, "tcpnodelay": true}
 		var missing []string
 		for k, where := range used {
 			if !src[strings.ToLower(k)] && !goName[strings.ToLower(k)] {
@@ -89,7 +88,8 @@ func TestTableKeysAreKeysOfTheSource(t *testing.T) {
 			t.Errorf("%s: keys of the table that the source does not have: %v", tag, missing)
 		}
 		for k := range globalRejected() {
-			if !src[k] {
+			// WireGuardConfig.IsClient has the empty tag json:"", so its Go name is the key.
+			if !src[k] && k != "isclient" {
 				t.Errorf("%s: always-rejected key %q is not a key of the source", tag, k)
 			}
 		}

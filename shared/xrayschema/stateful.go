@@ -23,11 +23,16 @@ type statefulSet struct {
 // inside its stream settings (tlsSettings, downloadSettings and extra included). B5
 // rebuilds such a config in the idle slot on every change, removal or disable.
 //
-// The answer errs towards true: a fragment that cannot be read, or a table with no
-// rules, is called stateful, because the cost of a wrong true is one rebuild and the
+// The answer errs towards true: a fragment that cannot be read, one that the table does
+// not pass without accept_unknown, or a table with no rules, is called stateful, because the cost of a wrong true is one rebuild and the
 // cost of a wrong false is a second WireGuard device with the same key.
 func (t Table) Stateful(fragment []byte) bool {
 	if t.rules == nil {
+		return true
+	}
+	// A fragment the table does not pass as it stands (one that cannot be read, one with
+	// an accepted unknown key or value) is stateful: nobody read what its handler keeps.
+	if r := t.Check(fragment, nil); len(r.Rejected) != 0 || len(r.Warnings) != 0 {
 		return true
 	}
 	root, err := parse(fragment)
