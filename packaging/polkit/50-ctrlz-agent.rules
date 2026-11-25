@@ -1,0 +1,30 @@
+// What the agent may ask systemd to do (p4-nodes 7.1, R16).
+//
+// The agent runs as ctrlz-agent, an unprivileged user. It starts, stops and
+// restarts exactly these four units, and it is refused every other polkit action
+// by name, so a compromised agent cannot install a package, write a unit file,
+// reload systemd or touch any other service. `systemctl is-active` needs no
+// authorisation and is not listed. A reload of Unbound is `unbound-control
+// reload_keep_cache` on the control socket, not a systemd verb.
+//
+// internal/pkgcheck parses the two arrays below (and the user) and the install
+// test compares them with the agent's own list; a rule that names another unit,
+// another verb or no unit at all fails it.
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "ctrlz-agent") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var units = [
+        "ctrlz-dns.service",
+        "ctrlz-unbound.service",
+        "ctrlz-unbound-free.service",
+        "chrony.service"
+    ];
+    var verbs = ["start", "stop", "restart"];
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        units.indexOf(action.lookup("unit")) >= 0 &&
+        verbs.indexOf(action.lookup("verb")) >= 0) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NO;
+});

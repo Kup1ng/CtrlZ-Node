@@ -1,0 +1,49 @@
+# The free Unbound: serves free-DNS misses only, on 127.0.0.11:5300 (p4-nodes 7.3,
+# SC 5.2a). Same rules as ctrlz-unbound.service (agent-supervised, no Restart=,
+# output to null), with its own user, directories and a ceiling on what it may take
+# from the host. A flood of free queries then cannot starve the identified path.
+#
+# CPUQuota is not here: systemd counts it per CPU, so 25% of the host is
+# 25% times the CPU count, which only the host knows. install/apply.sh writes it
+# to a drop-in (10-limits.conf) from nproc.
+[Unit]
+Description=Ctrl Z Unbound (free)
+After=network.target
+ConditionPathExists=/etc/ctrlz/unbound/free.conf
+
+[Service]
+Type=simple
+User=ctrlz-unbound-free
+Group=ctrlz-unbound-free
+ExecStart=/usr/sbin/unbound -d -c /etc/ctrlz/unbound/free.conf
+Restart=no
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+RuntimeDirectory=ctrlz-unbound-free
+RuntimeDirectoryMode=0750
+StateDirectory=ctrlz-unbound-free
+StateDirectoryMode=0750
+# Two threads with 512 queries each and the caches that go with them fit well under
+# this; it is a ceiling for a fault, provisional until the load test (T-374, D31).
+MemoryMax=512M
+TasksMax=256
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0027

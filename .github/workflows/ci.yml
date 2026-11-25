@@ -1,0 +1,166 @@
+# CI of the Node on GitHub Actions: the steps of scripts/ci.sh, cut into parallel
+# jobs (static, tests, tests (lab), install and the scan). What stays local is named in ci/github/README.md of the workspace: the equality of
+# the two shared copies (it needs both repositories side by side) and gitleaks over the
+# real local history.
+#
+# Rules this file keeps:
+#   - no pull_request or pull_request_target trigger: the repository is public and a fork
+#     must never get to run these jobs;
+#   - read-only token and no repository credential of any kind (check-tree.mjs refuses the
+#     word that names them, comments included, so it is not written in this file);
+#   - actions are pinned to a full commit SHA, the version in the comment, and only
+#     actions/checkout and actions/setup-go are used. A release is pinned only when it is at
+#     least 14 days old (setup-go v7.1.0 was two days old and is not used yet);
+#   - the job xray-check (docs/specs/p4b-proxy.md 17, B0) runs only for branches named ci/p4b-b0*; the other five jobs skip
+#     on the experiment branches ci/p4b-b0-x*, so a run of the experiment does not queue the install job again and again. The
+#     final commit of B0 goes to ci/p4b-b0, where all six run. The rule is removed with the job when B0 is recorded;
+#   - five jobs at once. The Panel's run peaks at 18, so both together are 23 and the last three queue
+#     on the 20 of the free account (a queued job waits, it does not fail).
+name: ci
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A go.mod ahead of the installed Go must fail, not download a toolchain (go-pin-check.sh).
+  GOTOOLCHAIN: local
+
+jobs:
+  # pin check, shared verify of the one copy, shared tests, gofmt, build, vet for both systems.
+  static:
+    name: static
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Static checks
+        run: sh .github/ci/static.sh
+
+  tests:
+    name: tests
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Check the compiler
+        run: sh scripts/go-pin-check.sh
+      # shardrun runs go test -count=1 -json ./... and fails on a package that reports no
+      # result or a skip that is not on its list of by-design skips, and says what was skipped.
+      - name: go test
+        run: go run ./.github/ci/shardrun module .
+
+  # The lab build (tag ctrlz_lab): the module and shared/ with the P4 fault-test build. No release job
+  # builds the files and the golden-vector cases that only this tag builds, so this job is what runs
+  # them; the cases that only a release build runs skip here, by design (shardrun, gofiles.sh).
+  tests-lab:
+    name: tests (lab)
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: go test with the lab tag
+        run: sh .github/ci/lab.sh
+
+  # TestInstallInContainer, which the other jobs skip: node.sh, apply.sh and the upgrade in clean
+  # ubuntu:24.04 containers. The runner has Docker. The job pulls the image by digest and fails if
+  # the test skips.
+  install:
+    name: install
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            shared/go.sum
+      - name: Install test in containers
+        run: sh .github/ci/install.sh
+
+  # The published history is only snapshots, so gitleaks reads the files of the checkout
+  # with the repository's own .gitleaks.toml (publish.mjs only pushes a tree whose file is a reviewed
+  # one) and with gitleaks:allow comments ignored. The history is scanned by the local run.
+  scan:
+    name: gitleaks and govulncheck
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No build or module cache here: the cache that setup-go restores is saved by whichever job
+      # finishes first, which can be one that has just run the tree's tests and so its dependencies,
+      # and the scanners must not be compiled from anything such a job could have written (CI review
+      # round 7, ci-r7-8). They are built from the module proxy with the checksum database instead.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install the scanners
+        run: sh .github/ci/install-tools.sh
+      - name: gitleaks
+        run: gitleaks dir --no-banner --redact --log-level=warn --ignore-gitleaks-allow .
+      - name: govulncheck
+        run: govulncheck -C . ./...
+
+  # The start check of package B0 (docs/specs/p4b-proxy.md 17): the pinned Xray release, run through the experiments of
+  # .github/ci/xraycheck. It fetches the release archive from github.com over https and the module source from the Go module
+  # proxy, both against pinned hashes (.github/ci/xray-check.sh). Only the branches ci/p4b-b0* run it. No cache: nothing here is
+  # proved elsewhere, so what the job compiles must not come from what another job saved.
+  xray-check:
+    name: xray start check
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Start check of the pinned Xray
+        run: sh .github/ci/xray-check.sh
