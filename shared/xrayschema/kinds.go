@@ -84,9 +84,17 @@ func fits(n *node, v *val) string {
 		if v.k != 's' || !ipOK(v.s) {
 			return "must be an IP address or a prefix"
 		}
+	case kPrefix:
+		if v.k != 's' || !prefixOK(v.s) {
+			return "must be an IP prefix with its length, such as 10.0.0.1/32"
+		}
+	case kHTTPHost:
+		if v.k != 's' || !httpHostOK(v.s) {
+			return "must be an IP address or a DNS name of ASCII labels with a dot, with an optional :port"
+		}
 	case kPins:
 		if v.k != 's' || !pinsOK(v.s) {
-			return "must be 1 to 4 SHA-256 hashes in hex"
+			return "must be 1 to 4 SHA-256 hashes in hex, joined by commas"
 		}
 	case kShortID:
 		if v.k != 's' || !shortIDOK(v.s) {
@@ -339,11 +347,13 @@ func ipOK(s string) bool {
 	return err == nil && a.Zone() == ""
 }
 
-// pinsOK: one to four SHA-256 hashes in hex, joined by "~" (the separator of the
-// loader's list) or ",".
+// pinsOK: one to four SHA-256 hashes in hex, joined by ",". TLSConfig.Build of the
+// release splits the value on "," alone and hex-decodes each part, so a pair joined by
+// "~" is a build error of the whole tlsSettings (the share-link converter turns the "~"
+// of a link into ",").
 func pinsOK(s string) bool {
-	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '~' || r == ',' })
-	if len(parts) < 1 || len(parts) > 4 || strings.Count(s, "~")+strings.Count(s, ",") != len(parts)-1 {
+	parts := strings.Split(s, ",")
+	if len(parts) > 4 {
 		return false
 	}
 	for _, p := range parts {
@@ -352,6 +362,21 @@ func pinsOK(s string) bool {
 		}
 	}
 	return true
+}
+
+// prefixOK: wireguard-go reads allowed_ip with netip.ParsePrefix, which refuses a bare
+// address, so the allowedIPs of a peer need the length.
+func prefixOK(s string) bool {
+	p, err := netip.ParsePrefix(s)
+	return err == nil && p.Addr().Zone() == ""
+}
+
+// httpHostOK is a Host or :authority value that Go will write: ASCII labels only
+// (hostOK), and an optional port. A byte above 0x7f passes url.String and NewRequest of
+// the client but fails Request.Write with an idna error, and the xhttp upload runs
+// common.Must on that, which ends the process that all locations share.
+func httpHostOK(s string) bool {
+	return hostOK(s) || hostPortOK(s)
 }
 
 func shortIDOK(s string) bool { return s != "" && len(s) <= 16 && allHex(s) }

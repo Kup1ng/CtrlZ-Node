@@ -501,7 +501,6 @@ func TestListedKeysPass(t *testing.T) {
 		"xhttpSettings":{"host":"a.example","path":"/x","mode":"auto","headers":{"A":"b"},"noGRPCHeader":true,"xPaddingBytes":"100-1000","scMaxEachPostBytes":1000000,
 		"extra":{"xPaddingBytes":"100-1000","headers":{"A":"b"},"noGRPCHeader":false,"scMaxEachPostBytes":"20000-30000"}}}`))
 	mustOK(t, outboundWith(`,"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example","multiMode":true,"permit_without_stream":false,"idle_timeout":60,"health_check_timeout":20,"initial_windows_size":0}}`))
-	mustOK(t, outboundWith(`,"streamSettings":{"network":"httpupgrade","httpupgradeSettings":{"host":"h","path":"/p","headers":{"A":"b"}}}`))
 	mustOK(t, outboundWith(`,"streamSettings":{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"version":"1.1","method":"GET","path":["/a","/b"],"headers":{"Host":["a.example","b.example"],"X":"y"}}}}}`))
 	mustOK(t, outboundWith(`,"streamSettings":{"security":"reality","realitySettings":{"serverName":"a.example","fingerprint":"firefox","publicKey":"`+realityKey+`","shortId":"ab12","spiderX":"/a/b_c-d.e~f"}}`))
 	mustOK(t, `{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"203.0.113.7","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"tlsSettings":{"serverName":"h.example","alpn":["h3"]},
@@ -538,6 +537,15 @@ func TestKcpIsUnknownAndOtherTransportsAreRefused(t *testing.T) {
 			t.Errorf("%s with settings: %v", n, r.Warnings)
 		}
 		mustOK(t, outboundWith(`,"streamSettings":{"network":"`+n+`","kcpSettings":{"mtu":1350}}`), "outbounds[0].streamSettings.method", "outbounds[0].streamSettings.kcpSettings")
+	}
+	// B1n-r1-3: the dialer of httpupgrade panics on bytes after the 101 header, so it is an
+	// unknown value like kcp, and its settings are unknown keys.
+	for _, n := range []string{"httpupgrade", "HttpUpgrade"} {
+		r := check(t, outboundWith(`,"streamSettings":{"network":"`+n+`","httpupgradeSettings":{"host":"a.example"}}`))
+		if len(r.Rejected) != 0 || len(r.Warnings) != 2 || r.OK() {
+			t.Errorf("%s: %v %v", n, r.Warnings, r.Rejected)
+		}
+		mustOK(t, outboundWith(`,"streamSettings":{"network":"`+n+`","httpupgradeSettings":{"host":"a.example"}}`), "outbounds[0].streamSettings.method", "outbounds[0].streamSettings.httpupgradeSettings")
 	}
 	mustReject(t, "quic", outboundWith(`,"streamSettings":{"network":"quic"}`), "outbounds[0].streamSettings.method")
 }

@@ -30,6 +30,8 @@ const (
 	kOneOf                    // any one of alts
 	kDialer                   // a string that names another outbound by its tag (judged by the chain)
 	kDropped                  // removed from the fragment with a line in Diff
+	kPrefix                   // an IP prefix with its length, no zone
+	kHTTPHost                 // a Host value: host or host:port, ASCII only
 )
 
 // node is one place of a release table. The tables are built by functions and
@@ -133,6 +135,8 @@ func uuidText() *node    { return &node{k: kUUIDText} }
 func key32() *node       { return &node{k: kKey32} }
 func key32URL() *node    { return &node{k: kKey32URL} }
 func ipOrPrefix() *node  { return &node{k: kIP} }
+func prefixOnly() *node  { return &node{k: kPrefix} }
+func httpHost() *node    { return &node{k: kHTTPHost} }
 func pins() *node        { return &node{k: kPins} }
 func shortID() *node     { return &node{k: kShortID} }
 func spiderX() *node     { return &node{k: kSpiderX} }
@@ -225,7 +229,7 @@ func (n *node) problem() string {
 				return "a choice of a structure"
 			}
 		}
-	case kBool, kHost, kHostPort, kText, kPath, kHeaders, kUUIDText, kKey32, kKey32URL, kIP, kPins, kShortID, kSpiderX, kDialer, kDropped:
+	case kBool, kHost, kHostPort, kText, kPath, kHeaders, kUUIDText, kKey32, kKey32URL, kIP, kPrefix, kHTTPHost, kPins, kShortID, kSpiderX, kDialer, kDropped:
 		// Each of these has a bound written into its check.
 	default:
 		return "a node of no kind"

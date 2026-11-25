@@ -56,8 +56,13 @@ func TestVLESS(t *testing.T) {
 	has(t, got, `"method":"xhttp"`, `"mode":"stream-up"`, `"extra":{"xPaddingBytes":"100-200"}`)
 	got = norm(t, "vless://"+uuid+"@a.example:80?type=tcp&headerType=http&host=a.example%2Cb.example&path=%2Fa")
 	has(t, got, `"type":"http"`, `"Host":["a.example","b.example"]`, `"path":["/a"]`)
-	got = norm(t, "vless://"+uuid+"@a.example:80?type=httpupgrade&path=%2Fu&host=h.example")
-	has(t, got, `"httpupgradeSettings":{"host":"h.example","path":"/u"}`)
+	// B1n-r1-3: httpupgrade is not on the list, so its link is an error of its line.
+	if _, _, _, err := Convert("vless://" + uuid + "@a.example:80?type=httpupgrade&path=%2Fu&host=h.example"); err == nil {
+		t.Error("httpupgrade converted")
+	}
+	// B1n-r1-1: links join pins with ~, the loader of Xray splits on a comma.
+	got = norm(t, "vless://"+uuid+"@a.example:443?security=tls&sni=a.example&pcs="+strings.Repeat("ab", 32)+"~"+strings.Repeat("cd", 32))
+	has(t, got, `"pinnedPeerCertSha256":"`+strings.Repeat("ab", 32)+`,`+strings.Repeat("cd", 32)+`"`)
 	// Case of the scheme and of the names.
 	norm(t, "VLESS://"+uuid+"@a.example:443?SECURITY=none&Type=TCP")
 }

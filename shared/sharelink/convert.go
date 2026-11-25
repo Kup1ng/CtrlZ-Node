@@ -288,11 +288,9 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 		setIf(ws, "host", rd("host"))
 		ss["wsSettings"] = ws
 	case "httpupgrade":
-		ss["method"] = "httpupgrade"
-		hu := map[string]any{}
-		setIf(hu, "path", rd("path"))
-		setIf(hu, "host", rd("host"))
-		ss["httpupgradeSettings"] = hu
+		// Not on the list (7.2): its dialer panics when the exit sends bytes after the 101
+		// header, so an exit that offers it is pasted as JSON, where the admin accepts it.
+		return nil, errors.New("parameter \"type\" is httpupgrade, which is not on the list of the allow-list: use ws or xhttp, or paste the exit as JSON")
 	case "grpc":
 		ss["method"] = "grpc"
 		g := map[string]any{}
@@ -362,7 +360,8 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			// candidate that carries it could only fail at the node's -test.
 			return nil, errNoInsecure("allowinsecure", "pcs")
 		}
-		setIf(t, "pinnedPeerCertSha256", rd("pcs"))
+		// Links separate several pins with "~"; the loader of Xray splits on "," alone.
+		setIf(t, "pinnedPeerCertSha256", strings.ReplaceAll(rd("pcs"), "~", ","))
 		// ECH is not on the list (7.2), and the exit may not work without it, so the link is
 		// an error of its line and the exit is pasted as JSON. A value with :// would also
 		// make Xray ask a DoH, h2c or UDP server for the record, which is refused for good.
@@ -614,16 +613,16 @@ func convertVMess(rest string) (map[string]any, string, []string, error) {
 		p.m["type"] = "tcp"
 		p.m["headertype"] = lower["type"]
 		p.m["host"], p.m["path"] = lower["host"], lower["path"]
-	case "ws", "httpupgrade", "xhttp":
+	case "ws", "xhttp":
 		p.m["type"] = net
 		p.m["host"], p.m["path"] = lower["host"], lower["path"]
-		// v2rayN keeps the xhttp mode in "type"; for ws and httpupgrade it holds only none.
+		// v2rayN keeps the xhttp mode in "type"; for ws it holds only none.
 		switch t := strings.ToLower(lower["type"]); {
 		case t == "" || t == "none":
 		case net == "xhttp":
 			p.m["mode"] = lower["type"]
 		default:
-			return nil, "", nil, errors.New("field \"type\" must be none or empty for ws and httpupgrade")
+			return nil, "", nil, errors.New("field \"type\" must be none or empty for ws")
 		}
 	case "grpc":
 		p.m["type"] = "grpc"

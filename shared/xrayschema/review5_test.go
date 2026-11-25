@@ -29,7 +29,6 @@ func TestHTTPHeadersAreUnknown(t *testing.T) {
 	// The transports whose headers are listed keep braces in values: they are no templates.
 	mustOK(t, stream4(`"method":"ws","wsSettings":{"headers":{"X":"{{ literal }}"}}`))
 	mustOK(t, stream4(`"method":"xhttp","xhttpSettings":{"headers":{"X":"{{ literal }}"}}`))
-	mustOK(t, stream4(`"method":"httpupgrade","httpupgradeSettings":{"headers":{"X":"{{ literal }}"}}`))
 }
 
 // B1-r5-3: SOCKS5 carries the length of the user and the password in one byte, and the

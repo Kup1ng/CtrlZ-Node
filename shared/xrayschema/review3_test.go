@@ -135,13 +135,22 @@ func TestKindsOfListedKeys(t *testing.T) {
 		{"tls alpn", stream(`"security":"tls","tlsSettings":{"alpn":VALUE}`), []string{`["h2"]`, `["h3","h2","http/1.1"]`, `["H2"]`}, []string{`[]`, `["spdy"]`, `["h2","h2","h2","h2"]`, str("h2"), `[1]`}},
 		{"tls fingerprint", stream(`"security":"tls","tlsSettings":{"fingerprint":VALUE}`), []string{str("chrome"), str("Randomized")}, []string{str("unsafe"), str("hellochrome_auto")}},
 		{"tls pin", stream(`"security":"tls","tlsSettings":{"pinnedPeerCertSha256":VALUE}`),
-			[]string{str(strings.Repeat("ab", 32)), str(strings.Repeat("AB", 32)), str(strings.Repeat("ab", 32) + "~" + strings.Repeat("cd", 32))},
-			[]string{str(strings.Repeat("ab", 31)), str(strings.Repeat("ab", 32) + "~"), str(strings.Repeat(strings.Repeat("ab", 32)+"~", 4) + strings.Repeat("ab", 32)), str("zz"), `1`}},
+			[]string{str(strings.Repeat("ab", 32)), str(strings.Repeat("AB", 32)), str(strings.Repeat("ab", 32) + "," + strings.Repeat("cd", 32))},
+			// B1n-r1-1 and 7: the loader splits on "," alone, so "~" joins nothing.
+			[]string{str(strings.Repeat("ab", 31)), str(strings.Repeat("ab", 32) + ","), str(strings.Repeat(strings.Repeat("ab", 32)+",", 4) + strings.Repeat("ab", 32)), str("zz"), `1`,
+				str(strings.Repeat("ab", 32) + "~" + strings.Repeat("cd", 32)), str(strings.Repeat("ab", 32) + " , " + strings.Repeat("cd", 32))}},
 		{"reality publicKey", stream(`"security":"reality","realitySettings":{"publicKey":VALUE}`), []string{str(realityKey)}, []string{str("PUB"), str(realityKey + "="), str(realityKey + "A"), str(strings.Repeat("+", 43))}},
 		{"reality shortId", stream(`"security":"reality","realitySettings":{"shortId":VALUE}`), []string{str("ab"), str("0123456789abcdef")}, []string{str("0123456789abcdef0"), str("xy"), `12`}},
 		{"reality serverName", stream(`"security":"reality","realitySettings":{"serverName":VALUE}`), []string{str("www.example.com")}, []string{str("example")}},
 		{"ws path", stream(`"method":"ws","wsSettings":{"path":VALUE}`), []string{str("/a"), str("/" + strings.Repeat("a", 254))}, []string{str("/a b"), str("/" + strings.Repeat("a", 255)), str("/\\u00e9")}},
-		{"ws host", stream(`"method":"ws","wsSettings":{"host":VALUE}`), []string{str("a.example"), str("anything goes, it is text")}, []string{str(strings.Repeat("h", 256)), `1`}},
+		{"ws host", stream(`"method":"ws","wsSettings":{"host":VALUE}`), []string{str("a.example"), str("a.example:8443"), str("203.0.113.7")},
+			// B1n-r1-5: a byte above 0x7f in a Host makes Request.Write fail, and the xhttp upload panics on it.
+			[]string{str("anything goes, it is text"), str("xn--\u00fc.com"), str("a.example:0"), str(strings.Repeat("h", 256)), `1`}},
+		{"xhttp host", stream(`"method":"xhttp","xhttpSettings":{"host":VALUE}`), []string{str("a.example"), str("a.example:8443")}, []string{str("xn--\u00fc.com"), str("a\ufffd.example"), str("a b.example"), `1`}},
+		{"wireguard allowedIPs", func(v string) string {
+			return strings.Replace(wireguard(``), `"allowedIPs":["0.0.0.0/0"]`, `"allowedIPs":`+v, 1)
+		},
+			[]string{`["0.0.0.0/0","::/0"]`, `["10.0.0.1/32"]`}, []string{`["10.0.0.1"]`, `["10.0.0.1/33"]`, `["a.example/32"]`, `[]`}},
 		{"ws headers", stream(`"method":"ws","wsSettings":{"headers":VALUE}`), []string{`{"A":"b"}`, `{"X-A_1":"` + strings.Repeat("v", 255) + `"}`},
 			[]string{`{"A":"` + strings.Repeat("v", 256) + `"}`, `{"A B":"c"}`, `{"A":"\u0007"}`, `{"A":1}`, `{"A":["b"]}`, `{"":"c"}`, `{"` + strings.Repeat("a", 65) + `":"c"}`, `[]`}},
 		{"raw headers", stream(`"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"headers":VALUE}}}`), []string{`{"Host":["a.example"]}`, `{"Host":"a.example"}`},

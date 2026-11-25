@@ -37,7 +37,31 @@ func outbound() *node {
 			// No UDP comes in at the node, so neither xudp key has an effect.
 			f("xudpConcurrency", dropped()), f("xudpProxyUDP443", dropped()),
 		)),
-	).withVariant("protocol", "settings", protocols)
+	).withVariant("protocol", "settings", protocols).postChecked(socksOverEarlyData)
+}
+
+// socksOverEarlyData: the path of a ws exit may carry ?ed=N, which the loader turns into
+// early data, and the ws dialer then returns a delayDialConn whose embedded conn is nil
+// until the first Write. Upstream overrides LocalAddr and RemoteAddr for that, but not
+// SetDeadline, and the socks client calls conn.SetDeadline before it writes: a nil
+// interface call that ends the process, and no -test dials. Any "?" is refused rather
+// than "ed=", because the loader decodes escapes of the query keys. No other listed
+// protocol touches the conn before its first write.
+func socksOverEarlyData(v *val) (string, string) {
+	proto := memberOf(v, "protocol")
+	ss := memberOf(v, "streamSettings")
+	if proto == nil || proto.k != 's' || !strings.EqualFold(proto.s, "socks") {
+		return "", ""
+	}
+	m := memberOf(ss, "method")
+	if m == nil || m.k != 's' || m.s != "ws" {
+		return "", ""
+	}
+	p := memberOf(memberOf(ss, "wsSettings"), "path")
+	if p != nil && p.k == 's' && strings.Contains(p.s, "?") {
+		return ".streamSettings.wsSettings.path", "a socks exit over ws cannot have a query in the path: ?ed= makes the connection panic before its first write"
+	}
+	return "", ""
 }
 
 // ---- protocols ------------------------------------------------------------------
@@ -128,7 +152,7 @@ func hysteriaSettings() *node {
 // always-rejected keys: with it the outbound would be a server.
 func wireguardSettings() *node {
 	peer := obj(f("publicKey", key32()), f("preSharedKey", key32()), f("endpoint", hostPort()), f("keepAlive", bnum(0, 600)),
-		f("allowedIPs", arrN(1, 8, ipOrPrefix())))
+		f("allowedIPs", arrN(1, 8, prefixOnly())))
 	return obj(
 		f("noKernelTun", boolean()), f("secretKey", key32()), f("address", arrN(1, 8, ipOrPrefix())),
 		f("peers", arrN(1, 1, peer)), f("mtu", bnum(1280, 1420)), f("reserved", arrN(3, 3, bnum(0, 255))),
@@ -160,8 +184,7 @@ func streamSettings() *node {
 		f("rawSettings", rawSettings()),
 		f("xhttpSettings", xhttpSettings()),
 		f("grpcSettings", grpcSettings()),
-		f("wsSettings", obj(f("host", text()), f("path", path()), f("headers", headers()))),
-		f("httpupgradeSettings", obj(f("host", text()), f("path", path()), f("headers", headers()))),
+		f("wsSettings", obj(f("host", httpHost()), f("path", path()), f("headers", headers()))),
 		f("hysteriaSettings", obj(f("version", bnum(2, 2)), f("auth", text()))),
 		f("sockopt", obj(f("dialerProxy", dialerTag()), f("domainStrategy", dropped()), f("tcpNoDelay", dropped()))),
 	).aliased("method", "network").
@@ -170,15 +193,18 @@ func streamSettings() *node {
 }
 
 // transportEnum is the value of "method" (formerly "network"). The loader folds it
-// with strings.ToLower and names the old spellings; the new ones are written. kcp is
-// the one transport that is an unknown value, passed by accept_unknown; any other
-// transport is refused for good (h2, h3, http and quic are removed from the release, and
-// masque and xdrive are never allowed), so they are not here.
+// with strings.ToLower and names the old spellings; the new ones are written. kcp and
+// httpupgrade are the transports that are an unknown value, passed by accept_unknown;
+// any other transport is refused for good (h2, h3, http and quic are removed from the
+// release, and masque and xdrive are never allowed), so they are not here. httpupgrade
+// is not listed because its dialer reads the answer with connRF.Read([]byte{}), and a
+// byte that the exit sends after the 101 header in the same segment makes that read
+// slice a buffer of capacity 0: a panic the exit triggers at a time of its choice.
 func transportEnum() *node {
 	return enumOf(false,
 		"raw=raw", "tcp=raw", "xhttp=xhttp", "splithttp=xhttp", "kcp=kcp", "mkcp=kcp",
 		"grpc", "ws=ws", "websocket=ws", "httpupgrade", "hysteria",
-	).softening("kcp")
+	).softening("kcp", "httpupgrade")
 }
 
 func tlsSettings() *node {
@@ -213,7 +239,7 @@ func xhttpSettings() *node {
 	extra := obj(f("headers", headers()), f("noGRPCHeader", boolean()), f("xPaddingBytes", brange(1, 2000)),
 		f("scMaxEachPostBytes", brange(16384, 1000000)))
 	return obj(
-		f("host", text()), f("path", path()), f("mode", enumOf(true, "auto", "packet-up", "stream-up", "stream-one")),
+		f("host", httpHost()), f("path", path()), f("mode", enumOf(true, "auto", "packet-up", "stream-up", "stream-one")),
 		f("headers", headers()), f("noGRPCHeader", boolean()), f("xPaddingBytes", brange(1, 2000)),
 		f("scMaxEachPostBytes", brange(16384, 1000000)), f("extra", extra),
 	)

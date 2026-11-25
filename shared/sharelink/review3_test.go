@@ -21,9 +21,9 @@ func TestVMessJSONDropsNothing(t *testing.T) {
 	has(t, got, `"mode":"stream-one"`)
 	norm(t, vmessLink(base(`,"net":"xhttp","type":"none"`)))
 	norm(t, vmessLink(base(`,"net":"ws","type":"none","path":"/p"`)))
-	norm(t, vmessLink(base(`,"net":"httpupgrade","type":"","path":"/p"`)))
 	for name, j := range map[string]string{
 		"ws with a type":          base(`,"net":"ws","type":"http"`),
+		"httpupgrade":             base(`,"net":"httpupgrade","type":"","path":"/p"`),
 		"httpupgrade with a type": base(`,"net":"httpupgrade","type":"http"`),
 		"kcp with a host":         base(`,"net":"kcp","host":"a.example"`),
 		"kcp":                     base(`,"net":"kcp","type":"none"`),
