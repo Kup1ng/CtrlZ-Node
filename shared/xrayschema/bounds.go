@@ -94,8 +94,12 @@ func kcpWindows(v *val) (string, string) {
 }
 
 // noiseExpPattern is the one of infra/conf (transport_finalmask.go): a segment of an
-// exp noise program such as "<r 100><t><b 0xab>".
-var noiseExpPattern = regexp.MustCompile(`<\s*([a-z]+)(?:\s+([^>]*?))?\s*>`)
+// exp noise program such as "<r 100><t><b 0xab>". It is compiled on each use and not
+// kept in a package variable (contract 1: no package-level mutable state); only an exp
+// noise reaches it, so the cost does not count.
+func noiseExpPattern() *regexp.Regexp {
+	return regexp.MustCompile(`<\s*([a-z]+)(?:\s+([^>]*?))?\s*>`)
+}
 
 // noiseExpSize is the most bytes an exp program writes, read as the loader reads it:
 // every <r N>, <rc N> and <rd N> up to 65,535 and any number of them, which buildPacket
@@ -103,7 +107,7 @@ var noiseExpPattern = regexp.MustCompile(`<\s*([a-z]+)(?:\s+([^>]*?))?\s*>`)
 // program it cannot size, which Xray would refuse as well.
 func noiseExpSize(exp string) (int64, bool) {
 	var total int64
-	for _, m := range noiseExpPattern.FindAllStringSubmatch(exp, -1) {
+	for _, m := range noiseExpPattern().FindAllStringSubmatch(exp, -1) {
 		switch m[1] {
 		case "r", "rc", "rd":
 			a, b, ok := rangeEnds(m[2])
