@@ -33,6 +33,11 @@ type State struct {
 	LagOK bool
 	// OffFloor is the highest FreeDnsOff version of this run, 0 when none came.
 	OffFloor uint64
+	// Applied is the applied seq the facts above were judged at: the one Applied last
+	// recorded, which the agent does after the batch's images went to dns. It is not
+	// the Applier's live seq, which moves at every commit inside a batch while dns
+	// still serves the image before it.
+	Applied uint64
 }
 
 // Ready is (c): all three facts hold.
@@ -142,5 +147,5 @@ func (f *Facts) State() State {
 	}
 	f.heads = keep
 	f.aged = need
-	return State{ServerTimeSeen: f.serverTime, CaughtUpOnce: f.caught, LagOK: f.applied >= need, OffFloor: f.floor}
+	return State{ServerTimeSeen: f.serverTime, CaughtUpOnce: f.caught, LagOK: f.applied >= need, OffFloor: f.floor, Applied: f.applied}
 }

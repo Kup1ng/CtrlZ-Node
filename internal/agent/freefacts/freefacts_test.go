@@ -141,3 +141,14 @@ func TestHeadListIsBounded(t *testing.T) {
 		t.Error("lag rule lost heads")
 	}
 }
+
+func TestStateNamesTheAppliedSeqTheFactsWereJudgedAt(t *testing.T) {
+	f, _ := newFacts()
+	if s := f.State(); s.Applied != 0 {
+		t.Fatalf("a fresh run has applied nothing: %+v", s)
+	}
+	f.Applied(7)
+	if s := f.State(); s.Applied != 7 {
+		t.Fatalf("applied %d, want 7", s.Applied)
+	}
+}

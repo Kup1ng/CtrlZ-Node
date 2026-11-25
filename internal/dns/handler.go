@@ -221,7 +221,7 @@ func (h *Handler) route(ctx context.Context, req *listen.Request, set *Settings,
 	// SC 5.2a (b) or REFUSED.
 	isMyIP := host.Kind == identity.HostReserved && host.Name == "myip"
 	if !id.known() {
-		return h.noIdentity(ctx, req, sv, id, qn, qtype, !isMyIP)
+		return h.noIdentity(ctx, req, sv, id, FreeQuery{Name: qn, QType: qtype}, !isMyIP)
 	}
 
 	// Step 4b.
@@ -364,7 +364,7 @@ func (h *Handler) stepSystem(ctx context.Context, req *listen.Request, set *Sett
 		// is read from the pattern: a row that matched a name it does not list itself
 		// has a star in it.
 		if !refusedID && strings.HasPrefix(e.Pattern, "*") {
-			return h.noIdentity(ctx, req, sv, id, qn, qtype, true), true
+			return h.noIdentity(ctx, req, sv, id, h.wildcardFreeQuery(req, set, e, qn), true), true
 		}
 		if qtype != dns.TypeA && qtype != dns.TypeAAAA && qtype != dns.TypeHTTPS {
 			return result{}, false // as if no row matched
@@ -490,15 +490,26 @@ func (h *Handler) refusal(req *listen.Request, g gateResult) result {
 // On Plain DNS it is SC 5.2a: REFUSED when the claim's Endpoint record is not
 // held, the silent drop when the source is the dns_ip of a node (point (b)), then
 // the free path, then REFUSED. The free path is W9's, behind FreePath.
-func (h *Handler) noIdentity(ctx context.Context, req *listen.Request, sv *Serving, id *ident, qn names.Name, qtype uint16, allowFree bool) result {
+func (h *Handler) noIdentity(ctx context.Context, req *listen.Request, sv *Serving, id *ident, fq FreeQuery, allowFree bool) result {
 	q := req.Msg
+	fq.ImageSeq = sv.img.Seq() // the image that found no claim for this source (p4n-MD-r3-1)
 	if req.Transport == listen.UDP || req.Transport == listen.TCP {
 		if !id.claimNoRecord {
+			fc, counts := h.cfg.Free.(FreeCases)
 			if sv.nodeIPs[req.Source.Addr().Unmap()] {
+				if counts {
+					fc.Hop(req)
+				}
 				return result{rep: listen.Reply{Drop: true}}
 			}
-			if allowFree && h.cfg.Free != nil {
-				if rep, ok := h.cfg.Free.Serve(ctx, req, FreeQuery{Name: qn, QType: qtype}); ok {
+			if !allowFree {
+				// myip: never a free query, but the counter says which of (a) and (c) would
+				// have stopped the source anyway.
+				if counts {
+					fc.MyIP(req, fq.ImageSeq)
+				}
+			} else if h.cfg.Free != nil {
+				if rep, ok := h.cfg.Free.Serve(ctx, req, fq); ok {
 					return result{rep: rep}
 				}
 			}

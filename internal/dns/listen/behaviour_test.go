@@ -1065,7 +1065,7 @@ func TestListenerSettingsInForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newDoH(c, nopListener{}, f.cfg.tlsConfig([]string{"h2"}), nil)
-	hs := srv.srv
+	hs := srv.shards[0].srv
 	if hs.ReadHeaderTimeout != set.ReadHeaderTimeout || hs.IdleTimeout != set.IdleTimeout ||
 		hs.MaxHeaderBytes != set.MaxHeaderBytes || hs.MaxHeaderBytes != 16<<10 ||
 		hs.HTTP2 == nil || hs.HTTP2.MaxConcurrentStreams != set.MaxStreams || set.MaxStreams != 100 {

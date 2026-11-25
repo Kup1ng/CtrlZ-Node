@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"testing"
@@ -103,7 +104,7 @@ func TestLogApplyImageAndFreeFacts(t *testing.T) {
 	}
 	l.waitDNS("free path facts", func() bool {
 		f := l.lastDNS(sock.TypeFacts).Facts
-		return f.FreeOK() && f.FreeVersion == 2
+		return f.FreeOK() && f.FreeVersion == 2 && f.AppliedSeq == 1 // p4n-MD-r1-4: dns judges the image against this
 	})
 	tbl := l.lastDNS(sock.TypeTable)
 	if tbl == nil || len(tbl.Table.Member) == 0 {
@@ -457,4 +458,86 @@ func TestPanelStaleReachesDNS(t *testing.T) {
 	l.waitDNS("clear", func() bool { return !l.lastDNS(sock.TypeTable).Table.PanelStale })
 }
 
+// SC 8a.6 on the agent side: it runs the drain rule over every table it applies and
+// tells dns (drain_since in the table message): set when the node stops being the
+// advertised node, cleared when a push makes it the advertised node again, and never
+// set for a node that was not advertised when it started.
+func TestDrainSinceReachesDNS(t *testing.T) {
+	l := newLab(t)
+	b1 := storetest.Blob(t, "a.example.com")
+	l.addEntry([][]byte{b1}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(1, b1)}, PairTable: storetest.Table(3, 0)})
+	l.start()
+	l.attachDNS()
+	s := l.session()
+	_ = s.Send(serverTime())
+	_ = s.Send(headNotice(1))
+	eventually(t, "entry 1", func() bool { return lastHB(s).AppliedSeq == 1 })
+	ds := func() int64 { return l.lastDNS(sock.TypeTable).Table.DrainSince }
+	l.waitDNS("a table in use", func() bool { m := l.lastDNS(sock.TypeTable); return m != nil && m.Table.Member != nil })
+	if ds() != 0 {
+		t.Fatalf("a node that has always been the advertised node drains: %d", ds())
+	}
+	push := func(version uint64, withdrawn ...int) {
+		pt := storetest.Table(3, version, withdrawn...)
+		pt.ExpiresAt = time.Now().Unix() + 1800
+		_ = s.Send(&hubv1.HubMessage{Body: &hubv1.HubMessage_PairTable{PairTable: l.keys.Sign(t, pt)}})
+	}
+	push(50)
+	l.waitDNS("push 50 in use", func() bool { return l.lastDNS(sock.TypeTable).Table.Version == 50 })
+	if ds() != 0 {
+		t.Fatal("a push that changes nothing for this node started a drain")
+	}
+	// The hub withdraws node 0, the advertised primary of the global pair: the answer
+	// moves to node 1 and this node drains.
+	push(51, 0)
+	l.waitDNS("drain since", func() bool { return ds() != 0 })
+	since := ds()
+	if d := time.Now().Unix() - since; d < -2 || d > 10 {
+		t.Fatalf("drain_since %d is not the time of the apply", since)
+	}
+	// A later table that still does not advertise it keeps the time of the first.
+	push(52, 0, 2)
+	l.waitDNS("push 52 in use", func() bool { return l.lastDNS(sock.TypeTable).Table.Version == 52 })
+	if ds() != since {
+		t.Fatalf("drain_since moved from %d to %d while the node stayed not advertised", since, ds())
+	}
+	// The hub clears the withdrawal: advertised again, the drain ends.
+	push(53)
+	l.waitDNS("drain cancelled", func() bool { m := l.lastDNS(sock.TypeTable); return m.Table.Version == 53 && ds() == 0 })
+}
+
 var _ sync.Mutex
+
+// SC 8a.10 "Drain test": a log entry that moves the global pair from (A, B) to an
+// existing pair (C, D) starts the drain of A although the pair (A, B) still exists.
+// The drain input changes through the membership of an applied entry, not through a
+// push, and the node's table in use must follow it (p4n-W8-r1-4).
+func TestDrainSinceStartsWhenALogEntrySwitchesTheGlobalPair(t *testing.T) {
+	l := newLab(t)
+	b1 := storetest.Blob(t, "a.example.com")
+	l.addEntry([][]byte{b1}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(1, b1)}, PairTable: storetest.Table(4, 0)})
+	l.start()
+	l.attachDNS()
+	s := l.session()
+	_ = s.Send(serverTime())
+	_ = s.Send(headNotice(1))
+	eventually(t, "entry 1", func() bool { return lastHB(s).AppliedSeq == 1 })
+	ds := func() int64 { return l.lastDNS(sock.TypeTable).Table.DrainSince }
+	l.waitDNS("a table in use", func() bool { m := l.lastDNS(sock.TypeTable); return m != nil && m.Table.Member != nil })
+	if ds() != 0 {
+		t.Fatalf("a node that has always been the advertised node drains: %d", ds())
+	}
+	// Entry 2: the pair table keeps (A, B) = nodes 0 and 1, adds (C, D) = nodes 2 and 3
+	// and makes it the global pair.
+	pt := storetest.Table(4, 1)
+	second := bytes.Repeat([]byte{0xb1}, 16)
+	pt.Pairs = append(pt.Pairs, &policyv1.Pair{PairId: second, Primary: storetest.NodeID(2), Fallback: storetest.NodeID(3)})
+	pt.GlobalPairId = second
+	l.addEntry(nil, &policyv1.ConfigEntry{PairTable: pt})
+	_ = s.Send(headNotice(2))
+	eventually(t, "entry 2", func() bool { return lastHB(s).AppliedSeq == 2 })
+	l.waitDNS("drain since after the switch", func() bool { return ds() != 0 })
+	if d := time.Now().Unix() - ds(); d < -2 || d > 10 {
+		t.Fatalf("drain_since %d is not the time of the apply", ds())
+	}
+}

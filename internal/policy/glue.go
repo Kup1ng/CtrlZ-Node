@@ -49,6 +49,13 @@ type Resolver struct {
 	// no name or address (SC 5.2a).
 	Rejected func()
 
+	// Refusal, when set, picks the Backend errors that mean "turned away, not
+	// failed" (the free path's full pools). Such a lookup is still Failed, so every
+	// consumer treats it as SERVFAIL, but its RCode is REFUSED and the free path
+	// answers with that. The cause rides in the answer, so a caller that shared the
+	// fetch sees it too.
+	Refusal func(err error) bool
+
 	// SrcPayload is the EDNS payload size of the query sent upstream.
 	SrcPayload uint16
 
@@ -104,7 +111,11 @@ func (r *Resolver) fetch(n names.Name, qtype uint16, p sharedpolicy.ResolveParam
 	resp, _, err := r.Backend.Exchange(ctx, q)
 	if err != nil || resp == nil {
 		r.failed.Add(1)
-		return failedAnswer(n)
+		a := failedAnswer(n)
+		if err != nil && r.Refusal != nil && r.Refusal(err) {
+			a.RCode = sharedpolicy.RCodeRefused
+		}
+		return a
 	}
 	a := TrueAnswerFromMsg(n, resp)
 	if a.Failed {

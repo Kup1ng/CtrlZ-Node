@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -158,14 +159,25 @@ type node struct {
 	dnsDone   chan struct{}
 	ports     listen.Ports
 	join      *querypath.Join
+
+	// W8: the node's clock, which a test moves; the slot of the node in
+	// storetest.Table; and where its listeners bind.
+	clock    *testClock
+	idx      int
+	portBase int
 }
 
-func newNode(t *testing.T) *node {
+func newNode(t *testing.T) *node { return newNodeAt(t, 0) }
+
+// newNodeAt is the node of table slot idx (0 to 3): its certificate names that node of
+// storetest.Table, so the agent knows which node of the pair it is.
+func newNodeAt(t *testing.T, idx int) *node {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the image swap is a symlink rename, which is Linux")
 	}
-	n := &node{t: t, dir: t.TempDir(), hub: fakehub.New(), keys: storetest.NewKeys(t), runner: &fake.Runner{}, alerts: &alert.Memory{}}
+	n := &node{t: t, dir: t.TempDir(), hub: fakehub.New(), keys: storetest.NewKeys(t), runner: &fake.Runner{}, alerts: &alert.Memory{},
+		clock: &testClock{}, idx: idx, portBase: 5320}
 	n.files = fake.NewFiles(map[string]string{
 		"/proc/sys/net/ipv4/ip_local_port_range":   "32768 39999\n",
 		"/proc/self/limits":                        "Max core file size 0 0 bytes\n",
@@ -192,7 +204,7 @@ func newNode(t *testing.T) *node {
 	cder, _ := x509.CreateCertificate(rand.Reader, ctmpl, ctmpl, &caKey.PublicKey, caKey)
 	ca, _ := x509.ParseCertificate(cder)
 	n.nodeKey, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	ntmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"}, NotBefore: time.Now().Add(-3 * time.Hour),
+	ntmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: hex.EncodeToString(storetest.NodeID(idx))}, NotBefore: time.Now().Add(-3 * time.Hour),
 		NotAfter: time.Now().Add(10 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
 	nder, _ := x509.CreateCertificate(rand.Reader, ntmpl, ca, &n.nodeKey.PublicKey, caKey)
 	kder, _ := x509.MarshalPKCS8PrivateKey(n.nodeKey)
@@ -210,7 +222,7 @@ func newNode(t *testing.T) *node {
 		Root: filepath.Join(n.dir, "ctrlz"), ConfPath: confPath,
 		Conf:     conf.Agent{Hub: "127.0.0.1", DNSBindIP: netip.MustParseAddr("127.0.0.1"), DNSAdvertisedIP: netip.MustParseAddr("8.8.8.8")},
 		SockPath: filepath.Join(t.TempDir(), "a.sock"), PeerCheck: func(net.Conn) error { return nil }, Version: "vtest",
-		Identity:  id,
+		Identity: id, Now: n.clock.Now,
 		Dial:      func(hubconn.Role) (*grpc.ClientConn, error) { return n.hub.Dial() },
 		TrustRoot: func() (*signv1.Root, error) { return n.keys.Root, nil },
 		Runner:    n.runner, Files: n.files, Alert: n.alerts,
@@ -248,21 +260,27 @@ func (n *node) stopAgent() {
 	}
 }
 
-func (n *node) startDNS(local string) {
+func (n *node) startDNS(local string) { n.startDNSWith(local, nil) }
+
+// startDNSWith starts dns with the config a test adjusts (W8: the drain times, an observer).
+func (n *node) startDNSWith(local string, adjust func(*dnsrole.Config)) {
 	n.t.Helper()
-	n.ports = allocPorts(n.t)
+	n.ports = allocPortsAt(n.t, n.portBase)
 	ctx, cancel := context.WithCancel(context.Background())
 	n.dnsCancel, n.dnsDone = cancel, make(chan struct{})
 	ready := make(chan struct{})
 	ap := netip.MustParseAddrPort(local)
 	go func() {
 		defer close(n.dnsDone)
-		err := dnsrole.Run(ctx, dnsrole.Config{
+		dc := dnsrole.Config{
 			Root: n.cfg.Root, AgentConf: n.cfg.ConfPath, SockPath: n.cfg.SockPath, Ports: n.ports,
 			Build:   querypath.Factory(querypath.Options{LocalUnbound: ap, IntervalUnit: 200 * time.Millisecond, OnBuilt: func(j *querypath.Join) { n.join = j }}),
 			OnReady: func(*listen.Server) { close(ready) },
-		})
-		if err != nil {
+		}
+		if adjust != nil {
+			adjust(&dc)
+		}
+		if err := dnsrole.Run(ctx, dc); err != nil {
 			n.t.Errorf("dnsrole.Run: %v", err)
 		}
 	}()
@@ -276,10 +294,12 @@ func (n *node) startDNS(local string) {
 
 var e2ePort atomic.Int32
 
-func allocPorts(t testing.TB) listen.Ports {
+func allocPorts(t testing.TB) listen.Ports { return allocPortsAt(t, 5320) }
+
+func allocPortsAt(t testing.TB, first int) listen.Ports {
 	t.Helper()
 	for try := 0; try < 32; try++ {
-		base := 5320 + (int(e2ePort.Add(1)-1)%8)*3
+		base := first + (int(e2ePort.Add(1)-1)%8)*3
 		ok := true
 		var cl []io.Closer
 		for p := base; p < base+3 && ok; p++ {

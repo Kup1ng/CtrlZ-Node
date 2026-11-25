@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miekg/dns"
+
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 	policyv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/policy/v1"
 	telemetryv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/telemetry/v1"
@@ -47,6 +49,25 @@ type Reporter interface {
 type FreeQuery struct {
 	Name  names.Name
 	QType uint16
+	// Synth is set for a wildcard system name of step 2 that has a synthesized
+	// answer (isolated_synth, SC 8): the DNS_IP A answer. SynthAlways says it is the
+	// answer itself, which needs no lookup and so passes points 6 and 7 of 5.2a; with
+	// it clear it stands in for a SERVFAIL, so the validation name of Android keeps
+	// passing while the resolver is down.
+	Synth       func() *dns.Msg
+	SynthAlways bool
+	// ImageSeq is the seq of the image the Handler identified the source with. The
+	// free gate's caught-up fact is judged against it (p4n-MD-r3-1).
+	ImageSeq uint64
+}
+
+// FreeCases is implemented by a FreePath that also counts the queries of identity
+// case 3 that it is never asked to answer (SC 5.2a, Counters): Hop is a query that
+// point (b) dropped, MyIP one for myip.<zone>, which the caller answers REFUSED.
+type FreeCases interface {
+	FreePath
+	Hop(req *listen.Request)
+	MyIP(req *listen.Request, imageSeq uint64)
 }
 
 // FreePath is the seam of SC 5.2a. It is called at step 4 for a Plain DNS query

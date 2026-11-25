@@ -62,6 +62,7 @@ func (j *Join) syncRouter(first bool) {
 		return
 	}
 	j.lastRes, j.built, j.loopKey, j.loops = res, true, key, loops
+	j.syncFree(cfg, loops)
 
 	var next *resolve.Router
 	if eff := withoutLoops(cfg, loops); eff != nil {
@@ -184,6 +185,7 @@ func to16(b []byte) ([16]byte, bool) {
 // isolated_synth rows of step 2 read that flag from them.
 func (j *Join) syncSettings() {
 	cfg, iso := j.env.Config(), j.isolated()
+	j.iso.Store(iso)
 	if j.setDone && cfg == j.setCfg && iso == j.setIso {
 		return
 	}
@@ -230,6 +232,7 @@ func (j *Join) shutdown() {
 	if j.local != nil {
 		_ = j.local.Close()
 	}
+	j.closeFree()
 }
 
 // resolveKey fingerprints the part of a NodeConfig the Router is built from: the

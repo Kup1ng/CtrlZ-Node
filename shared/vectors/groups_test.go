@@ -21,7 +21,7 @@ var requiredGroups = map[string]int{
 	"hash": 17, "names": 57, "identity": 68, "tokens": 54, "precedence": 18, "specificity": 19, "merge": 13,
 	"schedule": 15, "client-order": 4, "expiry": 7, "geo-order": 10, "dest-geo": 17, "cname": 13,
 	"qtype-matrix": 54, "options": 40, "safe-search": 9, "dnssec": 20, "sysnames": 19, "locations": 9,
-	"auto-random": 9, "route": 18, "upload": 8, "blob": 37, "gtable": 23, "quarantine": 13,
+	"auto-random": 9, "route": 18, "upload": 8, "blob": 37, "gtable": 23, "quarantine": 13, "no-redirect": 36,
 	// P4 W1 (SC 8a.10): the zone package. zone-failover is written by
 	// sharedtool failover-vectors and nobody edits it.
 	"zone-answer": 65, "zone-failover": 119, "pair-table-validate": 67,
@@ -87,8 +87,8 @@ func TestGroupFilesAreTheListedOnes(t *testing.T) {
 	if len(unlisted) > 0 {
 		t.Errorf("vector groups not in requiredGroups or extraGroups: %s", strings.Join(unlisted, ", "))
 	}
-	if len(requiredGroups) != 28 {
-		t.Errorf("section 15 lists 28 groups, 4 of them not yet written (grants, pair-table-apply, xray, sharelink); the list has %d", len(requiredGroups))
+	if len(requiredGroups) != 29 {
+		t.Errorf("the written groups are 29 (section 15 and the no-redirect group of P2); grants, pair-table-apply, xray and sharelink are not yet written; the list has %d", len(requiredGroups))
 	}
 	for n := range requiredGroups {
 		if _, dup := extraGroups[n]; dup {

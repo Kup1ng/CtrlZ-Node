@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -155,9 +156,10 @@ const (
 	doqRequestCanceled quic.ApplicationErrorCode = 0x3
 	doqExcessiveLoad   quic.ApplicationErrorCode = 0x4
 
-	h3NoError        quic.ApplicationErrorCode = 0x100
-	h3ExcessiveLoad  quic.ApplicationErrorCode = 0x107
-	h3RequestCancled quic.StreamErrorCode      = 0x10c
+	h3NoError         quic.ApplicationErrorCode = 0x100
+	h3ExcessiveLoad   quic.ApplicationErrorCode = 0x107
+	h3RequestCancled  quic.StreamErrorCode      = 0x10c
+	h3RequestRejected quic.StreamErrorCode      = 0x10b // RFC 9114 8.1: safe to retry on another connection
 )
 
 // qconn is one accepted QUIC connection.
@@ -167,7 +169,11 @@ type qconn struct {
 	q      *quiet
 	hdr    *hdrQueue                 // DoH3 only: request streams whose headers are not read
 	noErr  quic.ApplicationErrorCode // code for a close that is not an error
-	held   *held                     // reply bytes this connection holds for the peer (p4n-W6-r3-3)
+	// refusing is set by the drain at this connection's moment: a stream opened from
+	// then on is rejected, so the queries already held finish and the connection can be
+	// closed with nothing in flight even under steady traffic (p4n-W8-r1-6).
+	refusing atomic.Bool
+	held     *held // reply bytes this connection holds for the peer (p4n-W6-r3-3)
 }
 
 // fail records why the connection ends (first reason wins) and closes it.
@@ -340,6 +346,47 @@ func (b *quicBase) connContext(ctx context.Context, ci *quic.ClientInfo) (contex
 	// back; the serving goroutine releases it too, and Release is idempotent.
 	context.AfterFunc(ctx, slot.Release)
 	return ctx, nil
+}
+
+// quicDrainGraceMax bounds the quiet time before a QUIC drain close. The spec asks for
+// three round trips, so the bound must lie above that for every path a client can
+// have; the plan's Wait bounds the whole wait anyway (p4n-W8-r1-5).
+const quicDrainGraceMax = 5 * time.Second
+
+// attachDrain registers a connection with the drain rule once its quiet state
+// exists. At its moment the connection refuses new streams (the client is told the
+// request was cancelled or rejected and sends it on a new connection), finishes the
+// queries it holds, and is closed with CONNECTION_CLOSE and no error (RFC 9250 for
+// DoQ, H3_NO_ERROR for DoH3). The returned function takes it out again.
+//
+// quic-go's CloseWithError sends the CONNECTION_CLOSE at once and does not wait for
+// the stream data it holds, and a stream whose write ended (the quiet state) may
+// still hold its last packets. So the connection counts as quiet only after it has
+// been so for three round trips, which is how long those packets take to be sent
+// and acknowledged. No new stream can start that wait over, because the connection
+// refuses them. Only the drainer's own goroutine calls the function, so it keeps its
+// state unlocked.
+func (b *quicBase) attachDrain(qc *qconn) func() {
+	var since time.Time
+	quiet := func() bool {
+		if !qc.q.isQuiet() {
+			since = time.Time{}
+			return false
+		}
+		if since.IsZero() {
+			since = time.Now()
+		}
+		grace := 3*qc.c.ConnectionStats().SmoothedRTT + 25*time.Millisecond
+		if grace > quicDrainGraceMax {
+			grace = quicDrainGraceMax
+		}
+		return time.Since(since) >= grace
+	}
+	return b.dr.attach(&drainItem{
+		quiet:  quiet,
+		close:  func() { qc.fail(CloseDrain, qc.noErr) },
+		refuse: func(on bool) bool { qc.refusing.Store(on); return true },
+	})
 }
 
 func (b *quicBase) lookup(c *quic.Conn) *qconn {

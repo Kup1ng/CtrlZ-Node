@@ -19,6 +19,8 @@ type Server struct {
 	cancel context.CancelFunc
 	hs     *handshakes
 	doh3   *doh3Server // for tests that look into the connections
+	doh    *dohServer  // for tests that look into the shards
+	dr     *drainer    // the connections the drain rule can close, and its plan (drain.go)
 	addrs  map[Transport]netip.AddrPort
 
 	closers []func()
@@ -34,7 +36,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	s := &Server{cancel: cancel, addrs: map[Transport]netip.AddrPort{}}
+	s := &Server{cancel: cancel, addrs: map[Transport]netip.AddrPort{}, dr: newDrainer()}
 	if err := s.start(ctx, &cfg); err != nil {
 		s.Close()
 		return nil, err
@@ -51,6 +53,7 @@ func (s *Server) start(ctx context.Context, cfg *Config) error {
 		if err != nil {
 			return err
 		}
+		c.dr = s.dr
 		ap := netip.AddrPortFrom(cfg.Bind, cfg.Ports.of(t))
 		switch t {
 		case UDP:
@@ -81,6 +84,7 @@ func (s *Server) start(ctx context.Context, cfg *Config) error {
 			}
 			// h2 must be named or net/http does not enable HTTP/2.
 			srv := newDoH(c, ln, cfg.tlsConfig([]string{"h2", "http/1.1"}), cfg.Verify)
+			s.doh = srv
 			s.add(t, ln.Addr(), srv.close, srv.start, &starters)
 		case DoQ, DoH3:
 			conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(ap))

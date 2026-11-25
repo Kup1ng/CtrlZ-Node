@@ -135,6 +135,15 @@ type Facts struct {
 	FreeEnabled    bool   `json:"fon"`
 	FreeQPS        uint32 `json:"fqps"`
 	FreeVersion    uint64 `json:"fver"`
+	// AppliedSeq is the applied seq the facts above were judged at: it moves after the
+	// images of an Apply reached dns, not at each commit inside a batch, so a batch in
+	// progress does not turn the free path off. The agent commits it before the image
+	// swap, and the swap or dns's open of the image can fail, so
+	// dns serves from an image with a seq below it until the next one arrives. dns
+	// therefore counts the node as caught up only while the image it serves has at
+	// least this seq (SC 5.2a (c)); an image from a lost state has a higher seq and
+	// passes.
+	AppliedSeq uint64 `json:"applied,omitempty"`
 	// HubOffset is the seconds to add to the node's clock to get the hub's (8a.4
 	// Clock). Every expires_at the agent hands dns (revocations, ACME challenges) is
 	// in hub time, so dns must judge it with its own clock plus this, never with its
@@ -143,11 +152,17 @@ type Facts struct {
 	HubOffset int64 `json:"off,omitempty"`
 }
 
-// FreeOK is the whole decision of (a) and (c) from one message.
-func (f Facts) FreeOK() bool {
-	return f.ServerTimeSeen && f.CaughtUpOnce && f.LagOK &&
-		f.FreeSet && f.FreeEnabled && f.FreeVersion >= f.OffFloor
+// FreeOn is (a): a free_dns value is in force, it is enabled, and its version is
+// at or above the off floor.
+func (f Facts) FreeOn() bool {
+	return f.FreeSet && f.FreeEnabled && f.FreeVersion >= f.OffFloor
 }
+
+// FreeCaughtUp is (c): the three facts of the agent's run.
+func (f Facts) FreeCaughtUp() bool { return f.ServerTimeSeen && f.CaughtUpOnce && f.LagOK }
+
+// FreeOK is the whole decision of (a) and (c) from one message.
+func (f Facts) FreeOK() bool { return f.FreeOn() && f.FreeCaughtUp() }
 
 // ZoneKey is one zone certificate with its private key, opened in the agent.
 // Key is PKCS#8 DER. dns keeps it in memory only.

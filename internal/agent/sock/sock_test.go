@@ -438,3 +438,29 @@ func TestSecondCloseWaitsForTheFirst(t *testing.T) {
 		t.Fatalf("the new server's socket is gone: %v", err)
 	}
 }
+
+// FreeOn is (a) and FreeCaughtUp is (c): the free path's counters name the first
+// that fails, so each must move with its own facts only.
+func TestFactsFreeGateParts(t *testing.T) {
+	f := Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: true, FreeSet: true, FreeEnabled: true, FreeVersion: 10, OffFloor: 10}
+	if !f.FreeOn() || !f.FreeCaughtUp() {
+		t.Fatal("all hold")
+	}
+	for name, c := range map[string]struct {
+		mut      func(*Facts)
+		on, caug bool
+	}{
+		"no value":        {func(f *Facts) { f.FreeSet = false }, false, true},
+		"disabled":        {func(f *Facts) { f.FreeEnabled = false }, false, true},
+		"under the floor": {func(f *Facts) { f.OffFloor = 11 }, false, true},
+		"no server time":  {func(f *Facts) { f.ServerTimeSeen = false }, true, false},
+		"not caught up":   {func(f *Facts) { f.CaughtUpOnce = false }, true, false},
+		"lagging":         {func(f *Facts) { f.LagOK = false }, true, false},
+	} {
+		g := f
+		c.mut(&g)
+		if g.FreeOn() != c.on || g.FreeCaughtUp() != c.caug || g.FreeOK() {
+			t.Errorf("%s: on %v caught up %v ok %v", name, g.FreeOn(), g.FreeCaughtUp(), g.FreeOK())
+		}
+	}
+}

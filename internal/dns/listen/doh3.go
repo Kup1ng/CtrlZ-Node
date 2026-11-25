@@ -65,6 +65,7 @@ func (s *doh3Server) start() {
 func (s *doh3Server) serveConn(qc *qconn, _ netip.AddrPort, _ *limits.Conn) {
 	q := qc.newQuiet(s.set)
 	defer q.stop()
+	defer s.attachDrain(qc)()
 	qc.hdr = newHdrQueue(q, s.set.ReadHeaderTimeout)
 	qc.hdr.max = s.set.MaxStreams
 	defer qc.hdr.stop()
@@ -94,6 +95,15 @@ func (s *doh3Server) serveConn(qc *qconn, _ netip.AddrPort, _ *limits.Conn) {
 			return
 		}
 		tok := qc.hdr.add(str.StreamID())
+		if qc.refusing.Load() {
+			// H3_REQUEST_REJECTED says nothing was processed, so the client may send the
+			// request on a new connection (RFC 9114 8.1). quic-go's RawServerConn has no
+			// GOAWAY of its own, so this is how the client learns.
+			qc.hdr.end(tok)
+			str.CancelRead(h3RequestRejected)
+			str.CancelWrite(h3RequestRejected)
+			continue
+		}
 		if d := s.set.ReadHeaderTimeout; d > 0 {
 			_ = str.SetReadDeadline(time.Now().Add(d))
 		}

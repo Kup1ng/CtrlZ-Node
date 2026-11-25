@@ -30,6 +30,7 @@ func (s *doqServer) start() {
 func (s *doqServer) serveConn(qc *qconn, acceptSrc netip.AddrPort, _ *limits.Conn) {
 	q := qc.newQuiet(s.set)
 	defer q.stop()
+	defer s.attachDrain(qc)()
 	sni := qc.c.ConnectionState().TLS.ServerName
 	for {
 		str, err := qc.c.AcceptStream(s.ctx)
@@ -39,6 +40,15 @@ func (s *doqServer) serveConn(qc *qconn, acceptSrc netip.AddrPort, _ *limits.Con
 		// A stream whose query is not whole yet is unread: the connection is not
 		// quiet, so neither the idle nor the stall deadline can run.
 		id := q.begin()
+		if qc.refusing.Load() {
+			// The drain has begun on this connection: the query is not taken, and the
+			// client sends it on a new connection. The begin comes first so a stream
+			// accepted as the flag is set is either refused here or held and finished.
+			q.abort(id)
+			str.CancelRead(quic.StreamErrorCode(doqRequestCanceled))
+			str.CancelWrite(quic.StreamErrorCode(doqRequestCanceled))
+			continue
+		}
 		// The source is read per stream: quic-go follows a client that migrates
 		// once the new path is validated, and a connection lives as long as it
 		// keeps asking. The slot of the connection limits stays on the address

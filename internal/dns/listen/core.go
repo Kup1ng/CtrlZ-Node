@@ -22,6 +22,9 @@ type core struct {
 	t   Transport
 	set limits.ListenerSettings
 	ctx context.Context // ends when the Server closes
+	// dr holds the connections the drain rule can close; nil in a test that builds
+	// a listener alone, and then nothing registers.
+	dr *drainer
 
 	inflight atomic.Int64
 }

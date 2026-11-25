@@ -84,9 +84,16 @@ func TestMergeBTheWholeNodeAnswersThroughTheRealPath(t *testing.T) {
 	resolve := func(a asker, ep byte, name string) (*dns.Msg, error) { return a.ask(c, ep, q(name, dns.TypeA)) }
 
 	// dns serves only once the agent has handed it the image: the first identified
-	// Plain query that gets an answer ends the wait.
-	eventually(t, 90*time.Second, "Endpoint 1 answered over Plain DNS", func() bool {
+	// Plain query that gets an answer ends the wait. The zone certificate reaches dns
+	// in its own message, so the encrypted transports are waited for as well: a run on
+	// a loaded machine saw "tls: internal error" from a listener whose certificate was
+	// still on its way.
+	eventually(t, 90*time.Second, "Endpoint 1 answered over Plain DNS and DoT", func() bool {
 		r, err := resolve(byName["plain-tcp"], 1, allowedName)
+		if err != nil || !hasA(r, ipV1) {
+			return false
+		}
+		r, err = resolve(byName["dot"], 1, allowedName)
 		return err == nil && hasA(r, ipV1)
 	})
 
@@ -115,7 +122,7 @@ func TestMergeBTheWholeNodeAnswersThroughTheRealPath(t *testing.T) {
 		})
 	}
 
-	// 2. A Plain DNS source nobody claims is REFUSED (free DNS is a seam, off); an
+	// 2. A Plain DNS source nobody claims is REFUSED (no free_dns value is in force, so the free path is off); an
 	// unknown resolver id is refused at the handshake.
 	t.Run("unidentified", func(t *testing.T) {
 		r, err := c.tcp("127.0.0.9", q(allowedName, dns.TypeA))

@@ -11,7 +11,7 @@
 #   - actions are pinned to a full commit SHA, the version in the comment, and only
 #     actions/checkout and actions/setup-go are used. A release is pinned only when it is at
 #     least 14 days old (setup-go v7.1.0 was two days old and is not used yet);
-#   - five jobs at once. The Panel's run peaks at 17, so both together are 22 and the last two queue
+#   - five jobs at once. The Panel's run peaks at 18, so both together are 23 and the last three queue
 #     on the 20 of the free account (a queued job waits, it does not fail).
 name: ci
 

@@ -93,6 +93,11 @@ type sconn struct {
 	raw    net.Conn
 	conn   net.Conn
 	reason atomic.Uint32
+	// drainState is set by the drain at this connection's moment (see refuse and
+	// admit): queries that arrive from then on are read and dropped, so the ones
+	// already held can finish and the connection becomes quiet even when the client
+	// never stops asking (p4n-W8-r1-6).
+	drainState atomic.Int32
 
 	// The replies that are ready and wait for the wire, written by one writer
 	// goroutine in the order they became ready.
@@ -374,6 +379,10 @@ func (s *streamServer) serveConn(raw net.Conn, src netip.AddrPort, slot *limits.
 	q := newQuiet(s.set.IdleTimeout, s.set.WriteStall,
 		connAlarm{set: conn.SetReadDeadline}, &timerAlarm{fire: func() { sc.fail(CloseStall) }})
 	defer q.stop()
+	if s.t == DoT {
+		// Plain TCP is never drained (SC 8a.6).
+		defer s.dr.attach(&drainItem{quiet: q.isQuiet, close: sc.drainClose, refuse: sc.refuse})()
+	}
 	s.wg.Add(1)
 	go s.writeLoop(sc, q)
 
@@ -416,6 +425,16 @@ func (s *streamServer) serveConn(raw net.Conn, src netip.AddrPort, slot *limits.
 		_ = conn.SetReadDeadline(time.Time{})
 		if m.Response {
 			q.abort(id) // a response on a query stream is not answered
+			continue
+		}
+		if !sc.admit() {
+			// Dropped, not answered: a reply that cannot be sent after the close_notify
+			// would only be lost, and the client retries an unanswered query on a new
+			// connection (RFC 7766 6.2). The frame is still read so that closing the
+			// socket does not turn unread bytes into a reset that hides the last replies.
+			// From the first drop the close is decided (admit), so the client is always
+			// told to retry (p4n-W8-r2-2).
+			q.abort(id)
 			continue
 		}
 		s.dispatch(sc, q, id, m, src, sni)

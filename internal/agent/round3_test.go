@@ -225,3 +225,67 @@ func TestOwedDNSRestartSurvivesAnAgentRestart(t *testing.T) {
 		t.Errorf("dns was restarted again with nothing owed: %d", ok.Load())
 	}
 }
+
+// ---- p4n-MD-r2-1: the facts name the seq dns has an image for
+
+// Entry 1 is applied and the node is caught up. Entry 2 commits and entry 3 of the same
+// batch stalls on a blob: the Applier's seq is 2 while dns still serves the image of
+// entry 1. The facts must keep naming 1, or dns refuses every free query for the whole
+// batch (SC 5.2a (c): a new entry does not turn the free path off while it is applied).
+func TestFactsKeepTheSeqOfThePublishedImageWhileABatchIsApplied(t *testing.T) {
+	l := newLab(t)
+	l.cfg.TransferIdle = time.Minute
+	hold := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
+	})
+	l.addEntry(nil, &policyv1.ConfigEntry{FreeDns: &policyv1.FreeDns{Enabled: true, Qps: 40, Version: 2}})
+	l.start()
+	l.attachDNS()
+	s := l.session()
+	_ = s.Send(serverTime())
+	_ = s.Send(headNotice(1))
+	l.waitDNS("caught up at seq 1", func() bool {
+		m := l.lastDNS(sock.TypeFacts)
+		return m != nil && m.Facts.FreeOK() && m.Facts.AppliedSeq == 1
+	})
+
+	b2, b3 := storetest.Blob(t, "second.example.com"), storetest.Blob(t, "third.example.com")
+	l.addEntry([][]byte{b2}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(2, b2)}})
+	l.addEntry([][]byte{b3}, &policyv1.ConfigEntry{PutEndpoints: []*policyv1.EndpointRecord{storetest.Endpoint(3, b3)}})
+	stalled := storetest.Hash(b3)
+	l.hub.Script(func(h *fakehub.Hub) {
+		h.BlobHook = func(ctx context.Context, hash [32]byte) error {
+			if hash != stalled {
+				return nil
+			}
+			select {
+			case <-hold:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	_ = s.Send(headNotice(3))
+	eventually(t, "entry 2 committed, entry 3 stalled", func() bool { return lastHB(s).AppliedSeq == 2 })
+	// Many table ticks pass with the batch open. Every facts message of that time names 1.
+	time.Sleep(time.Second)
+	l.dnsMu.Lock()
+	for _, m := range l.dnsMsgs {
+		if m.Type == sock.TypeFacts && m.Facts.AppliedSeq > 1 {
+			t.Errorf("facts name seq %d while dns still serves the image of entry 1", m.Facts.AppliedSeq)
+			break
+		}
+	}
+	l.dnsMu.Unlock()
+	if f := l.lastDNS(sock.TypeFacts).Facts; !f.FreeOK() {
+		t.Fatalf("free path is off during the batch: %+v", f)
+	}
+	close(hold)
+	l.waitDNS("facts at seq 3 once the images are out", func() bool { return l.lastDNS(sock.TypeFacts).Facts.AppliedSeq == 3 })
+}

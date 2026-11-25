@@ -142,6 +142,8 @@ func reasonName(r CloseReason) string {
 		return "shutdown"
 	case CloseHTTP:
 		return "http"
+	case CloseDrain:
+		return "drain"
 	}
 	return "?"
 }
@@ -450,6 +452,8 @@ func (fc *frameClient) fail(err error) {
 		close(fc.dead)
 	}
 	fc.mu.Unlock()
+	// A client that is told the server is done closes its side, as a real one does.
+	_ = fc.c.Close()
 }
 
 func (fc *frameClient) close() { _ = fc.c.Close() }

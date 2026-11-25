@@ -150,10 +150,41 @@ func (e *Env) Tables() TableState {
 
 // FreeOK is the whole decision of SC 5.2a (a) and (c) as the agent's facts give
 // it, false while the agent socket is down or no facts have arrived since it
-// came up. The query path still judges (b), the hop guard, itself.
-func (e *Env) FreeOK() bool {
+// came up. The query path still judges (b), the hop guard, itself. imageSeq is the
+// seq of the image the query path identified the source with (see servesApplied).
+func (e *Env) FreeOK(imageSeq uint64) bool {
 	f := e.facts.Load()
-	return e.linkUp.Load() && f != nil && f.FreeOK()
+	return e.linkUp.Load() && f != nil && f.FreeOK() && servesApplied(f, imageSeq)
+}
+
+// servesApplied is the part of caught-up (SC 5.2a (c)) that the agent cannot judge:
+// the claims that tell a tenant's device from a stranger are those of the image the
+// query path serves, and the agent's applied seq moves at the state commit, before
+// the image swap. A swap that failed, or an image dns could not open, leaves dns on
+// an older image while the facts say caught up, and a device whose claim is only in
+// the newer entry would be answered as a free stranger. Until the image catches up
+// the free path is refused (not_caught_up), the safe answer.
+//
+// imageSeq comes from the Handler's own Serving, never from the Env's image: the Env
+// stores a new image before the query path has swapped to it, so judging by the Env
+// would open the gate for a window in which sources are still told apart by the old
+// claims, for good if the swap then fails (p4n-MD-r3-1).
+func servesApplied(f *sock.Facts, imageSeq uint64) bool {
+	if f.AppliedSeq == 0 {
+		return true // nothing applied, so no claim exists to be missing
+	}
+	return imageSeq >= f.AppliedSeq
+}
+
+// FreeGate is FreeOK in its two parts, for the counters of SC 5.2a, which name the
+// first of (a) and (c) that fails: on is (a) and caughtUp is (c). Both are false
+// while the agent socket is down or no facts have arrived since it came up.
+func (e *Env) FreeGate(imageSeq uint64) (on, caughtUp bool) {
+	f := e.facts.Load()
+	if !e.linkUp.Load() || f == nil {
+		return false, false
+	}
+	return f.FreeOn(), f.FreeCaughtUp() && servesApplied(f, imageSeq)
 }
 
 // FreeQPS is the qps of the free_dns value in force, the node-wide budget, 0 when

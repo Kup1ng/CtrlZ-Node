@@ -38,6 +38,9 @@ type Config struct {
 	Build HandlerFactory
 	// Observer receives the listeners' counts, optional.
 	Observer listen.Observer
+	// Drain overrides the numbers of the drain rule; a test shortens them. Nil takes
+	// the rule's own (SC 8a.6).
+	Drain *DrainTimes
 	// OnReady, when set, is called with the bound addresses once the listeners are up.
 	OnReady func(*listen.Server)
 }
@@ -103,6 +106,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	go rotateCookies(ctx, jar)
 
+	drain := newDrainCtl(env)
+	if cfg.Drain != nil {
+		drain.times = *cfg.Drain
+	}
 	var cl *sock.Client
 	sink := newSink(func(m *sock.Msg) bool { return cl != nil && cl.Send(m) })
 	handler, verify, err := cfg.Build(env, sink)
@@ -111,8 +118,13 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	cl = sock.NewClient(cfg.SockPath, sock.ClientHandlers{
-		Message: func(m *sock.Msg) { env.apply(m, imagesDir, func(n string) { cl.Send(ackMsg(n)) }, exempt) },
-		State:   env.setLink,
+		Message: func(m *sock.Msg) {
+			env.apply(m, imagesDir, func(n string) { cl.Send(ackMsg(n)) }, exempt)
+			if m.Type == sock.TypeTable {
+				drain.sync() // the drain rule follows drain_since (SC 8a.6)
+			}
+		},
+		State: env.setLink,
 	})
 	go cl.Run(ctx)
 	go sink.run(ctx)
@@ -124,6 +136,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("dnsrole: listeners: %w", err)
 	}
+	drain.attach(srv)
 	if cfg.OnReady != nil {
 		cfg.OnReady(srv)
 	}

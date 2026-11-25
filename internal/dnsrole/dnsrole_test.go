@@ -96,20 +96,20 @@ func zoneKey(t *testing.T, sans ...string) *sock.ZoneKey {
 
 func TestFreePathIsOffWhileTheLinkIsDown(t *testing.T) {
 	e := newEnv()
-	if e.FreeOK() {
+	if e.FreeOK(0) {
 		t.Fatal("free path on with no facts")
 	}
 	good := sock.Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: true, FreeSet: true, FreeEnabled: true, FreeQPS: 40, FreeVersion: 3}
 	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &good}, "", func(string) {}, nil)
-	if e.FreeOK() {
+	if e.FreeOK(0) {
 		t.Fatal("facts without a link")
 	}
 	e.linkUp.Store(true)
-	if !e.FreeOK() || e.FreeQPS() != 40 {
+	if !e.FreeOK(0) || e.FreeQPS() != 40 {
 		t.Fatal("link up and facts good")
 	}
 	e.linkUp.Store(false)
-	if e.FreeOK() {
+	if e.FreeOK(0) {
 		t.Fatal("a dns cut off from the agent must not serve on facts nothing refreshes")
 	}
 	// the image is kept while the link is down: nothing here clears it
@@ -117,7 +117,7 @@ func TestFreePathIsOffWhileTheLinkIsDown(t *testing.T) {
 	bad := good
 	bad.OffFloor = 9
 	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &bad}, "", func(string) {}, nil)
-	if e.FreeOK() {
+	if e.FreeOK(0) {
 		t.Fatal("the off floor is above the value in force")
 	}
 }
@@ -345,7 +345,7 @@ func TestRunWithTheAgentSocket(t *testing.T) {
 			return false
 		}
 	})
-	eventually(t, "the free path on", env.FreeOK)
+	eventually(t, "the free path on", func() bool { return env.FreeOK(0) })
 	if c := env.Config(); c == nil || !bytesEqual(c.ProofKey, realKey) {
 		t.Error("the real proof_key did not arrive from the agent")
 	}
@@ -388,7 +388,7 @@ func TestRunWithTheAgentSocket(t *testing.T) {
 	})
 	// the link going down: the free path is off, the image stays
 	srv.Close()
-	eventually(t, "free path off", func() bool { return !env.FreeOK() })
+	eventually(t, "free path off", func() bool { return !env.FreeOK(0) })
 	if env.Image() == nil {
 		t.Error("the image was dropped with the link")
 	}
@@ -405,16 +405,16 @@ func TestReconnectClearsTheAgentsFacts(t *testing.T) {
 	good := sock.Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: true, FreeSet: true, FreeEnabled: true, FreeQPS: 40, FreeVersion: 3}
 	e.setLink(true)
 	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &good}, "", func(string) {}, nil)
-	if !e.FreeOK() {
+	if !e.FreeOK(0) {
 		t.Fatal("link up and facts good")
 	}
 	e.setLink(false)
 	e.setLink(true) // the agent came back; its facts message has not arrived yet
-	if e.FreeOK() {
+	if e.FreeOK(0) {
 		t.Fatal("free queries answered on the previous run's facts")
 	}
 	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &good}, "", func(string) {}, nil)
-	if !e.FreeOK() {
+	if !e.FreeOK(0) {
 		t.Fatal("the new facts must turn it on")
 	}
 }
@@ -627,5 +627,70 @@ func TestTheQueryPathSeesAnImageBeforeItIsConfirmed(t *testing.T) {
 	e.apply(&sock.Msg{Type: sock.TypeImage, Image: &sock.Image{Name: "missing"}}, filepath.Join(root, store.DirImage), func(string) { order = append(order, "ack") }, nil)
 	if len(order) != 0 {
 		t.Fatalf("an image that does not open was reported: %v", order)
+	}
+}
+
+// FreeGate splits FreeOK in (a) and (c) for the counters, and is false in both
+// while the agent cannot be read.
+func TestFreeGateSplitsTheFactsAndIsOffWhileTheLinkIsDown(t *testing.T) {
+	e := newEnv()
+	if on, caught := e.FreeGate(0); on || caught {
+		t.Fatal("a gate open with no facts")
+	}
+	facts := sock.Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: false, FreeSet: true, FreeEnabled: true, FreeQPS: 40, FreeVersion: 3}
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if on, caught := e.FreeGate(0); on || caught {
+		t.Fatal("facts with no link")
+	}
+	e.linkUp.Store(true)
+	if on, caught := e.FreeGate(0); !on || caught {
+		t.Fatalf("a lagging node: on %v caught up %v", on, caught)
+	}
+	facts.LagOK, facts.FreeEnabled = true, false
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if on, caught := e.FreeGate(0); on || !caught {
+		t.Fatalf("free off: on %v caught up %v", on, caught)
+	}
+	e.linkUp.Store(false)
+	if on, caught := e.FreeGate(0); on || caught {
+		t.Fatal("a gate open with the agent gone")
+	}
+}
+
+// p4n-MD-r1-4, p4n-MD-r3-1: the agent's applied seq moves at the state commit, before
+// the image swap, and the swap can fail. The free gate must not call dns caught up
+// while the image that identifies sources is older than the seq the facts were
+// judged at: a tenant's device whose claim is only in the newer entry would be
+// answered as a free stranger, unfiltered. The seq is the query path's own, handed
+// in by the caller: the Env stores a new image before the query path has swapped to
+// it, and must not open the gate on that.
+func TestFreeGateJudgesTheSeqOfTheImageThatIdentifiedTheQuery(t *testing.T) {
+	root := t.TempDir()
+	imgs := filepath.Join(root, store.DirImage)
+	e := newEnv()
+	e.linkUp.Store(true)
+	facts := sock.Facts{ServerTimeSeen: true, CaughtUpOnce: true, LagOK: true, FreeSet: true, FreeEnabled: true, FreeQPS: 40, FreeVersion: 3, AppliedSeq: 2}
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if on, caught := e.FreeGate(1); !on || caught || e.FreeOK(1) {
+		t.Fatalf("a query identified at seq 1 under applied seq 2: on %v caught up %v", on, caught)
+	}
+	// The Env now holds the image of seq 2 (stored before the query path swaps to
+	// it). A query still identified by seq 1 must stay refused: this is the window,
+	// and the whole of it if the swap fails.
+	e.apply(&sock.Msg{Type: sock.TypeImage, Image: &sock.Image{Name: buildImage(t, root, 2, 1)}}, imgs, func(string) {}, nil)
+	if e.Image() == nil || e.Image().Seq() != 2 {
+		t.Fatal("the test needs the Env to hold the image of seq 2")
+	}
+	if _, caught := e.FreeGate(1); caught || e.FreeOK(1) {
+		t.Fatal("the Env's own image opened the gate for a query the old claims identified")
+	}
+	if on, caught := e.FreeGate(2); !on || !caught || !e.FreeOK(2) {
+		t.Fatalf("a query identified at seq 2: on %v caught up %v", on, caught)
+	}
+	// An image from a lost state has a higher seq and passes.
+	facts.AppliedSeq = 1
+	e.apply(&sock.Msg{Type: sock.TypeFacts, Facts: &facts}, "", func(string) {}, nil)
+	if !e.FreeOK(2) {
+		t.Fatal("an image above the applied seq must pass")
 	}
 }

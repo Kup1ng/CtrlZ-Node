@@ -59,6 +59,8 @@ type Options struct {
 	Geo route.GeoSites
 	// GeoView is the same for the evaluator (country of a source), nil for none.
 	GeoView sharedpolicy.GeoView
+	// Free configures the free path (SC 5.2a).
+	Free FreeOptions
 	// IntervalUnit stands for one second of health_interval_s; tests shorten it.
 	IntervalUnit time.Duration
 	// OnBuilt, when set, receives the join once it exists (tests).
@@ -69,6 +71,8 @@ type Options struct {
 type Join struct {
 	Handler *dns.Handler
 	Cache   *cache.Cache
+	// Free is the free path of SC 5.2a, behind Handler.
+	Free *dns.FreeServer
 
 	env  *dnsrole.Env
 	sink *dnsrole.Sink
@@ -92,6 +96,12 @@ type Join struct {
 	setDone  bool
 	local    *resolve.Upstream
 	rebuilds atomic.Uint64
+
+	// The free path's own resolver: its Router, its Unbound member and the Isolated
+	// flag it reads. iso is written under mu and read by queries, so it is atomic.
+	freeBe    freeBackend
+	freeLocal *resolve.Upstream
+	iso       atomic.Bool
 }
 
 // Factory returns the dnsrole.HandlerFactory of the node.
@@ -117,18 +127,25 @@ func New(env *dnsrole.Env, sink *dnsrole.Sink, opt Options) (*Join, error) {
 	if opt.Profiles <= 0 {
 		opt.Profiles = 4096
 	}
+	if !opt.Free.Unbound.IsValid() {
+		opt.Free.Unbound = netip.MustParseAddrPort("127.0.0.11:5300")
+	}
 	if opt.NeverProxied == nil {
 		opt.NeverProxied = NeverIranian
 	}
 	j := &Join{env: env, sink: sink, opt: opt, Cache: cache.New(opt.Cache), start: sample{at: time.Now()}}
 	res := &policy.Resolver{Cache: j.Cache, Segment: cache.Shared, Backend: &j.be, Rejected: func() { j.cnt.rejected.Add(1) }}
 	rep := reporter{sink: sink}
+	free, err := j.newFree(opt.Free)
+	if err != nil {
+		return nil, err
+	}
+	j.Free = free
 	h, err := dns.New(dns.Config{
 		Resolver: res, Reporter: rep, Profiles: policy.NewProfiles(opt.Profiles),
 		NeverProxied: opt.NeverProxied, Geo: opt.GeoView, Now: j.now, CachedA: res.CachedA,
-		Self: j.self,
-		// Free and Grants are the seams of W9 and P4b: a nil FreePath is free DNS off
-		// and a nil GrantSink writes none.
+		Self: j.self, Free: free,
+		// Grants is the seam of P4b: a nil GrantSink writes none.
 	})
 	if err != nil {
 		return nil, err

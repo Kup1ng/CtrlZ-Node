@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -358,24 +359,60 @@ func (a addrString) String() string  { return string(a) }
 // that are validated and carry a finished TLS handshake. HTTP/1.1 requests on
 // one connection are served in order, as net/http does; HTTP/2 streams are
 // capped at MaxStreams.
+//
+// The connections are spread over dohShards http.Servers, each with its own feed,
+// and that is for the drain rule (SC 8a.6): net/http can end one connection
+// gracefully only by shutting the Server that holds it down (HTTP/2 GOAWAY, an
+// HTTP/1.1 connection closed when idle), never one connection alone. A drain shuts
+// a shard down at a random moment of its window and puts a fresh shard in its
+// place, so the connections close in dohShards steps over the window and the node
+// goes on serving every new connection.
 type dohServer struct {
 	*core
 	ln     net.Listener
 	tlsCfg *tls.Config
-	srv    *http.Server
-	feed   *feedListener
+	h      *dohHandler
 	// nodeHeld is the bytes of replies all connections hold for peers that do not
 	// read them (p4n-W6-r3-3).
 	nodeHeld atomic.Int64
 	wg       sync.WaitGroup
+
+	mu      sync.Mutex
+	shards  []*dohShard
+	stopped bool
+	rng     func(n int) int // the shard a connection goes to; replaced by a test
+}
+
+// dohShards is how many http.Servers carry the DoH connections: the steps a drain
+// closes them in.
+const dohShards = 32
+
+// dohShard is one http.Server and the feed it takes connections from.
+type dohShard struct {
+	srv  *http.Server
+	feed *feedListener
+	// item is the shard's place in the drain; give reads it.
+	item *drainItem
+	// drained is set when the drain retires the shard: a connection of it that then
+	// closes is reported as CloseDrain, not as net/http's own close (p4n-W8-r3-2).
+	drained atomic.Bool
 }
 
 func newDoH(c *core, ln net.Listener, tlsCfg *tls.Config, verify VerifyHandler) *dohServer {
-	s := &dohServer{core: c, ln: ln, tlsCfg: tlsCfg, feed: newFeedListener(ln.Addr())}
-	h := &dohHandler{core: c, verify: verify}
-	s.srv = &http.Server{
+	s := &dohServer{core: c, ln: ln, tlsCfg: tlsCfg, h: &dohHandler{core: c, verify: verify}, rng: rand.IntN}
+	for i := 0; i < dohShards; i++ {
+		s.shards = append(s.shards, s.newShard())
+	}
+	return s
+}
+
+func (s *dohServer) newShard() *dohShard {
+	h := s.h
+	c := s.core
+	sh := &dohShard{feed: newFeedListener(s.ln.Addr())}
+	sh.srv = &http.Server{
 		Handler:   h,
-		TLSConfig: tlsCfg, // names h2, so Serve enables HTTP/2
+		TLSConfig: s.tlsCfg, // names h2, so Serve enables HTTP/2
 		// net/http would answer OPTIONS * itself, reading its body with no deadline
 		// and never reaching dohHandler: no BodyTimeout, no 405 (p4n-W6-r8-2).
 		DisableGeneralOptionsHandler: true,
@@ -401,19 +438,117 @@ func newDoH(c *core, ln net.Listener, tlsCfg *tls.Config, verify VerifyHandler) 
 			return ctx
 		},
 	}
-	return s
+	return sh
 }
 
 func (s *dohServer) start() {
-	s.wg.Add(2)
+	s.mu.Lock()
+	for _, sh := range s.shards {
+		s.serveShard(sh)
+	}
+	s.mu.Unlock()
+	s.wg.Add(1)
 	go func() { defer s.wg.Done(); s.acceptLoop() }()
-	go func() { defer s.wg.Done(); _ = s.srv.Serve(s.feed) }()
+}
+
+// serveShard starts a shard's Serve loop and registers it with the drain rule. A
+// replacement is registered like any shard, so a plan whose window is open schedules
+// it: the clients that arrive during the window go to it as often as to an original
+// shard (p4n-W8-r1-1). The caller holds s.mu.
+func (s *dohServer) serveShard(sh *dohShard) {
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); _ = sh.srv.Serve(sh.feed) }()
+	// A plan in force schedules the shard inside attach, and a moment of 0 can fire
+	// before attach has returned the detach function: close waits for it.
+	var detach func()
+	ready := make(chan struct{})
+	closeWith := func(wait time.Duration) {
+		<-ready
+		detach()
+		s.retire(sh, wait)
+	}
+	sh.item = &drainItem{
+		close:     func() { closeWith(s.set.HandlerTimeout) },
+		closeWait: closeWith,
+	}
+	detach = s.dr.attach(sh.item)
+	close(ready)
+}
+
+// retire puts a fresh shard in the place of sh and shuts sh down gracefully: the
+// connections it holds get GOAWAY (HTTP/2) or are closed when idle (HTTP/1.1), the
+// requests under way are answered first, for at most wait (never longer than the
+// handler timeout), and the node goes on accepting new connections into the fresh
+// shard.
+func (s *dohServer) retire(sh *dohShard, wait time.Duration) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	for i, x := range s.shards {
+		if x == sh {
+			n := s.newShard()
+			s.shards[i] = n
+			s.serveShard(n)
+			break
+		}
+	}
+	s.mu.Unlock()
+	if wait > s.set.HandlerTimeout {
+		wait = s.set.HandlerTimeout
+	}
+	// Set before the shutdown so the connections it ends are counted as drained.
+	sh.drained.Store(true)
+	sh.shutdownWithin(wait)
+}
+
+// give hands a handshaken connection to one of the shards. A shard that was shut
+// down between the choice and the hand-over refuses it, and the next try finds its
+// replacement.
+func (s *dohServer) give(tc net.Conn, on *atomic.Pointer[dohShard]) bool {
+	for try := 0; try < 3; try++ {
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return false
+		}
+		sh := s.pick()
+		s.mu.Unlock()
+		on.Store(sh)
+		if sh.feed.put(tc) {
+			return true
+		}
+	}
+	return false
+}
+
+// pick chooses the shard for a new connection: a random one, but after a drain's
+// window has ended, one that has no close still to come, so that a connection that
+// opens after the window is never drained (p4n-W8-r3-3). When every shard has one (a
+// plan that began at 340 s closes all of them within milliseconds) any shard will do.
+// The caller holds s.mu.
+func (s *dohServer) pick() *dohShard {
+	n := len(s.shards)
+	i := s.rng(n)
+	for k := 0; k < n; k++ {
+		if sh := s.shards[(i+k)%n]; !s.dr.pendingClose(sh.item) {
+			return sh
+		}
+	}
+	return s.shards[i]
 }
 
 func (s *dohServer) close() {
 	_ = s.ln.Close()
-	_ = s.srv.Close()
-	s.feed.close()
+	s.mu.Lock()
+	s.stopped = true
+	shards := append([]*dohShard(nil), s.shards...)
+	s.mu.Unlock()
+	for _, sh := range shards {
+		_ = sh.srv.Close()
+		sh.feed.close()
+	}
 	s.wg.Wait()
 }
 
@@ -450,6 +585,7 @@ func (s *dohServer) acceptLoop() {
 func (s *dohServer) handshake(raw net.Conn, slot *limits.Conn) {
 	gc := &guardedConn{Conn: raw, release: slot.Release, held: newHeld(&s.nodeHeld)}
 	var why atomic.Uint32
+	var shard atomic.Pointer[dohShard]
 	gc.onClose = func() {
 		w := CloseReason(why.Load())
 		switch {
@@ -460,6 +596,9 @@ func (s *dohServer) handshake(raw net.Conn, slot *limits.Conn) {
 			w = ClosePeer
 		default:
 			w = CloseHTTP
+			if sh := shard.Load(); sh != nil && sh.drained.Load() {
+				w = CloseDrain
+			}
 		}
 		s.closed(w)
 	}
@@ -480,7 +619,7 @@ func (s *dohServer) handshake(raw net.Conn, slot *limits.Conn) {
 	}})
 	prev := gc.onClose
 	gc.onClose = func() { gc.q.stop(); prev() }
-	if !s.feed.put(tc) {
+	if !s.give(tc, &shard) {
 		_ = tc.Close()
 	}
 }

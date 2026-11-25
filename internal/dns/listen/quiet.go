@@ -205,6 +205,14 @@ func (q *quiet) writeEnd(id uint64) {
 	})
 }
 
+// isQuiet reports that nothing is unread, unanswered or being written. The drain
+// closes a connection only at such a moment, so no query is lost to it.
+func (q *quiet) isQuiet() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.open == 0 && q.waiting == 0 && len(q.active) == 0
+}
+
 // idleArmed reports whether the idle deadline is armed now. A reader whose
 // read ended with a timeout asks it, because the deadline may have been
 // disarmed an instant before the timeout was delivered.

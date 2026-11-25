@@ -16,6 +16,7 @@ import (
 	"github.com/Kup1ng/CtrlZ-Shared/identity"
 	"github.com/Kup1ng/CtrlZ-Shared/locations"
 	"github.com/Kup1ng/CtrlZ-Shared/names"
+	"github.com/Kup1ng/CtrlZ-Shared/noredirect"
 	"github.com/Kup1ng/CtrlZ-Shared/reason"
 	"github.com/Kup1ng/CtrlZ-Shared/route"
 	"github.com/Kup1ng/CtrlZ-Shared/rules"
@@ -238,6 +239,10 @@ func textOp(c *TextCase) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("kind=%s negated=%v key=%s lit_labels=%d lit_bytes=%d", p.Kind, p.Negated, p.Key(), p.LitLabels, p.LitBytes), nil
+
+	// no-redirect (D42, contract 10.5)
+	case "no_redirect":
+		return noRedirect(c)
 
 	// schedule
 	case "cell":
@@ -522,4 +527,33 @@ func runBinaryGroup(t *testing.T, g *GroupFile) {
 			t.Errorf("blob group has no case for reasons %v", missing)
 		}
 	}
+}
+
+// noRedirect parses Input as a rule token and judges it with the entries named in Args
+// ("domain:<name>" or "host:<name>"). The answer is iranian_name or allowed, the two
+// outcomes the write path has for a Redirect on that pattern.
+func noRedirect(c *TextCase) (string, error) {
+	p, err := rules.Parse(c.Input)
+	if err != nil {
+		return "", err
+	}
+	e := noredirect.Entries{}
+	for _, a := range c.Args {
+		scope, name, ok := strings.Cut(a, ":")
+		if !ok {
+			return "", fmt.Errorf("bad entry %q", a)
+		}
+		switch scope {
+		case "domain":
+			e[name] = noredirect.ScopeDomain
+		case "host":
+			e[name] = noredirect.ScopeHost
+		default:
+			return "", fmt.Errorf("bad entry scope %q", scope)
+		}
+	}
+	if noredirect.Pattern(p, e) {
+		return "iranian_name", nil
+	}
+	return "allowed", nil
 }

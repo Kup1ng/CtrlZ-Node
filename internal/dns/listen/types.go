@@ -159,6 +159,7 @@ const (
 	ClosePeer                             // the peer closed or reset it
 	CloseShutdown                         // the listener stopped
 	CloseHTTP                             // DoH only: net/http closed it (idle deadline, a protocol error) with no sign that the peer had gone
+	CloseDrain                            // the drain rule (SC 8a.6): the node is no longer advertised and closed the connection gracefully
 )
 
 // Observer receives counts and no content. Every field is optional. A field is
