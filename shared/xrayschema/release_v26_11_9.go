@@ -53,11 +53,13 @@ func outbound() *node {
 // (globalRejected): a warning would pass with accept_unknown. testseed only tunes
 // Vision padding and stops at a warning like any key the table does not hold.
 func vlessSettings() *node {
-	user := obj(f("id", str()), f("flow", str()), f("encryption", str()), f("level", num()), f("email", str()),
+	// The padding gaps of an encryption text are sleeps nothing cancels (B1-r4-9).
+	enc := func() *node { return checked(CheckVLESSEncryption) }
+	user := obj(f("id", str()), f("flow", str()), f("encryption", enc()), f("level", num()), f("email", str()),
 		f("seed", str()))
 	return obj(
 		f("address", str()), f("port", num()), f("level", num()), f("email", str()), f("id", str()),
-		f("flow", str()), f("seed", str()), f("encryption", str()),
+		f("flow", str()), f("seed", str()), f("encryption", enc()),
 		f("vnext", arr(obj(f("address", str()), f("port", num()), f("users", arr(user))))),
 	)
 }
@@ -132,7 +134,7 @@ func wireguardSettings() *node {
 		f("allowedIPs", arr(str())), f("level", num()), f("email", str()))
 	return obj(
 		f("noKernelTun", boolean()), f("secretKey", str()), f("address", arr(str())), f("peers", arr(peer)),
-		f("mtu", bnum(0, 9000)), f("reserved", arr(num())), f("remoteDNS", arr(str())),
+		f("mtu", bnum(0, 1500)), f("reserved", arr(num())), f("remoteDNS", arr(str())),
 	).refusing("isClient", "turns the client into a server").forcing("noKernelTun")
 }
 
@@ -140,7 +142,8 @@ func wireguardSettings() *node {
 // ours: the agent writes the rules of 7.4 on every freedom outbound, so a rule of the
 // user's would only suggest that it applies.
 func freedomSettings() *node {
-	noise := obj(f("type", str()), f("packet", str()), f("delay", brange(0, maxWaitMs)), f("applyTo", str()))
+	noise := obj(f("type", str()), f("packet", str()), f("delay", brange(0, maxWaitMs)), f("applyTo", str())).
+		postChecked(freedomNoise)
 	return obj(
 		f("targetStrategy", str()), f("domainStrategy", str()), f("userLevel", num()),
 		f("fragment", obj(f("packets", str()), f("length", brange(1, maxFragment)), f("interval", brange(0, maxWaitMs)), f("maxSplit", brange(0, maxSplits)))),
@@ -167,7 +170,7 @@ func streamSettings() *node {
 		f("httpupgradeSettings", httpUpgradeSettings()),
 		f("hysteriaSettings", obj(f("version", num()), f("auth", str()), f("udpIdleTimeout", bnum(0, 3600)))),
 		f("sockopt", sockopt()),
-	).aliased("method", "network").
+	).postChecked(streamCongestion).aliased("method", "network").
 		aliased("rawSettings", "tcpSettings").
 		aliased("xhttpSettings", "splithttpSettings").
 		refusing("masqueSettings", "the masque transport belongs to the masque outbound, which is not allowed")
@@ -234,9 +237,10 @@ func xhttpSettings() *node {
 
 func kcpSettings() *node {
 	return obj(
-		f("mtu", bnum(21, 1500)), f("tti", bnum(0, 1000)), f("uplinkCapacity", bnum(0, 1000)), f("downlinkCapacity", bnum(0, 1000)),
-		f("cwndMultiplier", bnum(0, 256)), f("maxSendingWindow", bnum(0, 16384)), f("header", raw()), f("seed", str()),
-	)
+		f("mtu", bnum(21, 1500)), f("tti", bnum(10, 1000)), f("uplinkCapacity", bnum(0, 1000)), f("downlinkCapacity", bnum(0, 1000)),
+		// maxSendingWindow is in bytes (2 MiB by default); kcpWindows bounds what it makes with mtu.
+		f("cwndMultiplier", bnum(0, 256)), f("maxSendingWindow", bnum(0, maxWindow)), f("header", raw()), f("seed", str()),
+	).postChecked(kcpWindows)
 }
 
 func grpcSettings() *node {
@@ -256,14 +260,14 @@ func httpUpgradeSettings() *node {
 }
 
 // sockopt: mark, tproxy, acceptProxyProtocol, interface and customSockopt reach the
-// host's socket options and are on the global list of always-rejected keys.
+// host's socket options and are on the global list of always-rejected keys, and so is
+// happyEyeballs, which races several ports for one dial (B1-r4-1).
 func sockopt() *node {
 	return obj(
 		f("tcpFastOpen", anyScalar()), f("domainStrategy", str()), f("dialerProxy", dialerTag()),
 		f("tcpKeepAliveInterval", bnum(-1, 86400)), f("tcpKeepAliveIdle", bnum(-1, 86400)), f("tcpCongestion", str()),
 		f("tcpWindowClamp", bnum(0, maxWindow)), f("tcpMaxSeg", bnum(0, 65535)), f("penetrate", boolean()), f("tcpUserTimeout", bnum(0, 3600000)),
 		f("v6only", boolean()), f("tcpMptcp", boolean()),
-		f("happyEyeballs", obj(f("prioritizeIPv6", boolean()), f("tryDelayMs", bnum(0, maxWaitMs)), f("interleave", bnum(0, 64)), f("maxConcurrentTry", bnum(0, 16)))),
 		f("trustedXForwardedFor", arr(str())),
 	)
 }
@@ -286,17 +290,18 @@ func finalmask() *node {
 			f("lengths", arr(brange(1, maxFragment))), f("delays", arr(brange(0, maxWaitMs))), f("maxSplit", brange(0, maxSplits))),
 		"sudoku": sudoku(),
 	})
-	noiseItem := obj(f("rand", brange(0, 65535)), f("randRange", brange(0, 255)), f("type", str()), f("packet", raw()), f("delay", brange(0, maxWaitMs)))
+	noiseItem := obj(f("rand", brange(0, 65535)), f("randRange", brange(0, 255)), f("type", str()), f("packet", raw()), f("delay", brange(0, maxWaitMs))).
+		postChecked(noiseExpItem)
 	udp := mask(map[string]*node{
 		"filter":      obj(f("blockedSourceIPs", arr(str())), f("allowedSourceIPs", arr(str()))),
 		"mkcp-legacy": obj(f("header", str()), f("value", str())),
 		"noise":       obj(f("reset", brange(0, 86400)), f("noise", arr(noiseItem))),
-		"salamander":  obj(f("password", str()), f("packetSize", brange(0, 65535))),
+		"salamander":  obj(f("password", str()), f("packetSize", brange(0, 2048))),
 		"sudoku":      sudoku(),
 		"udphop":      obj(f("mode", str()), f("interval", brange(1, 86400)), f("remoteIPs", arr(str())), f("remotePorts", ports())),
 	})
 	quic := obj(
-		f("congestion", str()), f("bbrProfile", str()), f("brutalUp", anyScalar()),
+		f("congestion", enumOf(false, "", "reno", "bbr", "brutal", "force-brutal")), f("bbrProfile", str()), f("brutalUp", anyScalar()),
 		f("brutalDown", anyScalar()), f("brutalDisableLossCompensation", boolean()),
 		f("initStreamReceiveWindow", bnum(0, maxQuicWindow)), f("maxStreamReceiveWindow", bnum(0, maxQuicWindow)),
 		f("initConnectionReceiveWindow", bnum(0, maxQuicWindow)), f("maxConnectionReceiveWindow", bnum(0, maxQuicWindow)),
@@ -304,7 +309,7 @@ func finalmask() *node {
 		f("disableChromeParrot", boolean()), f("disableGSO", boolean()), f("maxIncomingStreams", bnum(0, 8192)),
 		f("disableStatelessReset", boolean()),
 	).refusing("debug", "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process")
-	return obj(f("tcp", arr(tcp)), f("udp", arr(udp)), f("quicParams", quic))
+	return obj(f("tcp", arr(tcp)), f("udp", arr(udp)), f("quicParams", quic)).postChecked(finalmaskMasks)
 }
 
 func sudoku() *node {

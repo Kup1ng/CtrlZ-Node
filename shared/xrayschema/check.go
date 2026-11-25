@@ -336,6 +336,9 @@ func globalRejected() map[string]string {
 		"portmapping":         "asks the gateway of the host for a UPnP or NAT-PMP port",
 		"addressportstrategy": "makes the node resolve SRV or TXT records to choose an address or a port",
 		"debug":               "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process",
+		// One dial would race up to maxConcurrentTry ports and as many tracked connections,
+		// which the dial limits of the node (p4b-proxy 5.5) are not sized for (B1-r4-1).
+		"happyeyeballs": "races several ports for one dial, which the dial limits of the node do not cover",
 		// A warning would not do: an exact path in accept_unknown passes a warning, and each
 		// testpre starts endless pre-dial goroutines that survive rmo (finding 4).
 		"testpre": "starts goroutines that dial the exit for ever and outlive the config",
@@ -491,6 +494,10 @@ func (c *ctx) scanRaw(v *val, path string) {
 				continue
 			}
 			if why, bad := keyedCheck(m.key, m.v); bad {
+				c.reject(p, why)
+				continue
+			}
+			if why, bad := rawValueRejected(m.key, m.v); bad {
 				c.reject(p, why)
 				continue
 			}
@@ -816,6 +823,11 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 		}
 	}
 	v.members = kept
+	if n.post != nil {
+		if key, why := n.post(v); why != "" {
+			c.reject(path+key, why)
+		}
+	}
 	for _, key := range n.forceTrue {
 		found := false
 		for i := range v.members {
@@ -1011,38 +1023,37 @@ func rangeInLimit(s string, l *limit) bool {
 		parts = strings.Split(s, ",")
 	}
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			return false
-		}
-		if i, err := strconv.ParseInt(p, 10, 64); err == nil {
-			if i < l.lo || i > l.hi {
-				return false
-			}
-			continue
-		}
-		ok := false
-		// The separator is a dash that is not the sign of the first number.
-		for i := 1; i < len(p); i++ {
-			if p[i] != '-' {
-				continue
-			}
-			a, errA := strconv.ParseInt(strings.TrimSpace(p[:i]), 10, 64)
-			b, errB := strconv.ParseInt(strings.TrimSpace(p[i+1:]), 10, 64)
-			if errA != nil || errB != nil {
-				continue
-			}
-			if a < l.lo || a > l.hi || b < l.lo || b > l.hi {
-				return false
-			}
-			ok = true
-			break
-		}
-		if !ok {
+		a, b, ok := rangeEnds(p)
+		if !ok || a < l.lo || a > l.hi || b < l.lo || b > l.hi {
 			return false
 		}
 	}
 	return true
+}
+
+// rangeEnds reads one range text as Xray's ParseRangeString does: "a", or "a-b" where
+// either number may carry a minus sign (the separator is a dash that is not the sign of
+// the first number). The ends are given as written, not put in order.
+func rangeEnds(p string) (a, b int64, ok bool) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return 0, 0, false
+	}
+	if i, err := strconv.ParseInt(p, 10, 64); err == nil {
+		return i, i, true
+	}
+	for i := 1; i < len(p); i++ {
+		if p[i] != '-' {
+			continue
+		}
+		x, errA := strconv.ParseInt(strings.TrimSpace(p[:i]), 10, 64)
+		y, errB := strconv.ParseInt(strings.TrimSpace(p[i+1:]), 10, 64)
+		if errA != nil || errB != nil {
+			continue
+		}
+		return x, y, true
+	}
+	return 0, 0, false
 }
 
 // limitText is the reason of a refused number. It names the bounds and never the value.

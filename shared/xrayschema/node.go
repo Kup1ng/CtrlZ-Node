@@ -60,6 +60,12 @@ type node struct {
 	forceTrue []string
 	// lim bounds the values of a kNum or a kRange (see limit); nil leaves them free.
 	lim *limit
+	// post judges a whole object after its members were walked and written in their
+	// canonical form, for a limit that depends on several members at once (the window a
+	// kcp connection may hold is a product of three keys). It returns the path below the
+	// object ("" or ".key") and the reason, or an empty reason. It never echoes a value
+	// and must cope with members the nodes have already rejected.
+	post func(v *val) (key, why string)
 }
 
 func (n *node) resolve() *node {
@@ -104,6 +110,12 @@ func (n *node) refusing(key, why string) *node {
 // refusingTrue marks a boolean that the release always refuses when it is true.
 func (n *node) refusingTrue(why string) *node {
 	n.noTrue = why
+	return n
+}
+
+// postChecked attaches a check of the whole object (see post).
+func (n *node) postChecked(fn func(v *val) (string, string)) *node {
+	n.post = fn
 	return n
 }
 

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Kup1ng/CtrlZ-Shared/xrayschema"
 )
 
 // Convert turns one share link into the text of a fragment {"outbounds":[outbound]}.
@@ -432,6 +434,10 @@ func convertVLESS(rest string) (map[string]any, string, error) {
 	enc := p.get("encryption")
 	if enc == "" {
 		enc = "none"
+	}
+	// A gap of the padding text is a sleep inside the handshake that nothing cancels.
+	if why := xrayschema.CheckVLESSEncryption(enc); why != "" {
+		return nil, "", errors.New("parameter \"encryption\": " + why)
 	}
 	settings := map[string]any{"address": host, "port": port, "id": id, "encryption": enc}
 	setIf(settings, "flow", p.get("flow"))

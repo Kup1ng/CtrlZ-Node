@@ -80,8 +80,10 @@ func TestBoundedNumbersOfTheTable(t *testing.T) {
 
 // The first and last values of a bound pass, and the ones beside them do not.
 func TestBoundEdges(t *testing.T) {
+	// The window and the capacity are small, so that the edge of mtu is tested alone: at
+	// mtu 21 the defaults make a window of tens of thousands of segments (B1-r4-4).
 	kcp := func(v string) string {
-		return outboundWith(`,"streamSettings":{"method":"kcp","kcpSettings":{"mtu":` + v + `}}`)
+		return outboundWith(`,"streamSettings":{"method":"kcp","kcpSettings":{"mtu":` + v + `,"downlinkCapacity":1,"maxSendingWindow":65536}}`)
 	}
 	mustOK(t, kcp(`21`))
 	mustOK(t, kcp(`1500`))
