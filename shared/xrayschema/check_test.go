@@ -450,6 +450,8 @@ func FuzzCheck(f *testing.F) {
 	f.Add([]byte(outboundWith(`,"streamSettings":{"sockopt":{"dialerProxy":"x"}}`)), "outbounds[0].a")
 	f.Add([]byte(`{"outbounds":[{"protocol":"vless","tag":"a","streamSettings":{"sockopt":{"dialerProxy":"b"}}},{"protocol":"freedom","tag":"b"}]}`), "")
 	f.Add([]byte(`{"outbounds":[{"protocol":"wireguard","settings":{"isClient":true}}]}`), "")
+	f.Add([]byte(tlsWith(`,"echConfigList":"https://1.1.1.1/dns-query"`)), "")
+	f.Add([]byte(outboundWith(`,"streamSettings":{"security":"reality","realitySettings":{"spiderX":"/?p=1"}}`)), "")
 	f.Add([]byte(`{`), "")
 	f.Fuzz(func(t *testing.T, data []byte, accept string) {
 		r := Newest().Check(data, strings.Split(accept, ","))
@@ -480,5 +482,28 @@ func FuzzCheck(f *testing.F) {
 				t.Fatalf("an accepted fragment holds the key %s: %s", k, form)
 			}
 		}
+		if root, err := parse(form); err == nil {
+			if key := keyedViolation(root); key != "" {
+				t.Fatalf("an accepted fragment holds a bad %s: %s", key, form)
+			}
+		}
 	})
+}
+
+// keyedViolation finds a member of the tree that keyedChecks refuse, at any depth.
+func keyedViolation(v *val) string {
+	for _, m := range v.members {
+		if _, bad := keyedCheck(m.key, m.v); bad {
+			return m.key
+		}
+		if k := keyedViolation(m.v); k != "" {
+			return k
+		}
+	}
+	for _, it := range v.items {
+		if k := keyedViolation(it); k != "" {
+			return k
+		}
+	}
+	return ""
 }

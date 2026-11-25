@@ -320,7 +320,16 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			return nil, errNoInsecure("allowinsecure", "pcs")
 		}
 		setIf(t, "pinnedPeerCertSha256", rd("pcs"))
-		setIf(t, "echConfigList", rd("ech"))
+		// Xray reads an echConfigList with :// as the address of a DoH, h2c or UDP server to
+		// ask for the exit's ECH record, with socket options of its own and the host
+		// resolver for a name (7.2, 7.4). Only a base64 list is passed on; the checker says
+		// the same, and the converter names the parameter.
+		if ech := rd("ech"); ech != "" {
+			if _, err := base64.StdEncoding.DecodeString(ech); err != nil {
+				return nil, errors.New("parameter \"ech\" is not a base64 ECH config list (a server address or a name is refused)")
+			}
+			t["echConfigList"] = ech
+		}
 		ss["tlsSettings"] = t
 	case "reality":
 		ss["security"] = "reality"
@@ -329,7 +338,13 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 		setIf(r, "fingerprint", rd("fp"))
 		setIf(r, "publicKey", rd("pbk"))
 		setIf(r, "shortId", rd("sid"))
-		setIf(r, "spiderX", rd("spx"))
+		// Xray reads p, c, t, i and r of a query in spiderX as unbounded crawler settings of
+		// the REALITY fallback; a link needs only a path.
+		if spx := rd("spx"); strings.Contains(spx, "?") {
+			return nil, errors.New("parameter \"spx\" has a query part: only a path is accepted")
+		} else {
+			setIf(r, "spiderX", spx)
+		}
 		setIf(r, "mldsa65Verify", rd("pqv"))
 		if r["publicKey"] == nil {
 			return nil, errors.New("security reality needs parameter \"pbk\"")
@@ -684,7 +699,7 @@ func convertHysteria2(rest string) (map[string]any, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	host, port, err := hostPortOf(u)
+	host, port, err := hysteria2HostPort(u)
 	if err != nil {
 		return nil, "", err
 	}
@@ -742,4 +757,14 @@ func convertHysteria2(rest string) (map[string]any, string, error) {
 	}
 	settings := map[string]any{"version": 2, "address": host, "port": port}
 	return newOutbound("hysteria", settings, ss), remark(u), nil
+}
+
+// hysteria2HostPort is hostPortOf with the default of the URI form: the port of
+// hysteria2://[auth@]host[:port]/ is optional and 443. A list or a range of ports is
+// not a URL port at all (net/url refuses it), so port hopping stays refused.
+func hysteria2HostPort(u *url.URL) (string, int, error) {
+	if u.Port() == "" {
+		return checkHostPort(u.Hostname(), "443")
+	}
+	return hostPortOf(u)
 }

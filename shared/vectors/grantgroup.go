@@ -12,13 +12,13 @@ import (
 //
 //	put     a Put of 4.2. Fields: name, src, ep, acct, client, origin (the node that
 //	        forwarded it, empty for a decision made here), plain (a UDP query without a
-//	        valid cookie), claim, open, unsafe, d (the decision). expect: ok, validate or
+//	        valid cookie), claim, claim_id (names the claim, implies claim), open, unsafe, d (the decision). expect: ok, validate or
 //	        refused:<reason>.
 //	lookup  expect: none, or exact or widened, then the outcome and the holders.
 //	open    admit one connection: id, name, src, width, asn. expect: none,
 //	        refused:<cap>, charged:<account>/<endpoint> or shared.
 //	close   close a connection by id.
-//	end     one cause of 4.6: cause, ep, origin, name. expect: closed=<ids>.
+//	end     one cause of 4.6: cause, ep, claim_id (for the two claim causes), origin, name. expect: closed=<ids>.
 //	sent    the answer to a forward (accepted, refused, unsent) for the holder of ep.
 //	state   expect: the dump of the table.
 //	stats   expect: the width counters of one client ASN.
@@ -35,26 +35,27 @@ type GrantCase struct {
 
 // GrantStep is one step.
 type GrantStep struct {
-	Op     string            `json:"op"`
-	Node   string            `json:"node"`
-	T      *int64            `json:"t"`
-	Name   string            `json:"name"`
-	Src    string            `json:"src"`
-	Ep     string            `json:"ep"`
-	Acct   string            `json:"acct"`
-	Client string            `json:"client"`
-	Origin string            `json:"origin"`
-	Plain  bool              `json:"plain"`
-	Claim  bool              `json:"claim"`
-	Open   bool              `json:"open"`
-	Unsafe bool              `json:"unsafe"`
-	D      GrantDecision     `json:"d"`
-	ID     string            `json:"id"`
-	Width  string            `json:"width"`
-	ASN    map[string]uint32 `json:"asn"`
-	Cause  string            `json:"cause"`
-	Result string            `json:"result"`
-	Expect string            `json:"expect"`
+	Op      string            `json:"op"`
+	Node    string            `json:"node"`
+	T       *int64            `json:"t"`
+	Name    string            `json:"name"`
+	Src     string            `json:"src"`
+	Ep      string            `json:"ep"`
+	Acct    string            `json:"acct"`
+	Client  string            `json:"client"`
+	Origin  string            `json:"origin"`
+	Plain   bool              `json:"plain"`
+	Claim   bool              `json:"claim"`
+	ClaimID string            `json:"claim_id"`
+	Open    bool              `json:"open"`
+	Unsafe  bool              `json:"unsafe"`
+	D       GrantDecision     `json:"d"`
+	ID      string            `json:"id"`
+	Width   string            `json:"width"`
+	ASN     map[string]uint32 `json:"asn"`
+	Cause   string            `json:"cause"`
+	Result  string            `json:"result"`
+	Expect  string            `json:"expect"`
 }
 
 func runGrantsGroup(t *testing.T, g *GroupFile) {
@@ -101,7 +102,7 @@ func RunGrantCase(c *GrantCase) string {
 		switch s.Op {
 		case "put":
 			got = n.Put(now, GrantPut{Name: s.Name, Src: s.Src, Ep: s.Ep, Acct: s.Acct, Client: s.Client, Origin: s.Origin,
-				Validated: !s.Plain, Claim: s.Claim, Open: s.Open, Unsafe: s.Unsafe, D: normDecision(s.D)})
+				Validated: !s.Plain, Claim: s.Claim, ClaimID: s.ClaimID, Open: s.Open, Unsafe: s.Unsafe, D: normDecision(s.D)})
 		case "lookup":
 			e, how := n.Lookup(now, s.Src, s.Name, s.Width, s.ASN)
 			if e == nil {
@@ -115,7 +116,7 @@ func RunGrantCase(c *GrantCase) string {
 			n.Close(s.ID)
 			continue
 		case "end":
-			ids := n.End(s.Cause, s.Ep, "", s.Origin, s.Name)
+			ids := n.End(s.Cause, s.Ep, s.ClaimID, s.Origin, s.Name)
 			got = "closed=" + strings.Join(ids, ",")
 			if len(ids) == 0 {
 				got = "closed=-"

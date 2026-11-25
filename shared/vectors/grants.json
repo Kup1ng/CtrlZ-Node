@@ -362,6 +362,25 @@
        {"op": "put", "t": 6, "name": "x.test", "src": "192.0.2.10", "ep": "B", "acct": "b", "d": {"kind": 1, "loc": 2}, "expect": "ok"},
        {"op": "put", "t": 7, "name": "x.test", "src": "192.0.2.10", "ep": "A", "acct": "a", "d": {"kind": 1, "pick": "auto", "loc": 1, "eff": [1, 2]}, "expect": "ok"},
        {"op": "state", "expect": "x.test 192.0.2.10 kind=1 loc=2 holders=A,B | conns c1:a/A"}
+     ]},
+    {"id": "g-038", "why": "Put: a Put that a cap refuses changes nothing, not even the outcome of the entry: a forwarded copy of this device holds the entry, the local decision for a new outcome is refused by the (Endpoint, source) quarter, and the entry keeps the outcome and the holder it had (B1-r2-10)",
+     "limits": {"grant_cap": 4},
+     "steps": [
+       {"op": "put", "t": 0, "node": "n2", "origin": "n1", "name": "x.test", "src": "192.0.2.10", "ep": "E", "acct": "a", "d": {"kind": 1, "loc": 2}, "expect": "ok"},
+       {"op": "put", "t": 1, "node": "n2", "name": "x.test", "src": "192.0.2.10", "ep": "E", "acct": "a", "d": {"kind": 1, "loc": 3}, "expect": "refused:endpoint_cap"},
+       {"op": "state", "node": "n2", "expect": "x.test 192.0.2.10 kind=1 loc=2 holders=E@n1"}
+     ]},
+    {"id": "g-039", "why": "End: a revocation of one claim and the loss of one claim end the holders of that claim and keep those of another claim of the same Endpoint (B1-r2-5)",
+     "steps": [
+       {"op": "put", "t": 0, "name": "x.test", "src": "192.0.2.10", "ep": "A", "acct": "a", "claim_id": "c1", "d": {"kind": 1, "loc": 2}, "expect": "ok"},
+       {"op": "put", "name": "y.test", "src": "192.0.2.10", "ep": "A", "acct": "a", "claim_id": "c2", "d": {"kind": 1, "loc": 2}, "expect": "ok"},
+       {"op": "put", "name": "z.test", "src": "192.0.2.10", "ep": "A", "acct": "a", "claim_id": "c1", "d": {"kind": 1, "loc": 2}, "expect": "ok"},
+       {"op": "end", "cause": "claim_gone", "ep": "A", "claim_id": "c1", "expect": "closed=-"},
+       {"op": "state", "expect": "y.test 192.0.2.10 kind=1 loc=2 holders=A"},
+       {"op": "end", "cause": "revocation_claim", "ep": "A", "claim_id": "c3", "expect": "closed=-"},
+       {"op": "state", "expect": "y.test 192.0.2.10 kind=1 loc=2 holders=A"},
+       {"op": "end", "cause": "revocation_claim", "ep": "A", "claim_id": "c2", "expect": "closed=-"},
+       {"op": "state", "expect": "-"}
      ]}
   ]
 }

@@ -100,14 +100,18 @@ func TestAnAcceptedMaskCannotCarryWhatTheTableRefuses(t *testing.T) {
 		"outbounds[0].streamSettings.tlsSettings.dialerProxy")
 }
 
-// B1-r1-9: testpre starts that many endless pre-dial goroutines in the Xray process
-// that every location of the node shares, so it stops at a warning, and testseed too.
-func TestVlessTestpreIsNotInTheTable(t *testing.T) {
+// B1-r1-9, redone in B1-r2-3 and B1-r2-9: testpre starts that many endless pre-dial
+// goroutines in the Xray process that every location of the node shares. A warning is
+// not enough (an exact path in accept_unknown passes it), so it is refused for good, at
+// the settings, in a user of vnext and in any subtree. testseed only tunes Vision
+// padding and stays a warning.
+func TestVlessTestpreIsRefusedForGood(t *testing.T) {
 	frag := `{"outbounds":[{"protocol":"vless","settings":{"address":"203.0.113.7","port":443,"id":"5783a3e7-e373-51cd-8642-c83782b807c5","encryption":"none","testpre":100000}}]}`
-	r := check(t, frag)
-	if r.OK() || len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].settings.testpre" {
-		t.Errorf("testpre: warnings=%v rejected=%v", r.Warnings, r.Rejected)
-	}
+	mustReject(t, "testpre", frag, "outbounds[0].settings.testpre")
+	mustReject(t, "TESTPRE", strings.Replace(frag, "testpre", "TESTPRE", 1), "outbounds[0].settings.TESTPRE")
+	userPre := `{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"203.0.113.7","port":443,"users":[{"id":"5783a3e7-e373-51cd-8642-c83782b807c5","testpre":5}]}]}}]}`
+	mustReject(t, "testpre of a user", userPre, "outbounds[0].settings.vnext[0].users[0].testpre")
+	mustReject(t, "testpre in a raw subtree", outboundWith(`,"streamSettings":{"xhttpSettings":{"h2Params":{"testpre":1}}}`))
 	user := `{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"203.0.113.7","port":443,"users":[{"id":"5783a3e7-e373-51cd-8642-c83782b807c5","testseed":[1,2]}]}]}}]}`
 	if r := check(t, user); r.OK() {
 		t.Error("testseed of a user passes")

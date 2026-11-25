@@ -36,10 +36,11 @@ func outbound() *node {
 
 // ---- protocols ------------------------------------------------------------------
 
-// vlessSettings leaves out testpre and testseed on purpose: testpre starts that many
+// vlessSettings leaves out testpre and testseed on purpose. testpre starts that many
 // pre-dial goroutines in the one Xray process every location of the node shares, and
-// none of them ends with the generation. They stop at a warning like any key the
-// table does not hold.
+// none of them ends with the generation, so it is on the always-rejected list
+// (globalRejected): a warning would pass with accept_unknown. testseed only tunes
+// Vision padding and stops at a warning like any key the table does not hold.
 func vlessSettings() *node {
 	user := obj(f("id", str()), f("flow", str()), f("encryption", str()), f("level", num()), f("email", str()),
 		f("seed", str()))
@@ -179,7 +180,7 @@ func tlsSettings() *node {
 		f("allowInsecure", boolean().refusingTrue("the release refuses allowInsecure; pin the certificate with pinnedPeerCertSha256")), f("certificates", arr(cert)), f("serverName", str()), f("alpn", strList()),
 		f("enableSessionResumption", boolean()), f("disableSystemRoot", boolean()), f("minVersion", str()),
 		f("maxVersion", str()), f("cipherSuites", str()), f("fingerprint", str()), f("curvePreferences", strList()),
-		f("pinnedPeerCertSha256", str()), f("verifyPeerCertByName", str()), f("echConfigList", str()),
+		f("pinnedPeerCertSha256", str()), f("verifyPeerCertByName", str()), f("echConfigList", checked(checkECHList)),
 		f("echSockopt", sockopt()), f("useSystemCA", boolean()),
 	)
 }
@@ -187,7 +188,7 @@ func tlsSettings() *node {
 func realitySettings() *node {
 	return obj(
 		f("show", boolean()), f("fingerprint", str()), f("serverName", str()), f("password", str()),
-		f("publicKey", str()), f("shortId", str()), f("mldsa65Verify", str()), f("spiderX", str()),
+		f("publicKey", str()), f("shortId", str()), f("mldsa65Verify", str()), f("spiderX", checked(checkSpiderX)),
 	)
 }
 
@@ -302,4 +303,26 @@ func sudoku() *node {
 		f("customTables", arr(str())), f("custom_tables", arr(str())), f("paddingMin", num()),
 		f("padding_min", num()), f("paddingMax", num()), f("padding_max", num()),
 	)
+}
+
+// ---- state that rmo leaves behind ------------------------------------------------
+
+// statefulRules classifies every protocol and every transport of the table (7.2,
+// finding 4): rmo only drops the tag of an outbound and never closes its handler, so
+// a wireguard device with its UDP socket, a hysteria session and an xhttp session over
+// h3 stay up until the process ends. A change to such a config therefore rebuilds in
+// the idle slot (7.5 step 5). Each protocol and transport of the table is named here,
+// so a release that adds one fails TestEveryProtocolAndTransportIsClassified until
+// someone has read its handler for the same property (G4).
+func statefulRules() statefulSet {
+	return statefulSet{
+		protocols: map[string]bool{
+			"vless": false, "vmess": false, "trojan": false, "shadowsocks": false, "socks": false,
+			"http": false, "freedom": false, "hysteria": true, "wireguard": true,
+		},
+		transports: map[string]transportState{
+			"raw": never, "kcp": never, "grpc": never, "ws": never, "httpupgrade": never,
+			"hysteria": always, "xhttp": withH3,
+		},
+	}
 }

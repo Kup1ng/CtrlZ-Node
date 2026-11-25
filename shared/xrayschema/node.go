@@ -53,6 +53,9 @@ type node struct {
 	dialer bool
 	// noTrue refuses the value true of a boolean, with the reason.
 	noTrue string
+	// check judges the text of a string that no table of keys can judge, and returns
+	// the reason it is refused or "". It never echoes the value.
+	check func(string) string
 	// forceTrue lists boolean keys that the normal form always sets to true.
 	forceTrue []string
 }
@@ -120,6 +123,9 @@ func strMap() *node             { return &node{k: kStrMap} }
 func lazy(f func() *node) *node { return &node{lazy: f} }
 
 func dialerTag() *node { return &node{k: kStr, dialer: true} }
+
+// checked is a string whose text a function judges (see keyedChecks).
+func checked(fn func(string) string) *node { return &node{k: kStr, check: fn} }
 
 // enumOf builds a hard enum. Each argument is "spelling=canonical" or just the
 // canonical spelling.

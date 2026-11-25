@@ -10,6 +10,10 @@
     "trojan://pw@203.0.113.7:443?flow=xtls-rprx-vision",
     "ss://YWVzLTI1Ni1nY206cHc@203.0.113.7:8388?plugin=obfs-local",
     "hysteria2://auth@203.0.113.7:443?mport=1000-2000",
-    "wireguard://x@203.0.113.7:51820"
+    "wireguard://x@203.0.113.7:51820",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=tls\u0026sni=a.example\u0026ech=udp%3A%2F%2Fattacker.example%3A53",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=tls\u0026sni=a.example\u0026ech=example.com%2Bhttps%3A%2F%2F1.1.1.1%2Fdns-query",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=tls\u0026sni=a.example\u0026ech=1.1.1.1",
+    "vless://5783a3e7-e373-51cd-8642-c83782b807c5@203.0.113.7:443?security=reality\u0026sni=a.example\u0026pbk=ZmFrZQ\u0026spx=%2F%3Fp%3D9000000000000000000"
   ]
 }

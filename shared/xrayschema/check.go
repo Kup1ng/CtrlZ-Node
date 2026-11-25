@@ -15,6 +15,7 @@ package xrayschema
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -75,6 +76,8 @@ func (r *Result) OK() bool { return len(r.Warnings) == 0 && len(r.Rejected) == 0
 type Table struct {
 	tag   string
 	build func() *node
+	// rules classifies the state of the release (Stateful).
+	rules func() statefulSet
 }
 
 // Release is the tag of the Xray release the table was written from.
@@ -333,7 +336,59 @@ func globalRejected() map[string]string {
 		"portmapping":         "asks the gateway of the host for a UPnP or NAT-PMP port",
 		"addressportstrategy": "makes the node resolve SRV or TXT records to choose an address or a port",
 		"debug":               "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process",
+		// A warning would not do: an exact path in accept_unknown passes a warning, and each
+		// testpre starts endless pre-dial goroutines that survive rmo (finding 4).
+		"testpre": "starts goroutines that dial the exit for ever and outlive the config",
 	}
+}
+
+// keyedChecks are the keys whose string value is judged wherever the key sits: in
+// the table at its node, in a subtree the table has no node for, and as an unknown key.
+// Both are free text to Xray's loader and read by code that reaches beyond the dial:
+//
+//   - tlsSettings.echConfigList: a value with "://" makes Xray query a DoH, h2c or
+//     plain UDP server for the exit's ECH record with socket options of its own, and
+//     resolve that server's name by the host resolver (7.2, 7.4). Only a standard
+//     base64 list (what Xray decodes with base64.StdEncoding) passes.
+//   - realitySettings.spiderX: the loader parses p, c, t, i and r of its query as
+//     unbounded int64 and a REALITY fallback then runs that many crawler goroutines
+//     (and strings.Repeat of that length, which panics) in the shared Xray process,
+//     after the trial passed, whenever the server answers with its real certificate.
+//     A path with no query part is all a link needs.
+func keyedChecks() map[string]func(string) string {
+	return map[string]func(string) string{
+		"echconfiglist": checkECHList,
+		"spiderx":       checkSpiderX,
+	}
+}
+
+func checkECHList(s string) string {
+	if _, err := base64.StdEncoding.DecodeString(s); err != nil {
+		return "echConfigList must be a base64 list: a value with :// or a name makes Xray query a server of its own"
+	}
+	return ""
+}
+
+func checkSpiderX(s string) string {
+	if strings.Contains(s, "?") {
+		return "spiderX must be a path with no query part: Xray reads p, c, t, i and r of it as crawler settings"
+	}
+	return ""
+}
+
+// keyedCheck judges a member by its key where no table node does.
+func keyedCheck(key string, v *val) (string, bool) {
+	if v.k != 's' {
+		return "", false
+	}
+	for k, fn := range keyedChecks() {
+		if strings.EqualFold(key, k) {
+			if why := fn(v.s); why != "" {
+				return why, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (c *ctx) forbiddenKey(n *node, key string) (string, bool) {
@@ -435,6 +490,10 @@ func (c *ctx) scanRaw(v *val, path string) {
 				c.reject(p, "key is never allowed here: "+why)
 				continue
 			}
+			if why, bad := keyedCheck(m.key, m.v); bad {
+				c.reject(p, why)
+				continue
+			}
 			c.scanRaw(m.v, p)
 		}
 	case 'a':
@@ -501,8 +560,16 @@ func (c *ctx) walk(n *node, v *val, path string) {
 			c.reject(path, "expected a string")
 			return
 		}
-		if c.checkString(path, v.s) && n.dialer {
-			c.dialers = append(c.dialers, dialRef{c.out, path, v})
+		if c.checkString(path, v.s) {
+			if n.check != nil {
+				if why := n.check(v.s); why != "" {
+					c.reject(path, why)
+					return
+				}
+			}
+			if n.dialer {
+				c.dialers = append(c.dialers, dialRef{c.out, path, v})
+			}
 		}
 	case kNum:
 		if v.k != 'n' {
@@ -725,6 +792,10 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 		p := path + "." + clip(m.key)
 		if why, bad := rawRejected(m.key); bad {
 			c.reject(p, "key is never allowed here: "+why)
+			continue
+		}
+		if why, bad := keyedCheck(m.key, m.v); bad {
+			c.reject(p, why)
 			continue
 		}
 		c.warn(p, "unknown key")

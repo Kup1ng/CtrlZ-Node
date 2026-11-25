@@ -9,7 +9,7 @@ var ErrUnknownRelease = errors.New("xrayschema: no allow-list for this Xray rele
 // removed: a node may stay on any release that was ever shipped as a bundle (7.2).
 func releases() []Table {
 	return []Table{
-		{tag: "v26.11.9", build: outbound},
+		{tag: "v26.11.9", build: outbound, rules: statefulRules},
 	}
 }
 

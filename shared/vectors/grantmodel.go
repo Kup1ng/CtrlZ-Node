@@ -71,9 +71,12 @@ type GrantPut struct {
 	Name, Src, Ep, Acct, Client, Origin string
 	Validated                           bool
 	Claim                               bool // the source is in a claim or an authorized prefix
-	Open                                bool // Require Authorized IPs was off when the holder was written
-	Unsafe                              bool // R9: the name to dial is not public
-	D                                   GrantDecision
+	// ClaimID names the claim that made the holder; a non-empty one implies Claim. A claim
+	// revocation ends the holders of that claim and no other (4.6).
+	ClaimID string
+	Open    bool // Require Authorized IPs was off when the holder was written
+	Unsafe  bool // R9: the name to dial is not public
+	D       GrantDecision
 }
 
 type outcome struct {
@@ -96,6 +99,7 @@ func outcomeOf(d GrantDecision) outcome {
 type holder struct {
 	ep, acct, client, origin string
 	claim, open, alone       bool
+	claimID                  string
 	widenable                bool
 	pick                     string
 	expires, decided         int64
@@ -185,6 +189,7 @@ func allows(d GrantDecision, live outcome) bool {
 
 // Put is 4.2. It returns ok, validate or refused:<reason>.
 func (n *GrantNode) Put(now int64, r GrantPut) string {
+	r.Claim = r.Claim || r.ClaimID != ""
 	n.expire(now)
 	if r.D.Kind == 1 && r.Unsafe {
 		return "refused:unsafe"
@@ -206,7 +211,7 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 		return "validate"
 	}
 	newHolder := func() *holder {
-		return &holder{ep: r.Ep, acct: r.Acct, client: r.Client, origin: r.Origin, claim: r.Claim, open: r.Open,
+		return &holder{ep: r.Ep, acct: r.Acct, client: r.Client, origin: r.Origin, claim: r.Claim, claimID: r.ClaimID, open: r.Open,
 			widenable: r.D.Widenable, pick: r.D.Pick, expires: now + GrantLife, decided: now}
 	}
 	if e != nil {
@@ -217,7 +222,7 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 				if r.Origin == "" {
 					h.decided = now
 				}
-				h.claim, h.open, h.widenable, h.pick = r.Claim, r.Open, r.D.Widenable, r.D.Pick
+				h.claim, h.claimID, h.open, h.widenable, h.pick = r.Claim, r.ClaimID, r.Open, r.D.Widenable, r.D.Pick
 				return "ok"
 			}
 		}
@@ -233,9 +238,12 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 			}
 		}
 		if own {
-			e.out = out
+			// A refused Put changes nothing (4.2), so the outcome moves only after the holder is
+			// in: when only a forwarded copy holds the entry, a new local holder needs admission
+			// and a cap may refuse it.
 			for _, h := range e.holders {
 				if h.id() == holderID(r) {
+					e.out = out
 					touch(h, r, now)
 					return "ok"
 				}
@@ -243,6 +251,7 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 			if v := n.admit(now, r, e); v != "" {
 				return v
 			}
+			e.out = out
 			e.holders = append(e.holders, newHolder())
 			return "ok"
 		}
@@ -302,7 +311,7 @@ func touch(h *holder, r GrantPut, now int64) {
 	if r.Origin == "" {
 		h.decided = now
 	}
-	h.claim, h.open, h.widenable, h.pick = r.Claim, r.Open, r.D.Widenable, r.D.Pick
+	h.claim, h.claimID, h.open, h.widenable, h.pick = r.Claim, r.ClaimID, r.Open, r.D.Widenable, r.D.Pick
 }
 
 // sameDevice is the (Endpoint, client) of 4.2 step 3, whatever node decided it.
@@ -551,7 +560,7 @@ func (n *GrantNode) End(cause, ep, claimMark, origin, name string) []string {
 		case "hard_disabled", "record_gone", "ident_changed", "revocation_endpoint", "revocation_grants_by_endpoint":
 			return h.ep == ep
 		case "claim_gone", "revocation_claim":
-			return h.ep == ep && h.claim
+			return h.ep == ep && h.claim && h.claimID == claimMark
 		case "authorized_lost":
 			return h.ep == ep && h.open && !h.claim
 		case "origin_removed":
