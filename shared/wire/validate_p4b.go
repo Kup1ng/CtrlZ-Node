@@ -281,9 +281,21 @@ func validateHeartbeatP4b(h *hubv1.Heartbeat) error {
 	if h.BindError < hubv1.BindError_BIND_ERROR_UNSPECIFIED || h.BindError > hubv1.BindError_BIND_ERROR_PROXY_FAILED {
 		return bad(reason.BadEnum, w, "bind_error %d", h.BindError)
 	}
+	// The hub copies xray_version into NodeConfig.xray_schema_version, which
+	// ValidateNodeConfig refuses unless it is a release tag; a free-text report would
+	// turn into a config the node can never be sent (B1-r5-1), so the report is held to
+	// the same form here. Empty stays valid: no node reports them yet.
+	if h.XrayVersion != "" && !xrayschema.ValidReleaseTag(h.XrayVersion) {
+		return bad(reason.BadSection, w, "xray_version is not a release tag v<major>.<minor>.<patch>")
+	}
 	if u := h.XrayUpgrade; u != nil {
 		if !validVersion(u.Fetched) || !validVersion(u.Version) {
 			return bad(reason.BadSection, w, "an xray_upgrade version is not valid text")
+		}
+		for _, v := range []string{u.Fetched, u.Version} {
+			if v != "" && !xrayschema.ValidReleaseTag(v) {
+				return bad(reason.BadSection, w, "an xray_upgrade version is not a release tag v<major>.<minor>.<patch>")
+			}
 		}
 		if len(u.FailedIds) > MaxXrayFailedIDs {
 			return bad(reason.SizeCap, w, "%d failed_ids", len(u.FailedIds))

@@ -234,6 +234,7 @@ func TestValidateHeartbeatP4b(t *testing.T) {
 	h.Faults = []hubv1.NodeFault{hubv1.NodeFault_NODE_FAULT_NFT_FAILED, hubv1.NodeFault_NODE_FAULT_GRANTS_FULL}
 	h.XrayUpgrade = &hubv1.XrayUpgradeState{Fetched: "v26.11.9", Version: "v26.11.9", Ok: false, FailedIds: [][]byte{make([]byte, 16)}}
 	h.BindError = hubv1.BindError_BIND_ERROR_DNS_FAILED
+	h.XrayVersion = "v26.11.9"
 	if err := ValidateHeartbeat(h); err != nil {
 		t.Fatalf("a full heartbeat: %v", err)
 	}
@@ -265,6 +266,12 @@ func TestValidateHeartbeatP4b(t *testing.T) {
 		"a fault twice":       func(h *hubv1.Heartbeat) { h.Faults = []hubv1.NodeFault{2, 2} },
 		"bind_error 5":        func(h *hubv1.Heartbeat) { h.BindError = 5 },
 		"upgrade version bad": func(h *hubv1.Heartbeat) { h.XrayUpgrade = &hubv1.XrayUpgradeState{Version: "a\nb"} },
+		// B1-r5-1: the hub copies the reports into NodeConfig.xray_schema_version, which
+		// wants a release tag, so free text must stop here.
+		"xray_version without v":     func(h *hubv1.Heartbeat) { h.XrayVersion = "26.11.9" },
+		"xray_version is the banner": func(h *hubv1.Heartbeat) { h.XrayVersion = "Xray 26.11.9 (go1.27.3 linux/amd64)" },
+		"upgrade fetched free text":  func(h *hubv1.Heartbeat) { h.XrayUpgrade = &hubv1.XrayUpgradeState{Fetched: "latest"} },
+		"upgrade version without v":  func(h *hubv1.Heartbeat) { h.XrayUpgrade = &hubv1.XrayUpgradeState{Version: "26.11.9"} },
 		"65 failed ids": func(h *hubv1.Heartbeat) {
 			u := &hubv1.XrayUpgradeState{}
 			for i := 0; i < 65; i++ {

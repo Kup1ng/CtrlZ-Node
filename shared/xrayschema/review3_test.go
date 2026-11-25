@@ -51,7 +51,7 @@ func TestBoundedNumbersOfTheTable(t *testing.T) {
 		{"xhttp uplinkChunkSize", xhttp("uplinkChunkSize"), []string{`2000000000`, `"1-2000000000"`}, `4096`},
 		{"xhttp xmux maxConnections", stream(`"method":"xhttp","xhttpSettings":{"xmux":{"maxConnections":V}}`), []string{`2000000000`, `"1-2000000000"`}, `"16-32"`},
 		{"xhttp extra", stream(`"method":"xhttp","xhttpSettings":{"extra":{"scMaxEachPostBytes":V}}`), []string{`2000000000`}, `1000000`},
-		{"xhttp downloadSettings", stream(`"method":"xhttp","xhttpSettings":{"downloadSettings":{"method":"xhttp","xhttpSettings":{"scMinPostsIntervalMs":V}}}`), []string{`2000000000`}, `30`},
+		{"xhttp downloadSettings", stream(`"method":"xhttp","xhttpSettings":{"downloadSettings":{"address":"203.0.113.9","method":"xhttp","xhttpSettings":{"scMinPostsIntervalMs":V}}}`), []string{`2000000000`}, `30`},
 		{"grpc initial_windows_size", stream(`"method":"grpc","grpcSettings":{"initial_windows_size":V}`), []string{`2147483647`, `-1`, `33554432`}, `65535`},
 		{"grpc idle_timeout", stream(`"method":"grpc","grpcSettings":{"idle_timeout":V}`), []string{`-1`, `2000000000`}, `60`},
 		{"quic maxStreamReceiveWindow", stream(`"finalmask":{"quicParams":{"maxStreamReceiveWindow":V}}`), []string{`18446744073709551615`, `2147483647`, `33554433`, `-1`}, `8388608`},

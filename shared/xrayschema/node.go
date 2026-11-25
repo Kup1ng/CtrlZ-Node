@@ -58,6 +58,9 @@ type node struct {
 	check func(string) string
 	// forceTrue lists boolean keys that the normal form always sets to true.
 	forceTrue []string
+	// noTemplate makes a kStrMap refuse any value with "{{": the headers of an http
+	// outbound are Go text/template programs that Xray runs on every connection.
+	noTemplate bool
 	// lim bounds the values of a kNum or a kRange (see limit); nil leaves them free.
 	lim *limit
 	// post judges a whole object after its members were walked and written in their
@@ -135,6 +138,21 @@ func anyScalar() *node          { return &node{k: kAny} }
 func raw() *node                { return &node{k: kRaw} }
 func strMap() *node             { return &node{k: kStrMap} }
 func lazy(f func() *node) *node { return &node{lazy: f} }
+
+// templateMap is a strMap whose values Xray parses as text/template (the headers of an
+// http outbound), so none may hold the opening delimiter (B1-r5-2).
+func templateMap() *node { return &node{k: kStrMap, noTemplate: true} }
+
+// maxBytes is a string of at most n bytes, for a field that the wire format sizes in one
+// byte (B1-r5-3). The reason names the limit and never the value.
+func maxBytes(n int, why string) *node {
+	return checked(func(s string) string {
+		if len(s) > n {
+			return why
+		}
+		return ""
+	})
+}
 
 func dialerTag() *node { return &node{k: kStr, dialer: true} }
 

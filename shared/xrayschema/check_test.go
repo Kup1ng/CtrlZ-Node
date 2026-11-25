@@ -313,9 +313,9 @@ func TestChains(t *testing.T) {
 	mustReject(t, "an outbound nothing reaches", frag(hop("a", ""), hop("b", "")))
 	mustReject(t, "freedom first", `{"outbounds":[{"protocol":"freedom","tag":"x"}]}`)
 	// The same through a nested downloadSettings, and through echSockopt.
-	nested := `{"protocol":"vless","tag":"a","streamSettings":{"xhttpSettings":{"downloadSettings":{"sockopt":{"dialerProxy":"b"}}}}}`
+	nested := `{"protocol":"vless","tag":"a","streamSettings":{"xhttpSettings":{"downloadSettings":{"address":"203.0.113.9","method":"xhttp","sockopt":{"dialerProxy":"b"}}}}}`
 	mustOK(t, frag(nested, hop("b", "")))
-	cyc := `{"protocol":"vless","tag":"b","streamSettings":{"xhttpSettings":{"downloadSettings":{"sockopt":{"dialerProxy":"a"}}}}}`
+	cyc := `{"protocol":"vless","tag":"b","streamSettings":{"xhttpSettings":{"downloadSettings":{"address":"203.0.113.9","method":"xhttp","sockopt":{"dialerProxy":"a"}}}}}`
 	mustReject(t, "cycle through downloadSettings", frag(nested, cyc))
 	ech := `{"protocol":"vless","tag":"a","streamSettings":{"security":"tls","tlsSettings":{"echSockopt":{"dialerProxy":"b"}}}}`
 	r = mustOK(t, frag(ech, hop("b", "")))

@@ -501,6 +501,10 @@ func (c *ctx) scanRaw(v *val, path string) {
 				c.reject(p, why)
 				continue
 			}
+			if strings.EqualFold(m.key, "headers") && subtreeHasTemplate(m.v) {
+				c.reject(p, templateWhy)
+				continue
+			}
 			c.scanRaw(m.v, p)
 		}
 	case 'a':
@@ -510,6 +514,39 @@ func (c *ctx) scanRaw(v *val, path string) {
 	case 's':
 		c.checkString(path, v.s)
 	}
+}
+
+// templateWhy is the reason of a header value with "{{" (B1-r5-2): proxy/http/client.go
+// parses each header value of an http outbound with text/template and runs it for every
+// connection with the source and the target, and nothing in text/template is bounded by
+// a context or a size, so a value can allocate until the one process every location
+// shares is killed, after a branch on the target that no probe takes.
+const templateWhy = "a header value holding {{ is a Go template that the http outbound runs on every connection"
+
+func hasTemplate(s string) bool { return strings.Contains(s, "{{") }
+
+// subtreeHasTemplate looks at every string under a member called headers in a subtree
+// the table has no node for. Only the http outbound runs its header values as
+// templates, but such a subtree may be the settings of one the table could not place,
+// so the spelling is refused wherever a headers member sits.
+func subtreeHasTemplate(v *val) bool {
+	switch v.k {
+	case 's':
+		return hasTemplate(v.s)
+	case 'a':
+		for _, it := range v.items {
+			if subtreeHasTemplate(it) {
+				return true
+			}
+		}
+	case 'o':
+		for _, m := range v.members {
+			if subtreeHasTemplate(m.v) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // lookup finds the canonical key of a member in an object node. Go's decoder takes
@@ -645,14 +682,18 @@ func (c *ctx) walk(n *node, v *val, path string) {
 			seenKey[m.key] = true
 			switch m.v.k {
 			case 's':
-				c.checkString(p, m.v.s)
+				if c.checkString(p, m.v.s) && n.noTemplate && hasTemplate(m.v.s) {
+					c.reject(p, templateWhy)
+				}
 			case 'a':
 				for i, it := range m.v.items {
 					if it.k != 's' {
 						c.reject(p, "expected a string or an array of strings")
 						break
 					}
-					c.checkString(p+"["+strconv.Itoa(i)+"]", it.s)
+					if c.checkString(p+"["+strconv.Itoa(i)+"]", it.s) && n.noTemplate && hasTemplate(it.s) {
+						c.reject(p+"["+strconv.Itoa(i)+"]", templateWhy)
+					}
 				}
 			default:
 				c.reject(p, "expected a string or an array of strings")
@@ -1022,9 +1063,16 @@ func rangeInLimit(s string, l *limit) bool {
 	if l.list {
 		parts = strings.Split(s, ",")
 	}
+	var total int64
 	for _, p := range parts {
 		a, b, ok := rangeEnds(p)
 		if !ok || a < l.lo || a > l.hi || b < l.lo || b > l.hi {
+			return false
+		}
+		// Xray expands a port list into one slice of every port of every part, repeats
+		// included (B1-r5-8), so the parts are bounded in sum as well.
+		total += max(a, b) - min(a, b) + 1
+		if l.list && total > l.hi-l.lo+1 {
 			return false
 		}
 	}
@@ -1058,5 +1106,9 @@ func rangeEnds(p string) (a, b int64, ok bool) {
 
 // limitText is the reason of a refused number. It names the bounds and never the value.
 func limitText(l *limit) string {
+	if l.list {
+		return "must be whole port numbers from " + strconv.FormatInt(l.lo, 10) + " to " + strconv.FormatInt(l.hi, 10) + ", at most " +
+			strconv.FormatInt(l.hi-l.lo+1, 10) + " ports in all: Xray expands the list into one slice"
+	}
 	return "must be a whole number from " + strconv.FormatInt(l.lo, 10) + " to " + strconv.FormatInt(l.hi, 10) + ": the node's one Xray process serves every location"
 }

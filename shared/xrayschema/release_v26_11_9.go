@@ -42,7 +42,7 @@ func outbound() *node {
 			f("enabled", boolean()), f("concurrency", bnum(-1, 1024)), f("xudpConcurrency", bnum(-1, 1024)), f("xudpProxyUDP443", str()),
 		)),
 		f("targetStrategy", str()),
-	).withVariant("protocol", "settings", protocols)
+	).withVariant("protocol", "settings", protocols).postChecked(freedomGecko)
 }
 
 // ---- protocols ------------------------------------------------------------------
@@ -104,10 +104,15 @@ func shadowsocksSettings() *node {
 	)
 }
 
+// socksSettings bounds user and pass at 255 bytes: SOCKS5 carries each length in one
+// byte, and the client writes both into one 8,192-byte buffer with common.Must2, which
+// panics in a goroutine nothing recovers once the exit answers method 02 (B1-r5-3).
 func socksSettings() *node {
-	user := obj(f("user", str()), f("pass", str()), f("level", num()), f("email", str()))
+	const why = "a socks user or pass is at most 255 bytes: SOCKS5 carries its length in one byte and Xray panics on a longer one"
+	user := obj(f("user", maxBytes(255, why)), f("pass", maxBytes(255, why)), f("level", num()), f("email", str()))
 	return obj(
-		f("address", str()), f("port", num()), f("level", num()), f("email", str()), f("user", str()), f("pass", str()),
+		f("address", str()), f("port", num()), f("level", num()), f("email", str()),
+		f("user", maxBytes(255, why)), f("pass", maxBytes(255, why)),
 		f("servers", arr(obj(f("address", str()), f("port", num()), f("users", arr(user))))),
 	)
 }
@@ -116,7 +121,7 @@ func httpSettings() *node {
 	user := obj(f("user", str()), f("pass", str()), f("level", num()), f("email", str()))
 	return obj(
 		f("address", str()), f("port", num()), f("level", num()), f("email", str()), f("user", str()), f("pass", str()),
-		f("headers", strMap()),
+		f("headers", templateMap()),
 		f("servers", arr(obj(f("address", str()), f("port", num()), f("users", arr(user))))),
 	)
 }
@@ -232,7 +237,7 @@ func xhttpSettings() *node {
 		// "extra" is read again by the loader as xhttp settings, so it is judged as such.
 		f("extra", lazy(xhttpSettings)),
 		f("h2Params", raw()),
-	)
+	).postChecked(xhttpDownload)
 }
 
 func kcpSettings() *node {
@@ -327,7 +332,10 @@ func sudoku() *node {
 // a wireguard device with its UDP socket, a hysteria session, a grpc ClientConn (the
 // process-wide globalDialerMap of transport/internet/grpc keeps it up to 30 min after
 // its last call, with keepalive pings, and redials a dead exit; read, not run) and an xhttp session over
-// h3 stay up until the process ends. A change to such a config therefore rebuilds in
+// h3 stay up until the process ends. The http protocol is stateful too (B1-r5-6): its
+// client keeps every HTTP/2 connection in the package-level cachedH2Conns, keyed by
+// destination alone and never closed, so a removed exit stays up and an edit (a pin, a
+// dialerProxy hop) is answered over the old connection. A change to such a config therefore rebuilds in
 // the idle slot (7.5 step 5). Each protocol and transport of the table is named here,
 // so a release that adds one fails TestEveryProtocolAndTransportIsClassified until
 // someone has read its handler for the same property (G4).
@@ -335,7 +343,7 @@ func statefulRules() statefulSet {
 	return statefulSet{
 		protocols: map[string]bool{
 			"vless": false, "vmess": false, "trojan": false, "shadowsocks": false, "socks": false,
-			"http": false, "freedom": false, "hysteria": true, "wireguard": true,
+			"http": true, "freedom": false, "hysteria": true, "wireguard": true,
 		},
 		transports: map[string]transportState{
 			"raw": never, "kcp": never, "ws": never, "httpupgrade": never, "grpc": always,

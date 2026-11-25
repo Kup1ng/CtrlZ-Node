@@ -177,33 +177,170 @@ func freedomNoise(v *val) (string, string) {
 	return "", ""
 }
 
-// finalmaskMasks judges what the udp masks of one stream do to each other (B1-r4-6). A
-// salamander with packetSize is the gecko writer, which copies each packet it is given
-// into a buffer of 8,192 bytes and panics on one above 8,184. Every carrier the table
-// allows sends at most 1,500 bytes (kcp mtu, wireguard mtu, QUIC), but a sudoku mask
-// grows each packet 4 to 9 times, so the two cannot share a list.
+// maxGeckoNoise is the largest packet a noise may make beside a gecko mask. The gecko
+// writer copies each packet it is given into a buffer of 8,192 bytes and panics on one
+// above 8,184 (B1-r5-5); every carrier of the table sends at most 1,500 bytes, so the
+// same figure bounds the noise and leaves a margin of five times.
+const maxGeckoNoise = 1500
+
+// noiseItemSize is the most bytes one noise item can send as one packet: a finalmask
+// noise reads its length from rand, a freedom noise from a packet of type rand, and the
+// literal types send the text they hold (the length of the text bounds hex and base64
+// from above).
+func noiseItemSize(it *val) int64 {
+	var size int64
+	if r := memberOf(it, "rand"); r != nil {
+		size = rangeTop(r)
+	}
+	p := memberOf(it, "packet")
+	if p == nil {
+		return size
+	}
+	t := memberOf(it, "type")
+	typ := ""
+	if t != nil && t.k == 's' {
+		typ = strings.ToLower(t.s)
+	}
+	switch p.k {
+	case 'a':
+		size = max(size, int64(len(p.items)))
+	case 's':
+		size = max(size, int64(len(p.s)))
+		switch typ {
+		case "exp":
+			if n, ok := noiseExpSize(p.s); ok {
+				size = max(size, n)
+			}
+		case "rand", "":
+			size = max(size, rangeTop(p))
+		}
+	}
+	return size
+}
+
+// largeNoise reports whether a list of noise items holds one that can exceed the gecko
+// limit.
+func largeNoise(items *val) bool {
+	if items == nil {
+		return false
+	}
+	list := []*val{items}
+	if items.k == 'a' {
+		list = items.items
+	}
+	for _, it := range list {
+		if it.k == 'o' && noiseItemSize(it) > maxGeckoNoise {
+			return true
+		}
+	}
+	return false
+}
+
+// hasGecko reports whether a udp list holds a salamander mask with packetSize.
+func hasGecko(udp *val) bool {
+	if udp == nil || udp.k != 'a' {
+		return false
+	}
+	for _, it := range udp.items {
+		if t := memberOf(it, "type"); t != nil && t.k == 's' && strings.EqualFold(t.s, "salamander") {
+			if size := memberOf(memberOf(it, "settings"), "packetSize"); size != nil && rangeTop(size) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// freedomGecko judges an outbound of protocol freedom: its noises are written through
+// the finalmask of its own stream, so a noise that can exceed the gecko limit cannot
+// share a stream with a gecko mask (B1-r5-5).
+func freedomGecko(v *val) (string, string) {
+	if p := memberOf(v, "protocol"); p == nil || p.k != 's' || !strings.EqualFold(p.s, "freedom") {
+		return "", ""
+	}
+	if !hasGecko(memberOf(memberOf(memberOf(v, "streamSettings"), "finalmask"), "udp")) {
+		return "", ""
+	}
+	s := memberOf(v, "settings")
+	if largeNoise(memberOf(s, "noises")) || largeNoise(memberOf(s, "noise")) {
+		return ".settings", "a freedom noise above " + strconv.Itoa(maxGeckoNoise) + " bytes cannot share a stream with a salamander mask with packetSize: the gecko writer panics on a packet above 8,184 bytes"
+	}
+	return "", ""
+}
+
+// finalmaskMasks judges what the udp masks of one stream do to each other (B1-r4-6,
+// B1-r5-4, B1-r5-5). A salamander with packetSize is the gecko writer, which copies each
+// packet it is given into a buffer of 8,192 bytes and panics on one above 8,184. Every
+// carrier the table allows sends at most 1,500 bytes (kcp mtu, wireguard mtu, QUIC), but
+// a sudoku mask grows each packet 4 to 9 times, and a noise mask sends packets of its
+// own, so neither can share a list with it (a noise of at most 1,500 bytes can).
+//
+// The header masks (mkcp-legacy of any kind, and salamander without packetSize) are
+// read one after the other by headerManagerConn, which checks only that the packet is as
+// long as the sum of their Size(). An AES mkcp-legacy mask (one with a value) reports 12
+// and takes 12 plus a 16 byte tag, so after another header mask in an unbroken run one
+// datagram of an empty payload passes the check and the next mask slices past its end:
+// a panic in the read loop, at a time the exit chooses. The order [aes, header] is safe.
 func finalmaskMasks(v *val) (string, string) {
 	udp := memberOf(v, "udp")
 	if udp == nil || udp.k != 'a' {
 		return "", ""
 	}
 	gecko, sudoku := false, false
+	run := false // the item before this one is a header mask
+	var noises []*val
 	for _, it := range udp.items {
 		t := memberOf(it, "type")
 		if t == nil || t.k != 's' {
+			run = false
 			continue
 		}
+		header := false
 		switch strings.ToLower(t.s) {
 		case "sudoku":
 			sudoku = true
 		case "salamander":
 			if size := memberOf(memberOf(it, "settings"), "packetSize"); size != nil && rangeTop(size) > 0 {
 				gecko = true
+			} else {
+				header = true
+			}
+		case "mkcp-legacy":
+			header = true
+			if value := memberOf(memberOf(it, "settings"), "value"); run && value != nil && !(value.k == 's' && value.s == "") {
+				return ".udp", "an mkcp-legacy mask with a value (AES) cannot follow another header mask: a datagram with an empty payload makes the next mask slice past the packet and Xray panics (put it first)"
+			}
+		case "noise":
+			if n := memberOf(memberOf(it, "settings"), "noise"); n != nil && n.k == 'a' {
+				noises = append(noises, n.items...)
 			}
 		}
+		run = header
 	}
 	if gecko && sudoku {
 		return ".udp", "a salamander mask with packetSize cannot share a list with a sudoku mask: sudoku makes packets larger than its buffer takes"
+	}
+	if gecko && largeNoise(&val{k: 'a', items: noises}) {
+		return ".udp", "a noise above " + strconv.Itoa(maxGeckoNoise) + " bytes cannot share a list with a salamander mask with packetSize: the gecko writer panics on a packet above 8,184 bytes"
+	}
+	return "", ""
+}
+
+// xhttpDownload judges the downloadSettings of xhttp settings (and of its extra): the
+// dialer of the download half dereferences its address and asserts that its method is
+// xhttp with no check ("just panic" in splithttp/dialer.go), so a link with no address
+// or with method raw, the default, kills the shared process at the first dial, after
+// -test has passed it (B1-r5-7).
+func xhttpDownload(v *val) (string, string) {
+	d := memberOf(v, "downloadSettings")
+	if d == nil || d.k != 'o' {
+		return "", ""
+	}
+	if m := memberOf(d, "method"); m == nil || m.k != 's' || m.s != "xhttp" {
+		return ".downloadSettings.method", "the downloadSettings of xhttp must name method xhttp: Xray panics on any other"
+	}
+	if a := memberOf(d, "address"); a == nil || a.k != 's' || strings.TrimSpace(a.s) == "" {
+		return ".downloadSettings.address", "the downloadSettings of xhttp must have an address: Xray panics on none"
 	}
 	return "", ""
 }
@@ -264,16 +401,27 @@ func CheckVLESSEncryption(enc string) string {
 		return ""
 	}
 	i := 0
+	// The gaps are slept one after the other in one handshake, so their largest values
+	// are also bounded in sum (B1-r5-9): 1,400 gaps of 10 s each would hold a goroutine
+	// and a socket for hours.
+	var total int64
 	for _, r := range s[3:] {
 		if len(r) >= 20 {
 			continue // a key
 		}
 		x := strings.Split(r, "-")
 		if i%2 == 1 && len(x) >= 3 {
+			var longest int64
 			for _, part := range x[1:3] {
-				if n, err := strconv.Atoi(part); err == nil && n > maxWaitMs {
-					return "a padding gap of the encryption text is longer than " + strconv.Itoa(maxWaitMs) + " ms: Xray sleeps it inside the handshake"
+				if n, err := strconv.Atoi(part); err == nil {
+					if n > maxWaitMs {
+						return "a padding gap of the encryption text is longer than " + strconv.Itoa(maxWaitMs) + " ms: Xray sleeps it inside the handshake"
+					}
+					longest = max(longest, int64(n))
 				}
+			}
+			if total += longest; total > maxWaitMs {
+				return "the padding gaps of the encryption text add up to more than " + strconv.Itoa(maxWaitMs) + " ms: Xray sleeps them one after the other inside the handshake"
 			}
 		}
 		i++
