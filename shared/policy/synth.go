@@ -126,8 +126,9 @@ func synthRedirect(in *SynthIn, qt uint16) SynthOut {
 // with the Grant it was made for). An empty list means the node's proxy is down and
 // the peer's is not usable (p4b-proxy 4.4). A Branded block then answers A 0.0.0.0
 // with the Block TTL and no Grant, so a block never becomes the true answer. A
-// Redirect with no address keeps SERVFAIL: the node turns a Redirect into Bypass
-// before it gets here, so that case means a misbuilt caller.
+// Redirect with no address keeps SERVFAIL: the evaluator turns such a Redirect into
+// Bypass before it gets here (completeRedirect), so that case means a misbuilt caller
+// of Synthesize.
 func proxyAnswer(in *SynthIn, ttl uint32, kind uint8) SynthOut {
 	if ttl > MaxProxyTTL {
 		ttl = MaxProxyTTL

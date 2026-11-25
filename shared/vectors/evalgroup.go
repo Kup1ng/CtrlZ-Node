@@ -2,6 +2,7 @@ package vectors
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +84,7 @@ type ExpectJSON struct {
 	Flags        *[]string   `json:"flags"`
 	WantGrant    *bool       `json:"want_grant"`
 	GrantKind    *uint8      `json:"grant_kind"`
+	PageHash     *string     `json:"page_hash"` // hex of Final.PageHash: the page of a kind 2 Grant
 	Widenable    *bool       `json:"widenable"`
 	Target       *string     `json:"target"`
 	Location     *uint16     `json:"location"`
@@ -338,6 +340,9 @@ func check(t *testing.T, fx *Fixture, c *EvalCase, out *Outcome, up *upstreamRes
 	}
 	if e.GrantKind != nil {
 		cmp("grant_kind", f.GrantKind, *e.GrantKind)
+	}
+	if e.PageHash != nil {
+		cmp("page_hash", hex.EncodeToString(f.PageHash[:]), *e.PageHash)
 	}
 	if e.Widenable != nil {
 		cmp("widenable", f.Widenable, *e.Widenable)

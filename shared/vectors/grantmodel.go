@@ -221,12 +221,14 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 				return "ok"
 			}
 		}
-		// Every holder is this one's (Endpoint, client, origin): its own newer decision.
-		// A holder that a forwarded put made is never replaced by a local decision, nor
-		// the reverse: two nodes that decide one name at once each keep their own.
+		// Every holder is of this (Endpoint, client): its own newer decision (4.2 step 3).
+		// The origin does not matter here: a copy that the pair node forwarded is the
+		// same device's older decision, and judging it as another party would leave the
+		// device on Bypass at this node after an edit, until the copy expired. What keeps
+		// two accounts apart is the Endpoint, and no Endpoint belongs to two accounts.
 		own := true
 		for _, h := range e.holders {
-			if h.id() != holderID(r) {
+			if !sameDevice(h, r) {
 				own = false
 			}
 		}
@@ -259,12 +261,13 @@ func (n *GrantNode) Put(now int64, r GrantPut) string {
 			e.holders = append(e.holders, newHolder())
 			return "ok"
 		}
-		// Leave: the holder of this identity, and for a put decided here the local
-		// holders of this account with no deciding query for MaxProxyTTL. No holder of
-		// another account, and none of another origin.
+		// Leave: the holders of this (Endpoint, client), of any origin, and for a put
+		// decided here the local holders of this account with no deciding query for
+		// MaxProxyTTL (a forwarded copy has no deciding query of this node to age).
+		// No holder of another account.
 		kept := e.holders[:0]
 		for _, h := range e.holders {
-			leaves := h.id() == holderID(r)
+			leaves := sameDevice(h, r)
 			if r.Origin == "" && h.acct == r.Acct && h.origin == "" && now-h.decided >= GrantMaxProxyTTL {
 				leaves = true
 			}
@@ -301,6 +304,9 @@ func touch(h *holder, r GrantPut, now int64) {
 	}
 	h.claim, h.open, h.widenable, h.pick = r.Claim, r.Open, r.D.Widenable, r.D.Pick
 }
+
+// sameDevice is the (Endpoint, client) of 4.2 step 3, whatever node decided it.
+func sameDevice(h *holder, r GrantPut) bool { return h.ep == r.Ep && h.client == r.Client }
 
 func holderID(r GrantPut) string { return r.Ep + "/" + r.Client + "@" + r.Origin }
 

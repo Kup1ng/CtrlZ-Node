@@ -51,6 +51,8 @@ type node struct {
 	strict bool
 	// dialer marks the string that names another outbound by its tag.
 	dialer bool
+	// noTrue refuses the value true of a boolean, with the reason.
+	noTrue string
 	// forceTrue lists boolean keys that the normal form always sets to true.
 	forceTrue []string
 }
@@ -91,6 +93,12 @@ func (n *node) refusing(key, why string) *node {
 		n.reject = map[string]string{}
 	}
 	n.reject[strings.ToLower(key)] = why
+	return n
+}
+
+// refusingTrue marks a boolean that the release always refuses when it is true.
+func (n *node) refusingTrue(why string) *node {
+	n.noTrue = why
 	return n
 }
 

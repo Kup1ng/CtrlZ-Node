@@ -98,9 +98,8 @@ func TestRepeatedKeysAreRefusedInAnyCase(t *testing.T) {
 		"top level":          `{"outbounds":[],"Outbounds":[]}`,
 		"in a free-form map": outboundWith(`,"streamSettings":{"wsSettings":{"headers":{"A":"1","A":"2"}}}`),
 	} {
-		_ = name
 		r := check(t, frag)
-		if len(r.Rejected) == 0 && name != "in a free-form map" {
+		if len(r.Rejected) == 0 {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -215,8 +214,8 @@ func TestUnknownKeyIsABlockingWarningUntilItsPathIsAccepted(t *testing.T) {
 	if r.OK() || len(r.Warnings) != 1 || r.Warnings[0].Path != "outbounds[0].streamSettings.newThing" || len(r.Rejected) != 0 {
 		t.Fatalf("warnings=%v rejected=%v", r.Warnings, r.Rejected)
 	}
-	if r.Normalized == nil {
-		t.Error("a fragment with a warning has no preview")
+	if r.Preview == nil || r.Normalized != nil {
+		t.Error("a fragment with a warning has a preview and no normal form to store")
 	}
 	// Another path accepts nothing, and the path must be exact (no prefix, no suffix).
 	for _, p := range []string{"outbounds[0].streamSettings", "outbounds[0].streamSettings.newThing.a", "outbounds[1].streamSettings.newThing", "outbounds[0].streamSettings.newthing"} {
@@ -460,13 +459,25 @@ func FuzzCheck(f *testing.F) {
 			}
 			return
 		}
-		again := Newest().Check(r.Normalized, strings.Split(accept, ","))
-		if len(again.Rejected) != 0 || !bytes.Equal(again.Normalized, r.Normalized) {
-			t.Fatalf("the normal form is not a fixed point:\n%s\n%s\n%v", r.Normalized, again.Normalized, again.Rejected)
+		// A fragment with a warning keeps its normal form in Preview only.
+		form := r.Normalized
+		if len(r.Warnings) != 0 {
+			if r.Normalized != nil {
+				t.Fatal("a fragment with a warning has a normal form to store")
+			}
+			form = r.Preview
+		}
+		again := Newest().Check(form, strings.Split(accept, ","))
+		againForm := again.Normalized
+		if len(again.Warnings) != 0 {
+			againForm = again.Preview
+		}
+		if len(again.Rejected) != 0 || !bytes.Equal(againForm, form) {
+			t.Fatalf("the normal form is not a fixed point:\n%s\n%s\n%v", form, againForm, again.Rejected)
 		}
 		for k := range globalRejected() {
-			if bytes.Contains(bytes.ToLower(r.Normalized), []byte(`"`+k+`":`)) {
-				t.Fatalf("an accepted fragment holds the key %s: %s", k, r.Normalized)
+			if bytes.Contains(bytes.ToLower(form), []byte(`"`+k+`":`)) {
+				t.Fatalf("an accepted fragment holds the key %s: %s", k, form)
 			}
 		}
 	})

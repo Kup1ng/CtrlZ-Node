@@ -36,12 +36,16 @@ func outbound() *node {
 
 // ---- protocols ------------------------------------------------------------------
 
+// vlessSettings leaves out testpre and testseed on purpose: testpre starts that many
+// pre-dial goroutines in the one Xray process every location of the node shares, and
+// none of them ends with the generation. They stop at a warning like any key the
+// table does not hold.
 func vlessSettings() *node {
 	user := obj(f("id", str()), f("flow", str()), f("encryption", str()), f("level", num()), f("email", str()),
-		f("seed", str()), f("testpre", num()), f("testseed", arr(num())))
+		f("seed", str()))
 	return obj(
 		f("address", str()), f("port", num()), f("level", num()), f("email", str()), f("id", str()),
-		f("flow", str()), f("seed", str()), f("encryption", str()), f("testpre", num()), f("testseed", arr(num())),
+		f("flow", str()), f("seed", str()), f("encryption", str()),
 		f("vnext", arr(obj(f("address", str()), f("port", num()), f("users", arr(user))))),
 	)
 }
@@ -172,7 +176,7 @@ func tlsSettings() *node {
 	cert := obj(f("certificate", strList()), f("key", strList()), f("usage", str()), f("ocspStapling", num()),
 		f("oneTimeLoading", boolean()), f("buildChain", boolean()))
 	return obj(
-		f("allowInsecure", boolean()), f("certificates", arr(cert)), f("serverName", str()), f("alpn", strList()),
+		f("allowInsecure", boolean().refusingTrue("the release refuses allowInsecure; pin the certificate with pinnedPeerCertSha256")), f("certificates", arr(cert)), f("serverName", str()), f("alpn", strList()),
 		f("enableSessionResumption", boolean()), f("disableSystemRoot", boolean()), f("minVersion", str()),
 		f("maxVersion", str()), f("cipherSuites", str()), f("fingerprint", str()), f("curvePreferences", strList()),
 		f("pinnedPeerCertSha256", str()), f("verifyPeerCertByName", str()), f("echConfigList", str()),
@@ -246,7 +250,7 @@ func sockopt() *node {
 		f("tcpFastOpen", anyScalar()), f("domainStrategy", str()), f("dialerProxy", dialerTag()),
 		f("tcpKeepAliveInterval", num()), f("tcpKeepAliveIdle", num()), f("tcpCongestion", str()),
 		f("tcpWindowClamp", num()), f("tcpMaxSeg", num()), f("penetrate", boolean()), f("tcpUserTimeout", num()),
-		f("v6only", boolean()), f("tcpMptcp", boolean()), f("addressPortStrategy", str()),
+		f("v6only", boolean()), f("tcpMptcp", boolean()),
 		f("happyEyeballs", obj(f("prioritizeIPv6", boolean()), f("tryDelayMs", num()), f("interleave", num()), f("maxConcurrentTry", num()))),
 		f("trustedXForwardedFor", arr(str())),
 	)

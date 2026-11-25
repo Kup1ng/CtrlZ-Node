@@ -45,8 +45,8 @@ func TestVLESS(t *testing.T) {
 	if note != "my node" || proto != "vless" {
 		t.Errorf("note %q protocol %q", note, proto)
 	}
-	got = norm(t, "vless://"+uuid+"@[2001:db8::1]:8443?type=ws&path=%2Fws&host=cdn.example.com&security=tls&sni=cdn.example.com&alpn=h2%2Chttp%2F1.1&fp=firefox&allowInsecure=1")
-	has(t, got, `"address":"2001:db8::1"`, `"method":"ws"`, `"path":"/ws"`, `"host":"cdn.example.com"`, `"alpn":["h2","http/1.1"]`, `"allowInsecure":true`, `"fingerprint":"firefox"`)
+	got = norm(t, "vless://"+uuid+"@[2001:db8::1]:8443?type=ws&path=%2Fws&host=cdn.example.com&security=tls&sni=cdn.example.com&alpn=h2%2Chttp%2F1.1&fp=firefox&allowInsecure=0")
+	has(t, got, `"address":"2001:db8::1"`, `"method":"ws"`, `"path":"/ws"`, `"host":"cdn.example.com"`, `"alpn":["h2","http/1.1"]`, `"fingerprint":"firefox"`)
 	got = norm(t, "vless://"+uuid+"@a.example:443?type=grpc&serviceName=svc&authority=a.example&mode=multi&security=tls&sni=a.example")
 	has(t, got, `"method":"grpc"`, `"serviceName":"svc"`, `"multiMode":true`)
 	got = norm(t, "vless://"+uuid+"@a.example:443?type=xhttp&path=%2Fx&mode=stream-up&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D&security=tls&sni=a.example")
@@ -109,8 +109,8 @@ func TestShadowsocks(t *testing.T) {
 }
 
 func TestHysteria2(t *testing.T) {
-	got := norm(t, "hysteria2://auth%3Apw@203.0.113.7:443?sni=h.example&insecure=1&obfs=salamander&obfs-password=op&pinSHA256=AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99#hy")
-	has(t, got, `"protocol":"hysteria"`, `"version":2`, `"auth":"auth:pw"`, `"allowInsecure":true`, `"serverName":"h.example"`,
+	got := norm(t, "hysteria2://auth%3Apw@203.0.113.7:443?sni=h.example&insecure=0&obfs=salamander&obfs-password=op&pinSHA256=AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99#hy")
+	has(t, got, `"protocol":"hysteria"`, `"version":2`, `"auth":"auth:pw"`, `"serverName":"h.example"`,
 		`"type":"salamander"`, `"password":"op"`, `"pinnedPeerCertSha256":"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"`, `"method":"hysteria"`)
 	norm(t, "hy2://tok@h.example:8443?sni=h.example")
 }

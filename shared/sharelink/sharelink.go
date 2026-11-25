@@ -43,7 +43,9 @@ type Candidate struct {
 	Note string
 	// Protocol is the protocol of the first outbound, lower case.
 	Protocol string
-	// Err is set instead of Fragment when the line could not be converted.
+	// Err is set instead of Fragment when the line could not be converted, or, for a
+	// candidate of JSON (Line 0), when the outbound with its dialerProxy chain is longer
+	// than a config may be.
 	Err *LineError
 }
 

@@ -217,6 +217,8 @@
       {"name": "safe-redir", "token": "www.google.com", "action": "redirect", "target": {"kind": "location", "location": 2}}
     ]},
     "opt-safe-rebind": {"options": {"safe_search": true, "restricted_youtube": true, "rebind": true}},
+    "opt-rebind-page": {"options": {"rebind": true, "block_response": {"mode": "branded", "page_hash": "1111111111111111111111111111111111111111111111111111111111111111"}}, "default": "bypass",
+      "rules": [{"name": "qb", "token": "bl.example", "action": "block"}]},
     "opt-safe-rebind-branded": {"options": {"safe_search": true, "rebind": true, "block_response": {"mode": "branded"}}},
     "opt-safe-dns64": {"options": {"safe_search": true, "restricted_youtube": true, "dns64": true}},
     "opt-safe-dns64-rebind": {"options": {"safe_search": true, "restricted_youtube": true, "dns64": true, "rebind": true}},
@@ -340,6 +342,7 @@
     "e-opt-safe": {"profile1": "opt-safe", "pair_locs": [1, 2, 3, 4]},
     "e-opt-safe-redir": {"profile1": "opt-safe-redir", "pair_locs": [1, 2, 3, 4]},
     "e-opt-safe-rebind": {"profile1": "opt-safe-rebind", "pair_locs": [1, 2, 3, 4]},
+    "e-opt-rebind-page": {"profile1": "opt-rebind-page", "pair_locs": [1, 2, 3, 4]},
     "e-opt-safe-rebind-branded": {"profile1": "opt-safe-rebind-branded", "pair_locs": [1, 2, 3, 4]},
     "e-opt-safe-dns64": {"profile1": "opt-safe-dns64", "pair_locs": [1, 2, 3, 4]},
     "e-opt-safe-dns64-rebind": {"profile1": "opt-safe-dns64-rebind", "pair_locs": [1, 2, 3, 4]},

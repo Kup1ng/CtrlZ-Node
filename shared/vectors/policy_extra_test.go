@@ -128,8 +128,8 @@ func TestPeerUnusable(t *testing.T) {
 	}
 	env.Self.ProxyIP = netip.Addr{}
 	f = policy.Decide(context.Background(), &in, st, &env, stubResolver{})
-	if f.Answer.RCode != policy.RCodeServFail || f.WantGrant {
-		t.Fatalf("no proxy address at all must fail loudly, not answer with nothing: %+v", f.Answer)
+	if f.Action != policy.ActionBypass || f.Flags&policy.FlagLocationUnavailable == 0 || f.WantGrant || f.Answer.RCode == policy.RCodeServFail {
+		t.Fatalf("no proxy address at all is Bypass with location_unavailable (4.4), not an error: %+v", f)
 	}
 }
 
@@ -219,8 +219,8 @@ func TestProxyIPOrder(t *testing.T) {
 		if got := strings.Join(proxyList(f), ","); got != strings.Join(c.want, ",") {
 			t.Errorf("%s: %v want %v", c.name, proxyList(f), c.want)
 		}
-		if len(c.want) == 0 && (f.WantGrant || f.Answer.RCode != policy.RCodeServFail) {
-			t.Errorf("%s: a redirect with no address must be SERVFAIL with no Grant: %+v", c.name, f.Answer)
+		if len(c.want) == 0 && (f.WantGrant || f.Action != policy.ActionBypass || f.Flags&policy.FlagLocationUnavailable == 0) {
+			t.Errorf("%s: a redirect with no address must be Bypass with location_unavailable and no Grant: %+v", c.name, f)
 		}
 	}
 }
@@ -291,5 +291,28 @@ func TestAcceptGrantReturnsTheReceiversFinal(t *testing.T) {
 	f, ok = policy.AcceptGrant(&in, fx.Endpoints["e-loc"].Base, &env, stubResolver{}, policy.GrantOffer{Kind: policy.GrantRedirect, Location: 2})
 	if ok || f.Action != policy.ActionBypass {
 		t.Errorf("a name that is no Redirect here: ok=%v action=%v", ok, f.Action)
+	}
+}
+
+// B1-r1-6: when the proxy is down and the peer is not usable, the LocationView has no
+// location, so every Redirect that goes to a proxy (a location, Auto, Random) is Bypass
+// with location_unavailable for every qtype. It must not depend on the order in which
+// the node reads the LocationView and the Env.
+func TestRedirectToAProxyIsBypassWhenNoProxyAddressIsUsable(t *testing.T) {
+	fx, env := baseEnv(t)
+	st := fx.Endpoints["e-loc"].Base
+	down := env
+	down.Self.ProxyDown, down.Self.PeerProxyUsable = true, false
+	for _, name := range []string{"loc.example", "auto.example", "rand.example"} {
+		for _, qt := range []uint16{policy.TypeA, policy.TypeAAAA, policy.TypeHTTPS} {
+			in := inputFor(name, qt, "e-loc")
+			if f := policy.Decide(context.Background(), &in, st, &env, stubResolver{}); f.Action != policy.ActionRedirect {
+				t.Fatalf("control %s/%d: %v", name, qt, f.Action)
+			}
+			f := policy.Decide(context.Background(), &in, st, &down, stubResolver{})
+			if f.Action != policy.ActionBypass || f.Flags&policy.FlagLocationUnavailable == 0 || f.WantGrant || f.Answer.RCode == policy.RCodeServFail {
+				t.Errorf("%s/%d with no usable proxy address: action %v flags %v rcode %d grant %v", name, qt, f.Action, f.Flags, f.Answer.RCode, f.WantGrant)
+			}
+		}
 	}
 }

@@ -373,6 +373,17 @@ func (ev *eval) completeRedirect(d decision, f Final, fetch func() *TrueAnswer) 
 	p := ev.st.Slots[d.slot-1]
 	tg := p.Target(d.target)
 	f.Target = tg.Kind
+	// A location, Auto or Random sends the client to a PROXY_IP. With none usable (the
+	// proxy is down and the peer is not usable) the LocationView has no location, so the
+	// whole name is Bypass with FlagLocationUnavailable, for every qtype (p4b-proxy 4.4).
+	// Checked before any pick, so a hysteresis state is never moved for an answer that
+	// cannot be given.
+	switch tg.Kind {
+	case TargetLocation, TargetAuto, TargetRandom:
+		if len(ev.proxyIPs()) == 0 {
+			return ev.unavailable(f)
+		}
+	}
 	in := SynthIn{Name: ev.in.Name, QType: ev.in.QType, Action: ActionRedirect, Eff: ev.eff, TargetKind: tg.Kind}
 
 	switch tg.Kind {

@@ -50,11 +50,19 @@ type Change struct {
 	Msg  string
 }
 
-// Result is what Check returns. Normalized is empty when Rejected is not. Warnings
-// are blocking: a fragment passes only when both lists are empty, and a warning goes
-// away only when its exact path is in accept_unknown, which turns it into a Change.
+// Result is what Check returns. Warnings are blocking: a fragment passes only when
+// both lists are empty, and a warning goes away only when its exact path is in
+// accept_unknown, which turns it into a Change.
+//
+// Normalized is the one text a caller may store or hand to Xray, and it is empty
+// unless OK(): a caller that writes whatever Normalized holds can never write a
+// fragment that still has an unaccepted unknown key. Preview is the same normal form
+// for display only, filled when nothing is rejected but warnings remain, so the panel
+// can show the admin what an accepted path would let through (p4b-proxy 7.3). Never
+// store it.
 type Result struct {
 	Normalized []byte
+	Preview    []byte
 	Diff       []Change
 	Warnings   []Issue
 	Rejected   []Issue
@@ -266,6 +274,10 @@ func (t Table) Check(fragment []byte, accept []string) Result {
 		res.Diff = nil
 		return res
 	}
+	if len(res.Warnings) != 0 {
+		res.Preview = encode(root)
+		return res
+	}
 	res.Normalized = encode(root)
 	return res
 }
@@ -318,6 +330,9 @@ func globalRejected() map[string]string {
 		"customsockopt":       "sets raw socket options",
 		"acceptproxyprotocol": "a server-side setting",
 		"proxysettings":       "removed from the release; dialerProxy replaces it",
+		"portmapping":         "asks the gateway of the host for a UPnP or NAT-PMP port",
+		"addressportstrategy": "makes the node resolve SRV or TXT records to choose an address or a port",
+		"debug":               "sets HYSTERIA_BBR_DEBUG and HYSTERIA_BRUTAL_DEBUG in the environment of the process",
 	}
 }
 
@@ -342,13 +357,15 @@ func (c *ctx) forbiddenKey(n *node, key string) (string, bool) {
 
 // badValue reports whether a string value, or one comma-separated part of it, starts
 // like a reference to a file, the geodata or the environment of the host: ext:,
-// geoip:, geosite: and env:. Xray reads env: in an address or a port list, and ext:
-// and the geo prefixes in every list of rules.
+// ext-site:, geoip:, geosite: and env:, after any number of "!". Xray reads env: in an
+// address or a port list, and ext: and the geo prefixes in every list of rules.
 func badValue(s string) bool {
 	for _, part := range strings.Split(s, ",") {
-		p := strings.ToLower(strings.TrimSpace(part))
-		p = strings.TrimPrefix(p, "!")
-		for _, pre := range []string{"ext:", "ext-ip:", "ext-domain:", "geoip:", "geosite:", "env:"} {
+		// Xray's rule parser strips every leading "!" (and maps geoip: and geosite: to
+		// ext:), so one trimmed "!" would let "!!ext:" through. Spaces are trimmed too,
+		// because a loader that trims them later must not see a different prefix.
+		p := strings.TrimLeft(strings.ToLower(strings.TrimSpace(part)), "! \t\r\n")
+		for _, pre := range []string{"ext:", "ext-ip:", "ext-domain:", "ext-site:", "geoip:", "geosite:", "env:"} {
 			if strings.HasPrefix(p, pre) {
 				return true
 			}
@@ -365,15 +382,57 @@ func (c *ctx) checkString(path, s string) bool {
 	return true
 }
 
+// rawRejected lists the keys that the table refuses at one node and that a subtree
+// without a node must refuse too, because the Go struct behind it (an xdns resolver
+// holds a tlsConfig and a quicConfig, realm a tlsConfig) reads them just the same.
+// dialerProxy is refused rather than rewritten: a link inside a subtree the table does
+// not know cannot join the chain check, so it could name another config's outbound.
+func rawRejected(key string) (string, bool) {
+	for _, r := range [][2]string{
+		{"dialerproxy", "a link in a subtree the table does not know escapes the chain check"},
+		{"isclient", "turns the client into a server"},
+		{"finalrules", "the node writes the final rules of every freedom outbound"},
+		{"ipsblocked", "the node writes the final rules of every freedom outbound"},
+		{"masquesettings", "the masque transport belongs to the masque outbound, which is not allowed"},
+	} {
+		if strings.EqualFold(key, r[0]) {
+			return r[1], true
+		}
+	}
+	return "", false
+}
+
+// repeatedKey finds a key that occurs twice in one object under Unicode simple
+// folding, the way Go's decoder would pair them (7.2: a repeated key is refused in
+// any case). The quadratic loop is bounded by maxMembers.
+func repeatedKey(ms []member) (string, bool) {
+	for i := range ms {
+		for j := i + 1; j < len(ms); j++ {
+			if strings.EqualFold(ms[i].key, ms[j].key) {
+				return ms[j].key, true
+			}
+		}
+	}
+	return "", false
+}
+
 // scanRaw judges a subtree the table has no node for: the keys and values that are
 // never allowed are refused in it too.
 func (c *ctx) scanRaw(v *val, path string) {
 	switch v.k {
 	case 'o':
+		if key, dup := repeatedKey(v.members); dup {
+			c.reject(path+"."+clip(key), "key given twice")
+			return
+		}
 		for _, m := range v.members {
 			p := path + "." + clip(m.key)
 			if why, bad := c.forbiddenKey(nil, m.key); bad {
 				c.reject(p, "key is never allowed: "+why)
+				continue
+			}
+			if why, bad := rawRejected(m.key); bad {
+				c.reject(p, "key is never allowed here: "+why)
 				continue
 			}
 			c.scanRaw(m.v, p)
@@ -452,6 +511,8 @@ func (c *ctx) walk(n *node, v *val, path string) {
 	case kBool:
 		if v.k != 'b' {
 			c.reject(path, "expected true or false")
+		} else if v.b && n.noTrue != "" {
+			c.reject(path, n.noTrue)
 		}
 	case kStrList:
 		switch v.k {
@@ -491,8 +552,16 @@ func (c *ctx) walk(n *node, v *val, path string) {
 			c.reject(path, "expected an object")
 			return
 		}
+		// Header names that differ in case are different keys of a Go map, but the
+		// same key twice would be dropped without a word.
+		seenKey := make(map[string]bool, len(v.members))
 		for _, m := range v.members {
 			p := path + "." + clip(m.key)
+			if seenKey[m.key] {
+				c.reject(p, "key given twice")
+				continue
+			}
+			seenKey[m.key] = true
 			switch m.v.k {
 			case 's':
 				c.checkString(p, m.v.s)
@@ -533,6 +602,17 @@ func (c *ctx) walk(n *node, v *val, path string) {
 	}
 }
 
+func repeatedUnknown(ms []*member) (string, bool) {
+	for i := range ms {
+		for j := i + 1; j < len(ms); j++ {
+			if strings.EqualFold(ms[i].key, ms[j].key) {
+				return ms[j].key, true
+			}
+		}
+	}
+	return "", false
+}
+
 type group struct {
 	canon string
 	child *node
@@ -555,6 +635,19 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 					selCanon = sn.resolve().enum[strings.ToLower(m.v.s)]
 				}
 			}
+		}
+	}
+	if n.sel != nil {
+		has := false
+		for _, m := range v.members {
+			if strings.EqualFold(m.key, n.selKey) {
+				has = true
+			}
+		}
+		if !has {
+			// Without it no table node judges the settings, and a misspelt key in them
+			// would never be shown as unknown.
+			c.reject(path+"."+n.selKey, "missing")
 		}
 	}
 	var groups []*group
@@ -625,10 +718,14 @@ func (c *ctx) walkObject(n *node, v *val, path string) {
 			g.items[1].m.dead = true
 		}
 	}
+	if key, dup := repeatedUnknown(unknown); dup {
+		c.reject(path+"."+clip(key), "key given twice")
+	}
 	for _, m := range unknown {
-		p := path + "." + m.key
-		if len(m.key) > 64 {
-			p = path + "." + clip(m.key)
+		p := path + "." + clip(m.key)
+		if why, bad := rawRejected(m.key); bad {
+			c.reject(p, "key is never allowed here: "+why)
+			continue
 		}
 		c.warn(p, "unknown key")
 		c.scanRaw(m.v, p)

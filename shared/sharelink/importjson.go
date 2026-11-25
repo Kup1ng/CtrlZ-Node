@@ -18,6 +18,11 @@ type ImportResult struct {
 	LeftOut    []string
 }
 
+// maxChain is the most outbounds one candidate may hold: the exit and seven hops. It
+// is xrayschema.MaxOutbounds, repeated here because this package judges nothing and
+// does not import the checker outside its tests, which assert the two are equal.
+const maxChain = 8
+
 // maxImportBytes is the largest pasted configuration. A real client configuration
 // with a routing table is a few hundred KiB; the route has its own body limit (12).
 const maxImportBytes = 384 << 10
@@ -89,10 +94,15 @@ func FromJSON(data []byte) (ImportResult, error) {
 		if named[i] {
 			continue
 		}
+		// Each candidate copies its whole chain, so without a bound a few hundred small
+		// outbounds that name one large outbound make megabytes out of a small paste.
+		if len(res.Candidates) >= MaxLinks {
+			return res, ErrTooMany
+		}
 		// Collect the chain: breadth first from i through dialerProxy, each outbound once.
 		chain := []int{i}
 		seen := map[int]bool{i: true}
-		for k := 0; k < len(chain); k++ {
+		for k := 0; k < len(chain) && len(chain) <= maxChain; k++ {
 			for _, d := range info[chain[k]].dialers {
 				if ts, ok := byTag[d]; ok && len(ts) == 1 && !seen[ts[0]] {
 					seen[ts[0]] = true
@@ -100,9 +110,19 @@ func FromJSON(data []byte) (ImportResult, error) {
 				}
 			}
 		}
-		raws := make([]json.RawMessage, len(chain))
-		for n, idx := range chain {
-			raws[n] = outs[idx]
+		size := 0
+		raws := make([]json.RawMessage, 0, len(chain))
+		for _, idx := range chain {
+			raws = append(raws, outs[idx])
+			size += len(outs[idx]) + 1
+		}
+		// A chain the checker would refuse anyway is not copied: the candidate carries
+		// the reason instead of its text, and the others of the paste stay usable.
+		if len(chain) > maxChain || size > maxFragmentBytes {
+			note := clipNote(info[i].tag)
+			res.Candidates = append(res.Candidates, Candidate{Note: note, Protocol: info[i].protocol,
+				Err: &LineError{Msg: "the outbound with the outbounds it reaches through dialerProxy is longer than a config may be"}})
+			continue
 		}
 		c, err := candidateOf(raws, 0)
 		if err != nil {
@@ -115,6 +135,64 @@ func FromJSON(data []byte) (ImportResult, error) {
 	}
 	sort.Strings(res.LeftOut)
 	return res, nil
+}
+
+// maxFragmentBytes is xrayschema.MaxFragmentBytes (D31), repeated here for the same
+// reason as maxChain.
+const maxFragmentBytes = 32 << 10
+
+// repeatsAKey reports whether any object of a JSON text gives one key twice, in the
+// exact spelling. Decoding into a Go map keeps the last one and says nothing, which
+// would drop a value the admin believes is in force (R14). A text that does not parse
+// reports false: the caller has already decoded it.
+func repeatsAKey(data []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dup, err := scanRepeat(dec)
+	return err == nil && dup
+}
+
+func scanRepeat(dec *json.Decoder) (bool, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return false, nil
+	}
+	dup := false
+	switch d {
+	case '{':
+		seen := map[string]bool{}
+		for dec.More() {
+			kt, err := dec.Token()
+			k, isStr := kt.(string)
+			if err != nil || !isStr {
+				return false, errors.New("not valid JSON")
+			}
+			if seen[k] {
+				dup = true
+			}
+			seen[k] = true
+			d2, err := scanRepeat(dec)
+			if err != nil {
+				return false, err
+			}
+			dup = dup || d2
+		}
+	case '[':
+		for dec.More() {
+			d2, err := scanRepeat(dec)
+			if err != nil {
+				return false, err
+			}
+			dup = dup || d2
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return false, err
+	}
+	return dup, nil
 }
 
 func candidateOf(raws []json.RawMessage, line int) (Candidate, error) {

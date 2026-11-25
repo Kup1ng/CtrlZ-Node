@@ -274,6 +274,9 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			if err := json.Unmarshal([]byte(e), &extra); err != nil || extra == nil {
 				return nil, errors.New("parameter \"extra\" is not a JSON object")
 			}
+			if repeatsAKey([]byte(e)) {
+				return nil, errors.New("parameter \"extra\" gives a key twice")
+			}
 			x["extra"] = extra
 		}
 		ss["xhttpSettings"] = x
@@ -312,7 +315,9 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 			return nil, err
 		}
 		if ins {
-			t["allowInsecure"] = true
+			// The pinned release refuses allowInsecure true whatever else is set, so a
+			// candidate that carries it could only fail at the node's -test.
+			return nil, errNoInsecure("allowinsecure", "pcs")
 		}
 		setIf(t, "pinnedPeerCertSha256", rd("pcs"))
 		setIf(t, "echConfigList", rd("ech"))
@@ -342,6 +347,22 @@ func stream(p *params, defaultSecurity string) (map[string]any, error) {
 		}
 	}
 	return ss, nil
+}
+
+// errNoInsecure names the parameter and the one that replaces it. The release refuses
+// tlsSettings.allowInsecure true for good, so the converter says so by name instead of
+// handing the checker a value it must refuse.
+func errNoInsecure(param, instead string) error {
+	return fmt.Errorf("parameter %q is refused: Xray no longer accepts it, pin the certificate with %q", param, instead)
+}
+
+// noPassword refuses the password part of the user info of a link whose scheme has
+// only an id there: "id:extra@host" would otherwise lose ":extra" without a word (R14).
+func noPassword(u *url.URL) error {
+	if _, has := u.User.Password(); has {
+		return errors.New("the user info has a password part, and the id of this scheme has none")
+	}
+	return nil
 }
 
 func setIf(m map[string]any, key, val string) {
@@ -384,6 +405,9 @@ func convertVLESS(rest string) (map[string]any, string, error) {
 	id := u.User.Username()
 	if id == "" || len(id) > 64 {
 		return nil, "", errors.New("the user id is empty or too long")
+	}
+	if err := noPassword(u); err != nil {
+		return nil, "", err
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
@@ -464,6 +488,9 @@ func convertVMess(rest string) (map[string]any, string, error) {
 	dec.UseNumber()
 	if err := dec.Decode(&j); err != nil || j == nil {
 		return nil, "", errors.New("the vmess link does not hold a JSON object")
+	}
+	if repeatsAKey(b) {
+		return nil, "", errors.New("the vmess JSON gives a field twice")
 	}
 	str := func(k string) (string, error) {
 		v, ok := j[k]
@@ -565,6 +592,9 @@ func convertVMessURI(rest string) (map[string]any, string, error) {
 	id := u.User.Username()
 	if id == "" || len(id) > 64 {
 		return nil, "", errors.New("the user id is empty or too long")
+	}
+	if err := noPassword(u); err != nil {
+		return nil, "", err
 	}
 	p, err := parseQuery(u.RawQuery)
 	if err != nil {
@@ -680,7 +710,7 @@ func convertHysteria2(rest string) (map[string]any, string, error) {
 	if ins, err := p.boolean("insecure"); err != nil {
 		return nil, "", err
 	} else if ins {
-		tls["allowInsecure"] = true
+		return nil, "", errNoInsecure("insecure", "pinsha256")
 	}
 	if pin := p.get("pinsha256"); pin != "" {
 		hex := strings.ToLower(strings.ReplaceAll(pin, ":", ""))
