@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Node
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Local index of the code graph
+.codegraph/
+
+# Local secrets and state
+.env
+.env.*
+!.env.example
+secrets/
+.claude/settings.local.json
