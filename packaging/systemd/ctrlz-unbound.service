@@ -1,0 +1,46 @@
+# The identified Unbound: serves the identified query path and the resolve check,
+# on 127.0.0.10:5300 (p4-nodes 7.3). The agent renders its config, starts and
+# supervises it, so this unit is not enabled and does not restart itself: the
+# agent restarts a dead one only when the start checks (core dumps, version floor,
+# pinned settings of the file on disk) hold again, and a Restart= here would skip
+# them. Output goes nowhere on purpose (SC 5.2a, no trace).
+[Unit]
+Description=Ctrl Z Unbound (identified)
+After=network.target
+ConditionPathExists=/etc/ctrlz/unbound/identified.conf
+
+[Service]
+Type=simple
+User=ctrlz-unbound
+Group=ctrlz-unbound
+ExecStart=/usr/sbin/unbound -d -c /etc/ctrlz/unbound/identified.conf
+Restart=no
+StandardOutput=null
+StandardError=null
+LimitCORE=0
+# The config puts the pid file and control.sock under /run/ctrlz-unbound (mode 0750,
+# so the agent, a member of this group, reaches the socket) and works in /var/lib/ctrlz-unbound.
+RuntimeDirectory=ctrlz-unbound
+RuntimeDirectoryMode=0750
+StateDirectory=ctrlz-unbound
+StateDirectoryMode=0750
+
+# Unbound reads the user and group it already has; no capability is needed.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0027
