@@ -1,0 +1,60 @@
+{
+  "version":  "1",
+  "expiresAt":  "4102444800",
+  "keys":  [
+    {
+      "keyId":  "z4K80DNRT8bHuYDTq2Eopw==",
+      "ed25519":  "pSq3UuvDgSP52NC17rjUs/KJaaOUNgeRNJKQHpAcErA="
+    },
+    {
+      "keyId":  "BMIYK96+yg85a9vbbuAH/A==",
+      "ed25519":  "fNUy4wMn2wmY13+xs2uMK+yPD8+pFSlBSGvOcBw5Woc="
+    },
+    {
+      "keyId":  "2M5vFBFNG7SnpUEgds7Ucw==",
+      "ed25519":  "ZlheJjNVKT+rGd7qvU+QJ8+3jM6e9wf1XbtsS0PCdus="
+    },
+    {
+      "keyId":  "5ghzlJuLKEhSCfN7nJNxPQ==",
+      "ed25519":  "IjeP3YNGUYyXhq5Go+zw5ikDCYjMDO8j7mCbBnm6xWM="
+    },
+    {
+      "keyId":  "LrfYp9AybNJRGqZ6DcsuIg==",
+      "ed25519":  "LrKeEqyFU8Zgr3Mvf+aSO9Uj0tpPSkzMMLl/usDFSZs="
+    }
+  ],
+  "threshold":  2,
+  "roles":  [
+    {
+      "role":  "ROLE_POLICY",
+      "keyIds":  [
+        "5ghzlJuLKEhSCfN7nJNxPQ=="
+      ],
+      "threshold":  1,
+      "expiresAt":  "4102444800"
+    },
+    {
+      "role":  "ROLE_CATALOG",
+      "keyIds":  [
+        "LrfYp9AybNJRGqZ6DcsuIg=="
+      ],
+      "threshold":  1,
+      "expiresAt":  "4102444800"
+    },
+    {
+      "role":  "ROLE_BUNDLE",
+      "keyIds":  [
+        "z4K80DNRT8bHuYDTq2Eopw==",
+        "BMIYK96+yg85a9vbbuAH/A==",
+        "2M5vFBFNG7SnpUEgds7Ucw=="
+      ],
+      "threshold":  2,
+      "expiresAt":  "4102444800"
+    }
+  ],
+  "rootKeyIds":  [
+    "z4K80DNRT8bHuYDTq2Eopw==",
+    "BMIYK96+yg85a9vbbuAH/A==",
+    "2M5vFBFNG7SnpUEgds7Ucw=="
+  ]
+}
