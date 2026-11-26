@@ -44,6 +44,11 @@ const DefaultDir = "/var/lib/ctrlz/bundles"
 // IdleTimeout is how long one FetchBundle stream may go without a chunk.
 const IdleTimeout = 30 * time.Second
 
+// MinRate is the slowest transfer, in bytes a second, that one file may take. A
+// hub that sends one byte every few seconds keeps the idle timer alive for ever, so
+// each file also has a whole-file deadline of Idle plus its size at this rate.
+const MinRate = 16 << 10
+
 // maxManifest bounds manifest.json, the one file whose size no manifest states.
 const maxManifest = 8 << 20
 
@@ -75,6 +80,8 @@ type Config struct {
 	Now func() int64
 	// Idle replaces IdleTimeout, for tests.
 	Idle time.Duration
+	// MinRate replaces the package MinRate, for tests.
+	MinRate int64
 }
 
 // Downloader downloads node bundles.
@@ -87,6 +94,9 @@ func New(cfg Config) *Downloader {
 	}
 	if cfg.Idle == 0 {
 		cfg.Idle = IdleTimeout
+	}
+	if cfg.MinRate <= 0 {
+		cfg.MinRate = MinRate
 	}
 	if cfg.Now == nil {
 		cfg.Now = func() int64 { return time.Now().Unix() }
@@ -214,7 +224,8 @@ func (d *Downloader) fetchTo(ctx context.Context, root *os.Root, version uint64,
 			return fmt.Errorf("bundledl: %w", err)
 		}
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	// The deadline bounds the whole file; the idle timer below only catches a stall.
+	ctx, cancel := context.WithTimeout(ctx, d.cfg.Idle+time.Duration(limit)*time.Second/time.Duration(d.cfg.MinRate))
 	defer cancel()
 	idle := time.AfterFunc(d.cfg.Idle, cancel)
 	defer idle.Stop()

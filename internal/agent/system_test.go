@@ -111,6 +111,13 @@ func TestSystemRefusals(t *testing.T) {
 			t.Error("an Unbound was started while core dumps were not ruled out")
 		}
 	})
+	t.Run("tcp_syncookies off", func(t *testing.T) {
+		// The agent must call the check: hostcheck's own test only covers the function.
+		l := systemLab(t)
+		l.files.Set("/proc/sys/net/ipv4/tcp_syncookies", "0\n")
+		l.start()
+		eventually(t, "the alert", func() bool { return l.alerts.Count(alert.SyncookiesOff) >= 1 })
+	})
 	t.Run("a pinned limit changed on disk", func(t *testing.T) {
 		l := systemLab(t)
 		l.files.Set("/etc/ctrlz/unbound/free.conf", "server:\n    ratelimit: 99999\n")

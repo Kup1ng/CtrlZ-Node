@@ -226,7 +226,7 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 			_, _ = io.Copy(io.Discard, c)
 			_ = c.Close()
 		}
-		if c, err := tls.DialWithDialer(e.dialer(2*time.Second), "tcp", e.addr(listen.DoT), e.tlsConf(unknownRID+"-"+canaryLabel+"."+testZone)); err == nil {
+		if c, err := tls.DialWithDialer(u.dialer(2*time.Second), "tcp", e.addr(listen.DoT), e.tlsConf(unknownRID+"-"+canaryLabel+"."+testZone)); err == nil {
 			_ = c.Close()
 		}
 		if c, err := u.dotConn(sniB); err == nil {

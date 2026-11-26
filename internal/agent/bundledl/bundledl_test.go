@@ -39,6 +39,9 @@ type fakeHub struct {
 	stall string
 	// empties makes the stream of this name send empty chunks for ever.
 	empties string
+	// trickle makes the stream of this name send one byte at a time, this far apart.
+	trickle     string
+	trickleStep time.Duration
 	// listed is the manifest's index: like the real hub, a name outside it is not
 	// found, with manifest.json the one stated exception (see the note on the real
 	// hub in the commit: its gRPC door does not serve it yet).
@@ -62,7 +65,7 @@ func (h *fakeHub) FetchBundle(ctx context.Context, in *hubv1.FetchBundleRequest,
 	if h.tamper != nil {
 		b = h.tamper(in.Path, b)
 	}
-	return &stream{ctx: ctx, b: b, stall: h.stall == in.Path, empties: h.empties == in.Path}, nil
+	return &stream{ctx: ctx, b: b, stall: h.stall == in.Path, empties: h.empties == in.Path, trickle: h.trickle == in.Path, step: h.trickleStep}, nil
 }
 
 func (h *fakeHub) requests() []string {
@@ -80,6 +83,9 @@ type stream struct {
 	done  bool
 	// empties sends a chunk with no data at the current offset, again and again.
 	empties bool
+	// trickle sends one byte per step, so that every chunk is progress.
+	trickle bool
+	step    time.Duration
 }
 
 func (s *stream) Recv() (*hubv1.BlobChunk, error) {
@@ -94,6 +100,14 @@ func (s *stream) Recv() (*hubv1.BlobChunk, error) {
 		return &hubv1.BlobChunk{Offset: uint64(s.off)}, nil
 	}
 	n := min(len(s.b)-s.off, 7) // a small chunk, so a file takes several
+	if s.trickle {
+		n = 1
+		select {
+		case <-time.After(s.step):
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
 	ch := &hubv1.BlobChunk{Offset: uint64(s.off), Data: s.b[s.off : s.off+n]}
 	s.off += n
 	if s.off == len(s.b) {
@@ -332,6 +346,11 @@ func TestRefusesWhatDoesNotVerify(t *testing.T) {
 		"rollback": {func(r *rig) {
 			r.dl = New(Config{Hub: r.cfg().Hub, Root: r.cfg().Root, Dir: r.dir, Installed: func() uint64 { return 9 }})
 		}, "lower than the highest"},
+		"one byte at a time, each inside the idle time": {func(r *rig) {
+			r.hub.trickle, r.hub.trickleStep = "bin/ctrlz-node", 100*time.Millisecond
+			// A fast floor rate leaves the file Idle plus a few ms: its bytes would take longer.
+			r.dl = New(Config{Hub: r.cfg().Hub, Root: r.cfg().Root, Dir: r.dir, Idle: 300 * time.Millisecond, MinRate: 1 << 30})
+		}, "transfer broke"},
 		"stalled stream": {func(r *rig) { r.hub.stall = "bin/ctrlz-verify" }, "transfer broke"},
 	}
 	for name, c := range cases {
