@@ -58,7 +58,11 @@ const (
 func attempt(f func()) { f() }
 
 func (e *e2e) rawConn(network string, tr listen.Transport) (net.Conn, error) {
-	return (&net.Dialer{Timeout: 2 * time.Second}).Dial(network, e.addr(tr))
+	d := e.dialer(2 * time.Second)
+	if network == "udp" && e.src != "" {
+		d.LocalAddr = &net.UDPAddr{IP: net.ParseIP(e.src)}
+	}
+	return d.Dial(network, e.addr(tr))
 }
 
 // rawDoH sends one HTTP request with a body the test chooses.
@@ -105,6 +109,14 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 	zones := []names.Name{names.MustString(testZone)}
 	e.h.SetSettings(NewSettings(zones, e.settings.panel, e.settings.selfIP, proof, false))
 
+	// u dials from the source of queries that identify no one, on every transport.
+	u := e.from(canarySrc)
+
+	// The free path, so an unidentified name is looked up, cached, rate-limited and
+	// counted: the place a trace of it is likeliest. The response limit is small, so
+	// a burst of misses ends in the limited answers too.
+	free := newRig(t, e.world, func(c *FreeConfig) { c.ResponseRate, c.ResponseBurst = 1, 1500 })
+
 	sinks := testsink.Start(t)
 	sinks.Control(t) // the sinks work: without this a test that captured nothing would pass for ever
 
@@ -124,9 +136,9 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 	attempt(func() { _, _ = e.udp("127.0.0.2", q("n7-ident-udp.canary-net.example", dns.TypeA)) })
 	attempt(func() { _, _ = e.tcp(canarySrc, q(name("tcp"), dns.TypeA)) })
 	attempt(func() { _, _ = e.tcp("127.0.0.2", q("n7-ident-tcp.canary-net.example", dns.TypeA)) })
-	attempt(func() { _, _ = e.dot(unidSNI, q(name("dot"), dns.TypeA)) })
+	attempt(func() { _, _ = u.dot(unidSNI, q(name("dot"), dns.TypeA)) })
 	attempt(func() { _, _ = e.dot(sniB, q("n7-ident-dot.canary-net.example", dns.TypeA)) })
-	attempt(func() { _, _ = e.doq(unidSNI, q(name("doq"), dns.TypeA)) })
+	attempt(func() { _, _ = u.doq(unidSNI, q(name("doq"), dns.TypeA)) })
 	attempt(func() { _, _ = e.doq(sniB, q("n7-ident-doq.canary-net.example", dns.TypeA)) })
 	for _, c := range []struct {
 		tag string
@@ -136,8 +148,27 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 		un, id := dohB, dohB
 		un.t, un.h2, un.path, un.authority = c.tr, c.h2, "/", testZone // no token: names nobody
 		id.t, id.h2 = c.tr, c.h2
-		attempt(func() { _, _, _, _ = e.doh(un, q(name(c.tag), dns.TypeA)) })
+		attempt(func() { _, _, _, _ = u.doh(un, q(name(c.tag), dns.TypeA)) })
 		attempt(func() { _, _, _, _ = e.doh(id, q("n7-ident-"+c.tag+".canary-net.example", dns.TypeA)) })
+	}
+
+	// 1b. The free path with those names: a miss, the same name again (a hit of the
+	// Free segment) and a burst from one source until the response limit refuses.
+	hit := name("free-hit")
+	attempt(func() { _, _ = e.udpCookie(canarySrc, q(hit, dns.TypeA)) })
+	attempt(func() { _, _ = e.udpCookie(canarySrc, q(hit, dns.TypeA)) })
+	for i := 0; i < 60; i++ {
+		n := name(fmt.Sprintf("free-burst-%d", i))
+		// Plain UDP, which the response limit of point 3 judges; every third one over TCP.
+		if i%3 == 2 {
+			attempt(func() { _, _ = e.tcp(canarySrc, q(n, dns.TypeA)) })
+		} else {
+			attempt(func() { _, _ = e.udp(canarySrc, q(n, dns.TypeA)) })
+		}
+	}
+	if free.n(oAnswered) == 0 || free.n(oRate) == 0 || free.back.total.Load() == 0 {
+		t.Fatalf("the free path was not exercised: answered %d, rate limited %d, looked up %d",
+			free.n(oAnswered), free.n(oRate), free.back.total.Load())
 	}
 
 	// 2. A handler that panics, with each of those shapes of request.
@@ -148,23 +179,25 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 	}
 	attempt(func() { _, _ = e.udp(canarySrc, pn("udp")) })
 	attempt(func() { _, _ = e.tcp(canarySrc, pn("tcp")) })
-	attempt(func() { _, _ = e.dot(unidSNI, pn("dot")) })
-	attempt(func() { _, _ = e.dot(sniB, pn("dot-id")) })
-	attempt(func() { _, _ = e.doq(unidSNI, pn("doq")) })
-	attempt(func() { _, _ = e.doq(sniB, pn("doq-id")) })
+	attempt(func() { _, _ = u.dot(unidSNI, pn("dot")) })
+	attempt(func() { _, _ = u.dot(sniB, pn("dot-id")) })
+	attempt(func() { _, _ = u.doq(unidSNI, pn("doq")) })
+	attempt(func() { _, _ = u.doq(sniB, pn("doq-id")) })
 	for _, c := range []struct {
 		tr listen.Transport
 		h2 bool
 	}{{listen.DoH, true}, {listen.DoH, false}, {listen.DoH3, true}} {
 		id := dohB
 		id.t, id.h2 = c.tr, c.h2
-		attempt(func() { _, _, _, _ = e.doh(id, pn("doh-id")) })
+		attempt(func() { _, _, _, _ = u.doh(id, pn("doh-id")) })
 	}
 
 	// 3. Malformed requests. Each carries a canary where a name or a token would be.
+	// From here every request is a malformed one, so it comes from the source that no
+	// log of a peer address may hold, on the handshake errors too.
 	packed, _ := q(name("cut"), dns.TypeA).Pack()
 	attempt(func() { // UDP: a datagram cut in the middle of the name, a short header, a response
-		if c, err := e.rawConn("udp", listen.UDP); err == nil {
+		if c, err := u.rawConn("udp", listen.UDP); err == nil {
 			_, _ = c.Write(packed[:len(packed)-6])
 			_, _ = c.Write([]byte{1, 2, 3})
 			resp := q(name("qr"), dns.TypeA)
@@ -175,11 +208,11 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 		}
 	})
 	attempt(func() { // TCP: a length that promises more than comes, then a close; then garbage
-		if c, err := e.rawConn("tcp", listen.TCP); err == nil {
+		if c, err := u.rawConn("tcp", listen.TCP); err == nil {
 			_, _ = c.Write(append([]byte{byte(len(packed) >> 8), byte(len(packed))}, packed[:len(packed)/2]...))
 			_ = c.Close()
 		}
-		if c, err := e.rawConn("tcp", listen.TCP); err == nil {
+		if c, err := u.rawConn("tcp", listen.TCP); err == nil {
 			_, _ = c.Write([]byte("GET /" + idTok + " HTTP/1.1\r\nHost: " + canarySrc + "\r\n\r\n"))
 			_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 			_, _ = io.Copy(io.Discard, c)
@@ -187,16 +220,16 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 		}
 	})
 	attempt(func() { // DoT: plaintext on the TLS port, an unknown rid, a bad ALPN, garbage inside TLS
-		if c, err := e.rawConn("tcp", listen.DoT); err == nil {
+		if c, err := u.rawConn("tcp", listen.DoT); err == nil {
 			_, _ = c.Write([]byte("GET /" + idTok + " HTTP/1.1\r\nHost: " + idRID + "." + testZone + "\r\n\r\n"))
 			_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 			_, _ = io.Copy(io.Discard, c)
 			_ = c.Close()
 		}
-		if c, err := tls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", e.addr(listen.DoT), e.tlsConf(unknownRID+"-"+canaryLabel+"."+testZone)); err == nil {
+		if c, err := tls.DialWithDialer(e.dialer(2*time.Second), "tcp", e.addr(listen.DoT), e.tlsConf(unknownRID+"-"+canaryLabel+"."+testZone)); err == nil {
 			_ = c.Close()
 		}
-		if c, err := e.dotConn(sniB); err == nil {
+		if c, err := u.dotConn(sniB); err == nil {
 			_, _ = c.Write([]byte{0, 9, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5})
 			_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 			_, _ = io.Copy(io.Discard, c)
@@ -206,13 +239,13 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 	attempt(func() { // DoQ: an unknown rid, a bad ALPN, garbage on a stream
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if cn, err := quic.DialAddr(ctx, e.addr(listen.DoQ), e.tlsConf(unknownRID+"."+testZone, "doq"), &quic.Config{}); err == nil {
+		if cn, err := u.dialQUIC(ctx, e.addr(listen.DoQ), e.tlsConf(unknownRID+"."+testZone, "doq"), &quic.Config{}); err == nil {
 			cn.CloseWithError(0, "")
 		}
-		if cn, err := quic.DialAddr(ctx, e.addr(listen.DoQ), e.tlsConf(sniB, "n7-canary-alpn"), &quic.Config{}); err == nil {
+		if cn, err := u.dialQUIC(ctx, e.addr(listen.DoQ), e.tlsConf(sniB, "n7-canary-alpn"), &quic.Config{}); err == nil {
 			cn.CloseWithError(0, "")
 		}
-		if cn, err := e.doqConn(sniB); err == nil {
+		if cn, err := u.doqConn(sniB); err == nil {
 			if st, err := cn.OpenStreamSync(ctx); err == nil {
 				_, _ = st.Write([]byte{0, 40, 1, 2, 3})
 				_ = st.Close()
@@ -226,12 +259,12 @@ func TestN7NoTraceOfCanariesOnEveryTransport(t *testing.T) {
 		h2 bool
 	}{{listen.DoH, true}, {listen.DoH, false}, {listen.DoH3, true}} {
 		x := "x." + testZone
-		e.rawDoH(c.tr, c.h2, x, "POST", "/"+idTok, idRID+"."+testZone, "application/dns-message", []byte{1, 2, 3, 4})
-		e.rawDoH(c.tr, c.h2, x, "POST", "/"+idTok, idRID+"."+testZone, "text/plain", packed)
-		e.rawDoH(c.tr, c.h2, x, "GET", "/"+idTok+"?dns=!!"+canaryLabel, idRID+"."+testZone, "", nil)
-		e.rawDoH(c.tr, c.h2, x, "POST", "/"+unknownTok, unknownRID+"."+testZone, "application/dns-message", packed)
-		e.rawDoH(c.tr, c.h2, unknownRID+"."+testZone, "POST", "/"+idTok, "", "application/dns-message", packed)
-		e.rawDoH(c.tr, c.h2, x, "DELETE", "/"+idTok+"/"+canaryLabel, testZone, "", nil)
+		u.rawDoH(c.tr, c.h2, x, "POST", "/"+idTok, idRID+"."+testZone, "application/dns-message", []byte{1, 2, 3, 4})
+		u.rawDoH(c.tr, c.h2, x, "POST", "/"+idTok, idRID+"."+testZone, "text/plain", packed)
+		u.rawDoH(c.tr, c.h2, x, "GET", "/"+idTok+"?dns=!!"+canaryLabel, idRID+"."+testZone, "", nil)
+		u.rawDoH(c.tr, c.h2, x, "POST", "/"+unknownTok, unknownRID+"."+testZone, "application/dns-message", packed)
+		u.rawDoH(c.tr, c.h2, unknownRID+"."+testZone, "POST", "/"+idTok, "", "application/dns-message", packed)
+		u.rawDoH(c.tr, c.h2, x, "DELETE", "/"+idTok+"/"+canaryLabel, testZone, "", nil)
 	}
 	// The proof key's own route.
 	attempt(func() {

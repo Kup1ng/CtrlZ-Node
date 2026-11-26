@@ -125,6 +125,7 @@ func newLab(t *testing.T, opts ...labOpt) *lab {
 	l := &lab{t: t, dir: t.TempDir(), hub: fakehub.New(), keys: storetest.NewKeys(t), runner: &fake.Runner{}, alerts: &alert.Memory{}}
 	l.files = fake.NewFiles(map[string]string{
 		"/proc/sys/net/ipv4/ip_local_port_range":   "32768 39999\n",
+		"/proc/sys/net/ipv4/tcp_syncookies":        "1\n",
 		"/proc/self/limits":                        "Max core file size 0 0 bytes\n",
 		"/proc/sys/kernel/core_pattern":            "|/lib/systemd/systemd-coredump %P\n",
 		"/etc/systemd/coredump.conf.d/ctrlz.conf":  "[Coredump]\nStorage=none\nProcessSizeMax=0\n",

@@ -100,6 +100,9 @@ func e2eCert(t testing.TB) (tls.Certificate, *x509.CertPool) {
 
 type e2e struct {
 	*world
+	// src, when set, is the local address every client of this e2e dials from, so a
+	// test can tell the node's reading of a source on every transport (see from).
+	src   string
 	srv   *listen.Server
 	ports listen.Ports
 	pool  *x509.CertPool
@@ -162,6 +165,46 @@ func (e *e2e) addr(t listen.Transport) string {
 		p = e.ports.HTTPS
 	}
 	return fmt.Sprintf("127.0.0.1:%d", p)
+}
+
+// from is e with every client dialing from the loopback address src, on every
+// transport: the N7 test needs an address that no log of a peer may hold.
+func (e *e2e) from(src string) *e2e {
+	c := *e
+	c.src = src
+	return &c
+}
+
+// dialer is a TCP dialer from e.src, or from the default address.
+func (e *e2e) dialer(timeout time.Duration) *net.Dialer {
+	d := &net.Dialer{Timeout: timeout}
+	if e.src != "" {
+		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(e.src)}
+	}
+	return d
+}
+
+// dialQUIC is quic.DialAddr from e.src when it is set. The socket is closed with
+// the connection.
+func (e *e2e) dialQUIC(ctx context.Context, addr string, tc *tls.Config, qc *quic.Config) (*quic.Conn, error) {
+	if e.src == "" {
+		return quic.DialAddr(ctx, addr, tc, qc)
+	}
+	ra, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(e.src)})
+	if err != nil {
+		return nil, err
+	}
+	c, err := quic.Dial(ctx, pc, ra, tc, qc)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	go func() { <-c.Context().Done(); _ = pc.Close() }()
+	return c, nil
 }
 
 func (e *e2e) tlsConf(sni string, alpn ...string) *tls.Config {
@@ -232,7 +275,7 @@ func (e *e2e) tcp(src string, m *dns.Msg) (*dns.Msg, error) {
 }
 
 func (e *e2e) dotConn(sni string) (*tls.Conn, error) {
-	return tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", e.addr(listen.DoT), e.tlsConf(sni))
+	return tls.DialWithDialer(e.dialer(3*time.Second), "tcp", e.addr(listen.DoT), e.tlsConf(sni))
 }
 
 func (e *e2e) dot(sni string, m *dns.Msg) (*dns.Msg, error) {
@@ -247,7 +290,7 @@ func (e *e2e) dot(sni string, m *dns.Msg) (*dns.Msg, error) {
 func (e *e2e) doqConn(sni string) (*quic.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	return quic.DialAddr(ctx, e.addr(listen.DoQ), e.tlsConf(sni, "doq"), &quic.Config{MaxIdleTimeout: 20 * time.Second})
+	return e.dialQUIC(ctx, e.addr(listen.DoQ), e.tlsConf(sni, "doq"), &quic.Config{MaxIdleTimeout: 20 * time.Second})
 }
 
 func (e *e2e) doq(sni string, m *dns.Msg) (*dns.Msg, error) {
@@ -284,9 +327,18 @@ func (e *e2e) httpClient(t listen.Transport, sni string, h2 bool) (*http.Client,
 	switch t {
 	case listen.DoH3:
 		tr := &http3.Transport{TLSClientConfig: e.tlsConf(sni, "h3"), QUICConfig: &quic.Config{}}
+		if e.src != "" {
+			tr.Dial = func(ctx context.Context, addr string, tc *tls.Config, qc *quic.Config) (*quic.Conn, error) {
+				return e.dialQUIC(ctx, addr, tc, qc)
+			}
+		}
 		return &http.Client{Transport: tr, Timeout: 8 * time.Second}, func() { _ = tr.Close() }
 	}
 	tr := &http.Transport{DisableKeepAlives: true}
+	if e.src != "" {
+		d := e.dialer(0)
+		tr.DialContext = d.DialContext
+	}
 	if h2 {
 		tr.TLSClientConfig = e.tlsConf(sni, "h2", "http/1.1")
 		tr.ForceAttemptHTTP2 = true

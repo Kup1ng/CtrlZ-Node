@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
@@ -36,6 +37,12 @@ type fakeHub struct {
 	tamper func(name string, b []byte) []byte
 	// stall makes the stream of this name send nothing.
 	stall string
+	// empties makes the stream of this name send empty chunks for ever.
+	empties string
+	// listed is the manifest's index: like the real hub, a name outside it is not
+	// found, with manifest.json the one stated exception (see the note on the real
+	// hub in the commit: its gRPC door does not serve it yet).
+	listed map[string]bool
 }
 
 func (h *fakeHub) FetchBundle(ctx context.Context, in *hubv1.FetchBundleRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[hubv1.BlobChunk], error) {
@@ -45,6 +52,9 @@ func (h *fakeHub) FetchBundle(ctx context.Context, in *hubv1.FetchBundleRequest,
 	if in.Kind != signv1.Kind_KIND_NODE {
 		return nil, errors.New("not found")
 	}
+	if in.Path != bundle.ManifestFile && !h.listed[in.Path] {
+		return nil, errors.New("not found")
+	}
 	b, err := os.ReadFile(filepath.Join(h.dir, filepath.FromSlash(in.Path)))
 	if err != nil {
 		return nil, errors.New("not found")
@@ -52,7 +62,7 @@ func (h *fakeHub) FetchBundle(ctx context.Context, in *hubv1.FetchBundleRequest,
 	if h.tamper != nil {
 		b = h.tamper(in.Path, b)
 	}
-	return &stream{ctx: ctx, b: b, stall: h.stall == in.Path}, nil
+	return &stream{ctx: ctx, b: b, stall: h.stall == in.Path, empties: h.empties == in.Path}, nil
 }
 
 func (h *fakeHub) requests() []string {
@@ -68,6 +78,8 @@ type stream struct {
 	off   int
 	stall bool
 	done  bool
+	// empties sends a chunk with no data at the current offset, again and again.
+	empties bool
 }
 
 func (s *stream) Recv() (*hubv1.BlobChunk, error) {
@@ -77,6 +89,9 @@ func (s *stream) Recv() (*hubv1.BlobChunk, error) {
 	}
 	if s.done {
 		return nil, io.EOF
+	}
+	if s.empties {
+		return &hubv1.BlobChunk{Offset: uint64(s.off)}, nil
 	}
 	n := min(len(s.b)-s.off, 7) // a small chunk, so a file takes several
 	ch := &hubv1.BlobChunk{Offset: uint64(s.off), Data: s.b[s.off : s.off+n]}
@@ -154,7 +169,7 @@ func newRig(t *testing.T, version uint64) *rig {
 		t.Fatal(err)
 	}
 
-	rg := &rig{hub: &fakeHub{dir: out}, root: r, dir: filepath.Join(t.TempDir(), "bundles"), man: m}
+	rg := &rig{hub: &fakeHub{dir: out, listed: listedOf(m)}, root: r, dir: filepath.Join(t.TempDir(), "bundles"), man: m}
 	rg.dl = New(rg.cfg())
 	return rg
 }
@@ -290,11 +305,27 @@ func TestRefusesWhatDoesNotVerify(t *testing.T) {
 		"tampered manifest": {func(r *rig) {
 			r.hub.tamper = func(n string, b []byte) []byte {
 				if n == bundle.ManifestFile {
-					return []byte(strings.Replace(string(b), "\"payload\": \"", "\"payload\": \"AA", 1))
+					// Decode and re-encode rather than edit the text: protojson's
+					// spacing differs between builds, so a text replace matched
+					// on one host and silently changed nothing on another.
+					e := &signv1.Envelope{}
+					if err := protojson.Unmarshal(b, e); err != nil {
+						t.Fatal(err)
+					}
+					e.Payload = append([]byte{0}, e.Payload...)
+					out, err := bundle.MarshalEnvelope(e)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(out) == string(b) {
+						t.Fatal("the tamper changed nothing")
+					}
+					return out
 				}
 				return b
 			}
 		}, "manifest"},
+		"empty chunks for ever": {func(r *rig) { r.hub.empties = "bin/ctrlz-verify" }, "empty chunk"},
 		"unsigned manifest": {func(r *rig) {
 			r.root.Roles[0].Threshold = 3
 		}, "not signed by the root"},
@@ -336,4 +367,12 @@ func TestVersionZeroIsRefused(t *testing.T) {
 	if _, err := r.dl.Download(context.Background(), 0); err == nil {
 		t.Fatal("version 0 accepted")
 	}
+}
+
+func listedOf(m *signv1.Manifest) map[string]bool {
+	out := map[string]bool{}
+	for _, f := range m.Files {
+		out[f.Path] = true
+	}
+	return out
 }

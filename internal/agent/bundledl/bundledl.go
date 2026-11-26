@@ -237,10 +237,15 @@ func (d *Downloader) fetchTo(ctx context.Context, root *os.Root, version uint64,
 		if err != nil {
 			return fmt.Errorf("bundledl: the transfer broke: %w", err)
 		}
-		idle.Reset(d.cfg.Idle)
 		if int64(ch.Offset) != off {
 			return errors.New("bundledl: a chunk at an unexpected offset")
 		}
+		// Only data counts as progress: a hub that sends empty chunks forever must
+		// not keep the idle timer alive, so an empty chunk that ends nothing is refused.
+		if len(ch.Data) == 0 && !ch.Last {
+			return errors.New("bundledl: an empty chunk that is not the last")
+		}
+		idle.Reset(d.cfg.Idle)
 		if off+int64(len(ch.Data)) > limit {
 			return ErrTooBig
 		}

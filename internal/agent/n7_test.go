@@ -91,8 +91,11 @@ func (l *lab) n7Bundle(zone string, sealTo *ecdsa.PublicKey) (*hubv1.HubMessage,
 // forms is a secret in the shapes it can leak in: raw, hex, and the front of its
 // base64 (a PEM body wraps at 64 columns, so only that much is contiguous).
 func forms(b []byte) [][]byte {
+	// Each encoding is cut by its own length: the padded standard form of a
+	// 32-byte key is longer than its raw URL form, so sharing one length panics.
 	b64 := base64.StdEncoding.EncodeToString(b)
-	return [][]byte{b, []byte(hex.EncodeToString(b)), []byte(b64[:min(len(b64), 48)]), []byte(base64.RawURLEncoding.EncodeToString(b)[:min(len(b64), 48)])}
+	raw := base64.RawURLEncoding.EncodeToString(b)
+	return [][]byte{b, []byte(hex.EncodeToString(b)), []byte(b64[:min(len(b64), 48)]), []byte(raw[:min(len(raw), 48)])}
 }
 
 func TestN7AgentErrorPathsLeaveNoCanary(t *testing.T) {
