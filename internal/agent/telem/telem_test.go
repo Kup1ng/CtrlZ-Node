@@ -454,9 +454,13 @@ func TestActivityIdleAdmittedLabelsFreeTheirPlaces(t *testing.T) {
 	if got := labels(b, 2); !got["c"] {
 		t.Fatalf("endpoint 2 still holds the idle labels: %v", got)
 	}
-	// "a" of endpoint 1 was sent 12 hours ago, "b" 25: "c" takes b's place, "d" has none.
-	if got := labels(b, 1); !got["c"] || got["d"] {
-		t.Fatalf("endpoint 1 after the idle time: %v", got)
+	// "a" of endpoint 1 was sent 12 hours ago and still holds its place, "b" was idle for
+	// 24 hours and let go: one place is free for "c" and "d". Which of the two gets it
+	// depends on the order Flush walks the pending map, which is random, so the test holds
+	// the node to what it promises: exactly one of them, never both (the cap) and never
+	// neither (the idle label's place was freed).
+	if got := labels(b, 1); got["c"] == got["d"] {
+		t.Fatalf("endpoint 1 after the idle time: want exactly one of c and d, got %v", got)
 	}
 }
 
