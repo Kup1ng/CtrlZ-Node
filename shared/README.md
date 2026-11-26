@@ -40,7 +40,7 @@ or two paths that differ only by case is an error.
 | `sysnames` | System-names table; `Entry.Wildcard` says a row matched a name it does not list itself |
 | `locations` | Allowed and effective location sets, Auto and Random helpers |
 | `netclass` | Address classes for Rebind and the Sanity Gate, and the lab-build constant `AllowPrivatePairAddrs` (two files behind the `ctrlz_lab` tag) |
-| `zone` | Endpoint hostname target and name servers, `Build`, the failover decision table as data (`Rows`, `Inputs`), the evaluator that runs it, the probe state machine, the flap, drain and `PeerDown` rules (contract 8a) |
+| `zone` | Endpoint hostname target and name servers, `Build`, the failover decision table as data (`Rows`, `Inputs`), the evaluator that runs it (`Unmet` and `TimerDue` say what keeps a node out of F3, for the admin page), the probe state machine, the flap, drain and `PeerDown` rules (contract 8a) |
 | `route` | Hybrid resolver rule schema and matcher |
 | `reason` | Failure codes shared by every decoder |
 | `wire` | Protobuf validators (pair table, push, peer view, free counters, activity), `ZoneInput`, entry hash chain, `DecodeEntry` |

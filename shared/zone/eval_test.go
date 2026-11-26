@@ -282,3 +282,62 @@ func TestRdNeedsAListedPath(t *testing.T) {
 		t.Fatal("rd holds for a Heartbeat that lists no resolve path")
 	}
 }
+
+func unmetPreds(cs []Cond) []Pred {
+	var out []Pred
+	for _, c := range cs {
+		out = append(out, c.Pred)
+	}
+	return out
+}
+
+// Unmet names, in the row's order, the F3 conditions that keep a withdrawn node out, and TimerDue appears only once all of them
+// hold: the page's "conditions unmet" and "time left" read exactly these (T-542).
+func TestUnmetNamesWhatKeepsAWithdrawnNodeOut(t *testing.T) {
+	tb := tbl(t, nil, bp('p', 'A', 'B'))
+	t0 := time.Unix(1_000_000, 0)
+	e := newEval(t, t0, tb, tb, map[NodeID]Columns{nid('A'): {Withdrawn: true}})
+	now := t0.Add(60 * time.Second)
+	a, b := nid('A'), nid('B')
+
+	if got := unmetPreds(e.Unmet(now, F3, a)); len(got) != 2 || got[0] != PredFit || got[1] != PredViewUp {
+		t.Fatalf("nothing is known of A: %v", got)
+	}
+	if _, ok := e.TimerDue(now, F3, a); ok {
+		t.Fatal("a timer runs while conditions are unmet")
+	}
+
+	readyNode(e, now, a)
+	e.Heartbeat(now, b, Report{Paths: []bool{true}})
+	if got := unmetPreds(e.Unmet(now, F3, a)); len(got) != 1 || got[0] != PredViewUp {
+		t.Fatalf("A is fit, B has not voted: %v", got)
+	}
+
+	e.Heartbeat(now, b, Report{Paths: []bool{true}, Peers: []PeerEntry{{Node: a, Known: true}}})
+	if got := e.Unmet(now, F3, a); len(got) != 0 {
+		t.Fatalf("every condition holds: %v", got)
+	}
+	if _, err := e.Tick(now, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	due, ok := e.TimerDue(now, F3, a)
+	if !ok || !due.Equal(now.Add(Inputs().Stable)) {
+		t.Fatalf("the count begins at the tick: %v %v", due, ok)
+	}
+
+	// A flapping node waits the longer period.
+	e.cols[a] = Columns{Withdrawn: true, FlapUntil: now.Add(time.Hour)}
+	if due, ok := e.TimerDue(now, F3, a); !ok || !due.Equal(now.Add(Inputs().StableFlapping)) {
+		t.Fatalf("flapping: %v %v", due, ok)
+	}
+
+	// A held node fails the State condition, whatever its inputs.
+	e.cols[a] = Columns{Withdrawn: true, Hold: true}
+	if got := unmetPreds(e.Unmet(now, F3, a)); len(got) != 1 || got[0] != PredHeld {
+		t.Fatalf("held: %v", got)
+	}
+	// A row that is not a node row and a node outside the membership have nothing to say.
+	if e.Unmet(now, F4, a) != nil || e.Unmet(now, "nope", a) != nil || e.Unmet(now, F3, nid('Z')) != nil {
+		t.Fatal("Unmet speaks of what it does not judge")
+	}
+}

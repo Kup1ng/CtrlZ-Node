@@ -201,7 +201,8 @@ type Status struct {
 	Refusals    uint64
 	LastRefusal hubv1.PushRefusal
 	// LatestRefusal is the refusal of the latest push received, UNSPECIFIED when it was
-	// accepted. SC 8a.5: PanelStale holds while it is anything but LOWER_VERSION.
+	// accepted. SC 8a.5: a refused LOWER_VERSION never changes it, so PanelStale holds while it is
+	// any other refusal, until a push is accepted.
 	LatestRefusal hubv1.PushRefusal
 }
 
@@ -326,7 +327,12 @@ func (w *Writer) record(res *Result) {
 	}
 	w.refusals++
 	w.lastRefusal = res.Refusal
-	w.latestRefusal = res.Refusal
+	// SC 8a.5: a refused lower version is a stale or duplicate push, not a fault in the panel's table, so it is reported and
+	// counted but never replaces latestRefusal. Otherwise a LOWER_VERSION after a FLAG_CONFLICT would clear the PanelStale
+	// that refusal set, and the node would act on a table the panel had just contradicted (pair-table-apply apply-030).
+	if res.Refusal != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION {
+		w.latestRefusal = res.Refusal
+	}
 }
 
 func refuse(r hubv1.PushRefusal, format string, a ...any) Result {

@@ -670,3 +670,52 @@ func (e *Evaluator) signRefresh(now time.Time, row Row, out []Output, commit Com
 	}
 	return append(out, Output{Event: ev}), nil
 }
+
+// --- What the admin page reads (T-542) -----------------------------------
+
+// Unmet lists the conditions of a node row (F1 to F3) that do not hold for x at now, State conditions first and then Inputs, in
+// the row's own order. It changes nothing and reads only what the tick reads, so the admin page can say which condition keeps a
+// withdrawn node out (SC 8a.4 Admin). A row that is not a node row, or a node outside the membership, has none.
+func (e *Evaluator) Unmet(now time.Time, rowID string, x NodeID) []Cond {
+	row, ok := e.nodeRow(rowID)
+	if !ok {
+		return nil
+	}
+	if _, ok := e.member.Nodes[x]; !ok {
+		return nil
+	}
+	var out []Cond
+	for _, cs := range [][]Cond{row.State, row.Inputs} {
+		for _, c := range cs {
+			if !e.holds(now, c, x) {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// TimerDue is the moment a timed node row would act for x if its State and Inputs keep holding: the start of the count plus the
+// row's wait. It reports false while the count has not started, which is while some condition does not hold.
+func (e *Evaluator) TimerDue(now time.Time, rowID string, x NodeID) (time.Time, bool) {
+	row, isNode := e.nodeRow(rowID)
+	start, ok := e.since[timerKey{rowID, x}]
+	if !isNode || !ok {
+		return time.Time{}, false
+	}
+	need := time.Duration(row.For.Seconds) * time.Second
+	if row.For.Stable {
+		need = StablePeriod(e.cols[x], now)
+	}
+	return start.Add(need), true
+}
+
+// nodeRow finds a node row by id without the panic of row, because the ids here come from callers outside the package.
+func (e *Evaluator) nodeRow(id string) (Row, bool) {
+	for _, r := range e.rows {
+		if r.ID == id && r.Kind == RowNode {
+			return r, true
+		}
+	}
+	return Row{}, false
+}

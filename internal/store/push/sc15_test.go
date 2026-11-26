@@ -261,15 +261,20 @@ func TestSC15PairTableApply(t *testing.T) {
 			{"lower version", func() push.Result { return f.apply(f.signed(99)) }, hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION},
 			{"flag conflict", func() push.Result { return f.apply(f.signed(100, 1)) }, hubv1.PushRefusal_PUSH_REFUSAL_FLAG_CONFLICT},
 		}
+		// A refused lower version is reported and counted but never replaces latest_refusal (SC 8a.5): it keeps the refusal
+		// before it, here the expired one.
+		wantLatest := hubv1.PushRefusal_PUSH_REFUSAL_UNSPECIFIED
 		for i, c := range cases {
 			r := c.do()
 			st := f.w.Status()
-			if r.Accepted || r.Refusal != c.want || st.Refusals != uint64(i+1) || st.LastRefusal != c.want || st.LatestRefusal != c.want {
+			if c.want != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION {
+				wantLatest = c.want
+			}
+			if r.Accepted || r.Refusal != c.want || st.Refusals != uint64(i+1) || st.LastRefusal != c.want || st.LatestRefusal != wantLatest {
 				t.Errorf("%s: %+v %+v", c.name, r, st)
 			}
-			// What PanelStale reads (SC 8a.5): every refusal but a lower version.
-			stale := st.LatestRefusal != hubv1.PushRefusal_PUSH_REFUSAL_UNSPECIFIED && st.LatestRefusal != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION
-			if stale != (c.want != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION) {
+			// What PanelStale reads (SC 8a.5): every refusal stays stale, a lower version included, since it leaves the one before it.
+			if stale := st.LatestRefusal != hubv1.PushRefusal_PUSH_REFUSAL_UNSPECIFIED && st.LatestRefusal != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION; !stale {
 				t.Errorf("%s: panel-stale input %v", c.name, stale)
 			}
 		}
@@ -281,4 +286,39 @@ func TestSC15PairTableApply(t *testing.T) {
 			t.Fatalf("%+v", st)
 		}
 	})
+}
+
+// apply-030 of the pair-table-apply group, at the writer: a refused lower version after a refusal that set PanelStale must
+// neither clear it nor replace latest_refusal, while it is still counted and reported as last_refusal.
+//
+// Fails if: record() stores a LOWER_VERSION refusal in latestRefusal (the node is no longer stale after the third push).
+func TestLowerVersionRefusalKeepsPanelStale(t *testing.T) {
+	f := newFixture(t, nil)
+	f.w.Load(storetest.Table(3, 0), now)
+	if r := f.apply(f.signed(100, 0)); !r.Accepted {
+		t.Fatalf("%+v", r)
+	}
+	if r := f.apply(f.signed(100, 1)); r.Refusal != hubv1.PushRefusal_PUSH_REFUSAL_FLAG_CONFLICT {
+		t.Fatalf("%+v", r)
+	}
+	clocks := push.StaleClocks{HubNow: now}
+	if !f.w.Status().PanelStale(clocks) {
+		t.Fatal("not stale after a flag conflict")
+	}
+	if r := f.apply(f.signed(99)); r.Refusal != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION {
+		t.Fatalf("%+v", r)
+	}
+	st := f.w.Status()
+	if st.Refusals != 2 || st.LastRefusal != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION || st.LatestRefusal != hubv1.PushRefusal_PUSH_REFUSAL_FLAG_CONFLICT {
+		t.Fatalf("%+v", st)
+	}
+	if !st.PanelStale(clocks) {
+		t.Fatal("a refused lower version cleared PanelStale")
+	}
+	if r := f.apply(f.signed(101, 0)); !r.Accepted {
+		t.Fatalf("%+v", r)
+	}
+	if f.w.Status().PanelStale(clocks) {
+		t.Fatal("an accepted push left the node stale")
+	}
 }
