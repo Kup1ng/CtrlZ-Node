@@ -59,10 +59,7 @@ func (h *Handler) activity(req *listen.Request, id *ident, now time.Time) {
 	if id.claim != nil && !req.Validated {
 		return
 	}
-	label := id.client
-	if label == "" {
-		label = "default" // a query that names no client sends the default label (SC 12)
-	}
+	label := id.activityLabel() // a query that names no client sends the default label (SC 12)
 	bucket := now.Unix() / activityBucket * activityBucket
 	e := &telemetryv1.ActivityEntry{
 		EndpointId: id.st.id[:], ClientLabel: label,

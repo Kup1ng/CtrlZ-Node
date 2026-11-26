@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/Kup1ng/CtrlZ-Shared/enrollproof"
 	enrollv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/enroll/v1"
 )
 
@@ -180,8 +181,9 @@ func (h *fakeHub) Poll(ctx context.Context, r *enrollv1.PollRequest) (*enrollv1.
 	if rec == nil {
 		return &enrollv1.PollResponse{State: enrollv1.EnrollState_ENROLL_STATE_REJECTED}, nil
 	}
-	digest := sha256.Sum256(ProofInput(rec.id))
-	if !ecdsa.VerifyASN1(rec.pub, digest[:], r.ProofSig) {
+	// The same check the hub runs, so a signature the real hub would refuse (a
+	// non-canonical DER, a wrong curve) fails here too.
+	if !enrollproof.Verify(rec.pub, rec.id, r.ProofSig) {
 		return nil, status.Error(codes.PermissionDenied, "proof")
 	}
 	h.mu.Lock()
@@ -918,6 +920,8 @@ func TestProofSigIsOverTheDomainSeparatedInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Written out here rather than through enrollproof, so a change of the shared
+	// definition that the hub and node both follow still has to match this contract text.
 	good := sha256.Sum256(append([]byte("ctrlz-poll-v1\x00"), id...))
 	if !ecdsa.VerifyASN1(&k.PublicKey, good[:], sig) {
 		t.Fatal("the signature is not over \"ctrlz-poll-v1\\0\" || id")
@@ -928,16 +932,33 @@ func TestProofSigIsOverTheDomainSeparatedInput(t *testing.T) {
 	}
 }
 
-// A golden vector for the hub side (W3, Panel): the same bytes and digest must come
-// out of its implementation. Computed outside Go, with printf and sha256sum.
-func TestProofInputGoldenVector(t *testing.T) {
+// The golden vector of the contract (computed outside Go, with printf and sha256sum),
+// pinned here against shared/enrollproof so the node's signature is over the digest
+// the hub checks: the signature must verify under enrollproof.Verify, which is the
+// hub's own function.
+func TestProofSigMatchesSharedGoldenDigest(t *testing.T) {
 	id := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	if got, want := hex.EncodeToString(ProofInput(id)), "6374726c7a2d706f6c6c2d7631000102030405060708090a0b0c0d0e0f10"; got != want {
-		t.Fatalf("ProofInput = %s, want %s", got, want)
+	if got, want := hex.EncodeToString(enrollproof.Input(id)), "6374726c7a2d706f6c6c2d7631000102030405060708090a0b0c0d0e0f10"; got != want {
+		t.Fatalf("enrollproof.Input = %s, want %s", got, want)
 	}
-	sum := sha256.Sum256(ProofInput(id))
-	if got, want := hex.EncodeToString(sum[:]), "ed213f81920fcc9792708e93b04efd440a1feacebf0e3d7dd39ee334074208c8"; got != want {
-		t.Fatalf("SHA-256 of ProofInput = %s, want %s", got, want)
+	if got, want := hex.EncodeToString(enrollproof.Digest(id)), "ed213f81920fcc9792708e93b04efd440a1feacebf0e3d7dd39ee334074208c8"; got != want {
+		t.Fatalf("enrollproof.Digest = %s, want %s", got, want)
+	}
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := ProofSig(k, id, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !enrollproof.Verify(&k.PublicKey, id, sig) {
+		t.Fatal("the hub's check refuses the node's Poll signature")
+	}
+	other := append([]byte(nil), id...)
+	other[0] ^= 1
+	if enrollproof.Verify(&k.PublicKey, other, sig) {
+		t.Fatal("the signature also verifies for another enrollment id")
 	}
 }
 

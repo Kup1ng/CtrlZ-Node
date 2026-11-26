@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/Kup1ng/CtrlZ-Shared/enrollproof"
 	enrollv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/enroll/v1"
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 
@@ -125,8 +126,7 @@ func (h *enrollHub) Enroll(_ context.Context, r *enrollv1.EnrollRequest) (*enrol
 func (h *enrollHub) Poll(_ context.Context, r *enrollv1.PollRequest) (*enrollv1.PollResponse, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	digest := sha256.Sum256(enroll.ProofInput(h.id))
-	if string(r.EnrollmentId) != string(h.id) || !ecdsa.VerifyASN1(h.pub, digest[:], r.ProofSig) {
+	if string(r.EnrollmentId) != string(h.id) || !enrollproof.Verify(h.pub, h.id, r.ProofSig) {
 		return nil, status.Error(codes.PermissionDenied, "proof")
 	}
 	if !h.approve.Load() {

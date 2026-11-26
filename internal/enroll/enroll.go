@@ -51,6 +51,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
+	"github.com/Kup1ng/CtrlZ-Shared/enrollproof"
 	enrollv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/enroll/v1"
 )
 
@@ -71,7 +72,6 @@ const (
 	maxCertDER   = 8 << 10
 	maxChainLen  = 4
 	idLen        = 16
-	pollContext  = "ctrlz-poll-v1\x00"
 	maxHostname  = 253
 	maxFreeText  = 128
 	badLimit     = 5
@@ -318,15 +318,13 @@ func (c *Config) announce(fp string) {
 	fmt.Fprintln(c.Out, "ctrlz-enroll: compare them with the admin page, then confirm and approve this node there")
 }
 
-// ProofInput is what the Poll signature covers: "ctrlz-poll-v1\0" || enrollment_id.
-func ProofInput(id []byte) []byte { return append([]byte(pollContext), id...) }
-
-// ProofSig signs a Poll with the enrolled key: ECDSA over the SHA-256 of ProofInput,
-// ASN.1 DER. The hub checks it against the record's key before it reads further, so
-// a leaked enrolment id gives nothing.
+// ProofSig signs a Poll with the enrolled key: ECDSA over enrollproof.Digest(id), ASN.1
+// DER. The signed input is defined once, in shared/enrollproof, which the hub calls to
+// check it, so the node and the hub cannot hash different bytes. The hub checks the
+// signature against the record's key before it reads further, so a leaked enrolment id
+// gives nothing.
 func ProofSig(key *ecdsa.PrivateKey, id []byte, rnd io.Reader) ([]byte, error) {
-	h := sha256.Sum256(ProofInput(id))
-	return ecdsa.SignASN1(rnd, key, h[:])
+	return ecdsa.SignASN1(rnd, key, enrollproof.Digest(id))
 }
 
 func (c *Config) poll(ctx context.Context, client enrollv1.EnrollmentClient, roots *x509.CertPool, p *pending) (*Result, error) {

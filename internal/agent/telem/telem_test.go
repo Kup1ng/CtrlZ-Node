@@ -406,6 +406,60 @@ func TestActivityAdmissionSetFollowsTheRecord(t *testing.T) {
 	}
 }
 
+// p4b-n0 (a): the record lists only clients with a profile or an analytics level, so the
+// auto rows the hub made from admitted labels never show in it. Idle labels must still
+// free their place, or an Endpoint's later labels are dropped until the agent restarts.
+func TestActivityIdleAdmittedLabelsFreeTheirPlaces(t *testing.T) {
+	c := newClock()
+	r := recs{ep(1): {Clients: hashes(), Cap: 2}, ep(2): {Clients: hashes(), Cap: 2}}
+	a := NewActivity(r, c.now, seqIDs())
+	add := func(e byte, label string) {
+		a.Add(Report{EndpointID: ep(e), ClientLabel: label, Protocol: commonv1.Protocol_PROTOCOL_DOH, At: c.t})
+	}
+	labels := func(b *telemetryv1.ActivityBatch, e byte) map[string]bool {
+		out := map[string]bool{}
+		for _, en := range b.GetEntries() {
+			if en.EndpointId[0] == e {
+				out[en.ClientLabel] = true
+			}
+		}
+		return out
+	}
+	add(1, "a")
+	add(1, "b")
+	add(2, "a")
+	add(2, "b")
+	if b := a.Flush(); b == nil || len(b.Entries) != 4 {
+		t.Fatalf("first flush: %v", b)
+	}
+	// Within the idle time the set is full for both Endpoints: "c" is dropped.
+	c.adv(AcceptedIdle / 2)
+	add(1, "a") // endpoint 1 keeps "a" alive; endpoint 2 sends nothing
+	add(1, "c")
+	add(2, "c")
+	b := a.Flush()
+	if got := labels(b, 1); !got["a"] || got["c"] {
+		t.Fatalf("endpoint 1 before the idle time: %v", got)
+	}
+	if got := labels(b, 2); got["c"] {
+		t.Fatalf("endpoint 2 admitted a third label before the idle time: %v", got)
+	}
+	// Past it, "a" of endpoint 1 was renewed and "b" of both Endpoints and "a" of endpoint
+	// 2 have been idle for the whole time: the new label gets a place on both.
+	c.adv(AcceptedIdle/2 + time.Minute)
+	add(1, "c")
+	add(1, "d")
+	add(2, "c")
+	b = a.Flush()
+	if got := labels(b, 2); !got["c"] {
+		t.Fatalf("endpoint 2 still holds the idle labels: %v", got)
+	}
+	// "a" of endpoint 1 was sent 12 hours ago, "b" 25: "c" takes b's place, "d" has none.
+	if got := labels(b, 1); !got["c"] || got["d"] {
+		t.Fatalf("endpoint 1 after the idle time: %v", got)
+	}
+}
+
 // p4n-W5b-r3-9: a batch is bounded by its encoded size too, so one the hub may refuse
 // for size is never built; what does not fit goes out in the next flushes.
 func TestActivityBatchIsBoundedByBytes(t *testing.T) {
@@ -551,5 +605,225 @@ func TestActivityKeyFloodOfOneTenantCannotFillTheSharedMap(t *testing.T) {
 		if n > 100 {
 			t.Errorf("endpoint %d holds %d keys, over its cap of 100", e, n)
 		}
+	}
+}
+
+// p4b-n0-r1-1 and r1-2: "default" is the label of every Plain DNS claim report and every
+// unlabelled encrypted query. The record lists it only when the tenant gave it a profile
+// or a level, and client_cap must never hold it back: dropping the entry drops claim_id, the
+// claim looks idle and ip_claim_take can give its address to another tenant.
+func TestActivityDefaultLabelIsNeverHeldToClientCap(t *testing.T) {
+	claim := make([]byte, 16)
+	claim[0] = 7
+	for _, capN := range []uint32{0, 2} {
+		c := newClock()
+		// The record lists no client at all, "default" included.
+		a := NewActivity(recs{ep(1): {Clients: hashes(), Cap: capN}}, c.now, seqIDs())
+		add := func(label string, withClaim bool) {
+			r := Report{EndpointID: ep(1), ClientLabel: label, Protocol: commonv1.Protocol_PROTOCOL_UDP, At: c.t}
+			if withClaim {
+				r.ClaimID = claim
+			}
+			a.Add(r)
+		}
+		hasClaim := func(b *telemetryv1.ActivityBatch) bool {
+			for _, e := range b.GetEntries() {
+				if e.ClientLabel == DefaultLabel && string(e.ClaimId) == string(claim) {
+					return true
+				}
+			}
+			return false
+		}
+		// Before the record is learned every label counts against DefaultLabelLimit:
+		// "default" still passes after the junk filled it.
+		for i := 0; i < DefaultLabelLimit+10; i++ {
+			add(fmt.Sprintf("junk%d", i), false)
+		}
+		add(DefaultLabel, true)
+		if b := a.Flush(); b == nil || !hasClaim(b) {
+			t.Fatalf("cap %d, record not learned: the claim entry did not go out: %v", capN, b)
+		}
+		// Learned, the set is full of labels the record lacks (cap 2) or closed (cap 0),
+		// at intake and at flush, also after the labels were admitted once.
+		for round := 0; round < 3; round++ {
+			c.adv(AcceptedIdle + time.Hour) // the idle release must not matter either
+			for i := 0; i < 20; i++ {
+				add(fmt.Sprintf("j%d-%d", round, i), false)
+			}
+			add(DefaultLabel, true)
+			add(DefaultLabel, false)
+			b := a.Flush()
+			if b == nil || !hasClaim(b) {
+				t.Fatalf("cap %d round %d: the claim entry did not go out: %v", capN, round, b)
+			}
+		}
+	}
+}
+
+// p4b-n0-r1-2: the per-Endpoint key bound does not apply to "default" either, or junk
+// labels carrying many source hashes would starve claim activity.
+func TestActivityDefaultLabelPassesAFullKeyBound(t *testing.T) {
+	c := newClock()
+	a := NewActivity(recs{ep(1): {Clients: hashes(), Cap: 100}}, c.now, seqIDs())
+	a.epKeys = 5
+	for i := 0; i < 20; i++ {
+		h := make([]byte, 16)
+		h[0] = byte(i + 1)
+		a.Add(Report{EndpointID: ep(1), ClientLabel: "junk", SourceIPHash: h, Protocol: commonv1.Protocol_PROTOCOL_DOH, At: c.t})
+	}
+	claim := make([]byte, 16)
+	claim[0] = 9
+	a.Add(Report{EndpointID: ep(1), ClientLabel: DefaultLabel, ClaimID: claim, Protocol: commonv1.Protocol_PROTOCOL_UDP, At: c.t})
+	b := a.Flush()
+	found := false
+	for _, e := range b.GetEntries() {
+		if e.ClientLabel == DefaultLabel && string(e.ClaimId) == string(claim) {
+			found = true
+		}
+	}
+	if !found || len(b.Entries) != 6 {
+		t.Errorf("entries %d, claim entry found %v", len(b.GetEntries()), found)
+	}
+}
+
+// p4b-n0-r1-3: a label stamped by a clock that was ahead and then stepped back is
+// released at once, not held until real time catches up.
+func TestActivityLabelStampedByAheadClockIsReleased(t *testing.T) {
+	c := newClock()
+	a := NewActivity(recs{ep(1): {Clients: hashes(), Cap: 1}}, c.now, seqIDs())
+	add := func(label string) {
+		a.Add(Report{EndpointID: ep(1), ClientLabel: label, Protocol: commonv1.Protocol_PROTOCOL_DOH, At: c.t})
+	}
+	real := c.t
+	c.t = real.Add(90 * 24 * time.Hour) // the RTC was months ahead before chrony stepped it
+	add("a")
+	if b := a.Flush(); b == nil || len(b.Entries) != 1 {
+		t.Fatalf("first flush: %v", b)
+	}
+	c.t = real.Add(time.Hour) // stepped back; "a" is 90 days in the future
+	add("b")
+	b := a.Flush()
+	if b == nil || len(b.Entries) != 1 || b.Entries[0].ClientLabel != "b" {
+		t.Fatalf("the label from the ahead clock still holds its place: %v", b)
+	}
+}
+
+// p4b-n0-r2-1: a label the node admitted at an earlier flush, whose auto row the record
+// does not list, is not counted like a new junk label at intake. Junk that arrived first in
+// the window must not drop its report (and with it the authorized row's last-seen move).
+func TestActivityAdmittedLabelIsNotCrowdedOutByJunkAtIntake(t *testing.T) {
+	c := newClock()
+	a := NewActivity(recs{ep(1): {Clients: hashes(), Cap: 2}}, c.now, seqIDs())
+	h := make([]byte, 16)
+	h[0] = 7
+	add := func(label string) {
+		a.Add(Report{EndpointID: ep(1), ClientLabel: label, SourceIPHash: h, Protocol: commonv1.Protocol_PROTOCOL_DOT, At: c.t})
+	}
+	add("pc")
+	if b := a.Flush(); b == nil || len(b.Entries) != 1 {
+		t.Fatalf("first flush: %v", b)
+	}
+	c.adv(300 * time.Second)
+	add("junk1")
+	add("junk2")
+	add("pc")
+	b := a.Flush()
+	found := false
+	for _, e := range b.GetEntries() {
+		found = found || e.ClientLabel == "pc"
+	}
+	if !found {
+		t.Errorf("the admitted label was dropped at intake: %v", b)
+	}
+	if n := len(b.GetEntries()); n != 2 {
+		t.Errorf("entries %d, want pc and one junk label (the cap is 2)", n)
+	}
+}
+
+func hasDefaultClaim(b *telemetryv1.ActivityBatch, ep byte, claim []byte) bool {
+	for _, e := range b.GetEntries() {
+		if e.ClientLabel == DefaultLabel && string(e.ClaimId) == string(claim) && e.EndpointId[0] == ep {
+			return true
+		}
+	}
+	return false
+}
+
+func fillWithJunk(a *Activity, c *clock, e byte, n int, base byte) {
+	for i := 0; i < n; i++ {
+		h := make([]byte, 16)
+		h[0], h[1] = base, byte(i)
+		a.Add(Report{EndpointID: ep(e), ClientLabel: "junk", SourceIPHash: h, Protocol: commonv1.Protocol_PROTOCOL_DOH, At: c.t})
+	}
+}
+
+// p4b-n0-r2-4: with the shared map full, a Plain DNS claim entry is not refused because its
+// Endpoint's own junk keys use up its fair share, and it makes room by removing another key.
+func TestActivityDefaultClaimGetsRoomInAFullMap(t *testing.T) {
+	c := newClock()
+	r := recs{}
+	for e := byte(1); e <= 10; e++ {
+		r[ep(e)] = EndpointInfo{Clients: hashes(), Cap: 1000}
+	}
+	a := NewActivity(r, c.now, seqIDs())
+	a.maxKeys, a.epKeys = 100, 1000
+	fillWithJunk(a, c, 2, 12, 2)     // the victim, over its fair share of 10
+	for e := byte(3); e <= 10; e++ { // eight small Endpoints
+		fillWithJunk(a, c, e, 1, e)
+	}
+	fillWithJunk(a, c, 1, 200, 1) // the flooder fills the rest, then is refused
+	claim := make([]byte, 16)
+	claim[0] = 9
+	a.Add(Report{EndpointID: ep(2), ClientLabel: DefaultLabel, ClaimID: claim, Protocol: commonv1.Protocol_PROTOCOL_UDP, At: c.t})
+	if b := a.Flush(); !hasDefaultClaim(b, 2, claim) {
+		t.Fatalf("the claim entry did not go out: %d entries", len(b.GetEntries()))
+	}
+}
+
+// An Endpoint under its fair share keeps every default claim key when another Endpoint
+// needs room: only keys of an Endpoint over its share are victims.
+func TestActivityDefaultClaimKeysUnderTheShareAreNotEvicted(t *testing.T) {
+	c := newClock()
+	r := recs{}
+	for e := byte(1); e <= 3; e++ {
+		r[ep(e)] = EndpointInfo{Clients: hashes(), Cap: 1000}
+	}
+	a := NewActivity(r, c.now, seqIDs())
+	a.maxKeys, a.epKeys = 20, 1000
+	for i := 0; i < 5; i++ {
+		claim := make([]byte, 16)
+		claim[0] = byte(i + 1)
+		a.Add(Report{EndpointID: ep(1), ClientLabel: DefaultLabel, ClaimID: claim, Protocol: commonv1.Protocol_PROTOCOL_UDP, At: c.t})
+	}
+	fillWithJunk(a, c, 2, 15, 2) // the map is full; fair share is 20/3 = 6
+	fillWithJunk(a, c, 3, 10, 3) // takes room from Endpoint 2 only
+	n := 0
+	for _, e := range a.Flush().GetEntries() {
+		if e.EndpointId[0] == 1 && e.ClientLabel == DefaultLabel {
+			n++
+		}
+	}
+	if n != 5 {
+		t.Errorf("Endpoint 1 kept %d of its 5 default claim keys", n)
+	}
+}
+
+// Requeue gives a default claim key the same room: a batch that failed to upload does not
+// lose it because the map filled in the meantime.
+func TestActivityRequeuedDefaultClaimGetsRoom(t *testing.T) {
+	c := newClock()
+	a := NewActivity(recs{ep(1): {Clients: hashes(), Cap: 1000}, ep(2): {Clients: hashes(), Cap: 1000}}, c.now, seqIDs())
+	a.maxKeys, a.epKeys = 100, 1000
+	claim := make([]byte, 16)
+	claim[0] = 9
+	a.Add(Report{EndpointID: ep(2), ClientLabel: DefaultLabel, ClaimID: claim, Protocol: commonv1.Protocol_PROTOCOL_UDP, At: c.t})
+	sent := a.Flush()
+	if !hasDefaultClaim(sent, 2, claim) {
+		t.Fatalf("first flush: %v", sent)
+	}
+	fillWithJunk(a, c, 1, 100, 1)
+	a.Requeue(sent)
+	if b := a.Flush(); !hasDefaultClaim(b, 2, claim) {
+		t.Fatalf("the requeued claim entry was dropped from a full map")
 	}
 }

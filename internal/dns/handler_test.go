@@ -9,6 +9,7 @@ import (
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/cache"
 	"github.com/Kup1ng/CtrlZ-Node/internal/dns/listen"
+	"github.com/Kup1ng/CtrlZ-Shared/identity"
 	"github.com/Kup1ng/CtrlZ-Shared/names"
 	sharedpolicy "github.com/Kup1ng/CtrlZ-Shared/policy"
 )
@@ -219,5 +220,41 @@ func TestDoHIgnoresConnectionSNIAndDoTFoldsCase(t *testing.T) {
 	r = w.call(qopt{t: listen.DoH, http: dohInfo("/"+string(bad), rid(epA)+"."+testZone)}, "www.example.com", dns.TypeA)
 	if r.Status != 404 {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// p4b-n0 (b): a Plain DNS identity is the client "default" (P3 3.3), so the stack of
+// that client applies to it; an encrypted query with no label is the identity "no
+// client" and takes the base, whatever "default" holds. The activity label of both is
+// "default".
+func TestPlainDNSIsTheDefaultClientForTheStack(t *testing.T) {
+	w := newWorld(t)
+	// G's base passes www.example.com; its "default" client blocks it.
+	src := "127.0.0." + itoa(int(epG))
+	for _, tr := range []listen.Transport{listen.TCP, listen.UDP} {
+		r := w.call(qopt{t: tr, src: src}, "www.example.com", dns.TypeA)
+		wantA(t, "plain "+tr.String()+" is client default", r, "0.0.0.0")
+	}
+	r := w.call(qopt{t: listen.DoT, sni: rid(epG) + "." + testZone}, "www.example.com", dns.TypeA)
+	wantA(t, "unlabelled DoT is no client", r, "192.0.2.20")
+	r = w.call(qopt{t: listen.DoH, http: dohInfo("/"+tok(epG), rid(epG)+"."+testZone)}, "www.example.com", dns.TypeA)
+	wantA(t, "unlabelled DoH is no client", r, "192.0.2.20")
+	// Another Endpoint with the same source shape has no "default" client: its Plain DNS is its base.
+	r = w.call(qopt{t: listen.TCP, src: "127.0.0." + itoa(int(epB))}, "www.example.com", dns.TypeA)
+	wantA(t, "plain on B", r, "192.0.2.20")
+}
+
+func TestClientKeysOfAnIdentity(t *testing.T) {
+	var none, plain, labelled ident
+	plain.claim = &claimEntry{}
+	labelled.client = "pc"
+	if none.activityLabel() != "default" || plain.activityLabel() != "default" || labelled.activityLabel() != "pc" {
+		t.Fatal("activity label")
+	}
+	if none.stackClient() != ([16]byte{}) {
+		t.Error("an unlabelled encrypted query must take no client stack")
+	}
+	if plain.stackClient() != identity.ClientHash("default") || labelled.stackClient() != identity.ClientHash("pc") {
+		t.Error("stack client")
 	}
 }

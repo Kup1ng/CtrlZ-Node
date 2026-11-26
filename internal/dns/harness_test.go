@@ -54,7 +54,7 @@ const (
 	epD byte = 5  // soft_disabled, Default Block
 	epE byte = 6  // Require Authorized IPs, list does not hold loopback, Authorize Secure DNS
 	epF byte = 7  // Require Authorized IPs, list holds loopback
-	epG byte = 8  // authorized list, a client "kid" with its own stack
+	epG byte = 8  // authorized list, clients "kid" and "default" with their own stacks
 	epH byte = 9  // degraded: its profile blob is not on disk
 	epR byte = 10 // Redirect rules
 )
@@ -215,7 +215,12 @@ func newWorld(t testing.TB) *world {
 	g.AuthorizeSecureDns = true
 	g.Authorized = []*commonv1.Prefix{prefix("127.0.0.0/8"), prefix("127.0.0.0/24")}
 	kh := identity.ClientHash("kid")
-	g.Clients = []*policyv1.ClientRecord{{ClientId: bytes.Repeat([]byte{0x77}, 16), ClientHash: kh[:], Stack: &policyv1.StackRecord{Profile1Hash: ptr(w.profile["kid"])}}}
+	// "default" holds the stack of Plain DNS (P3 3.3); here it is the same blocking profile.
+	dh := identity.ClientHash("default")
+	g.Clients = []*policyv1.ClientRecord{
+		{ClientId: bytes.Repeat([]byte{0x77}, 16), ClientHash: kh[:], Stack: &policyv1.StackRecord{Profile1Hash: ptr(w.profile["kid"])}},
+		{ClientId: bytes.Repeat([]byte{0x78}, 16), ClientHash: dh[:], Stack: &policyv1.StackRecord{Profile1Hash: ptr(w.profile["kid"])}},
+	}
 	add(g)
 	add(record(epR, w.profile["R"]))
 	hh := record(epH, w.profile["missing"])

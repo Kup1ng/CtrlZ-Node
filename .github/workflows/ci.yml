@@ -11,6 +11,9 @@
 #   - actions are pinned to a full commit SHA, the version in the comment, and only
 #     actions/checkout and actions/setup-go are used. A release is pinned only when it is at
 #     least 14 days old (setup-go v7.1.0 was two days old and is not used yet);
+#   - the job xray-check (docs/specs/p4b-proxy.md 17, B0) runs only for branches named ci/p4b-b0*; the other five jobs skip
+#     on the experiment branches ci/p4b-b0-x*, so a run of the experiment does not queue the install job again and again. The
+#     final commit of B0 goes to ci/p4b-b0, where all six run. The rule is removed with the job when B0 is recorded;
 #   - five jobs at once. The Panel's run peaks at 18, so both together are 23 and the last three queue
 #     on the 20 of the free account (a queued job waits, it does not fail).
 name: ci
@@ -35,6 +38,7 @@ jobs:
   # pin check, shared verify of the one copy, shared tests, gofmt, build, vet for both systems.
   static:
     name: static
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -52,6 +56,7 @@ jobs:
 
   tests:
     name: tests
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -76,6 +81,7 @@ jobs:
   # them; the cases that only a release build runs skip here, by design (shardrun, gofiles.sh).
   tests-lab:
     name: tests (lab)
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -96,6 +102,7 @@ jobs:
   # the test skips.
   install:
     name: install
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -116,6 +123,7 @@ jobs:
   # one) and with gitleaks:allow comments ignored. The history is scanned by the local run.
   scan:
     name: gitleaks and govulncheck
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0-x') == false
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -136,3 +144,23 @@ jobs:
         run: gitleaks dir --no-banner --redact --log-level=warn --ignore-gitleaks-allow .
       - name: govulncheck
         run: govulncheck -C . ./...
+
+  # The start check of package B0 (docs/specs/p4b-proxy.md 17): the pinned Xray release, run through the experiments of
+  # .github/ci/xraycheck. It fetches the release archive from github.com over https and the module source from the Go module
+  # proxy, both against pinned hashes (.github/ci/xray-check.sh). Only the branches ci/p4b-b0* run it. No cache: nothing here is
+  # proved elsewhere, so what the job compiles must not come from what another job saved.
+  xray-check:
+    name: xray start check
+    if: startsWith(github.ref, 'refs/heads/ci/p4b-b0')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Start check of the pinned Xray
+        run: sh .github/ci/xray-check.sh

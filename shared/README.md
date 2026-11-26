@@ -47,6 +47,7 @@ or two paths that differ only by case is an error.
 | `quarantine` | The apply transaction: a bad blob is set aside, the stream goes on |
 | `appleprofile` | Apple DNS profile: request validation, the stored params and their canonical JSON, the stable PayloadIdentifier and UUIDs (the builder is the panel's `internal/mobileconfig`) |
 | `manifest` | Signature check before parsing, bundle path checks |
+| `enrollproof` | The Poll proof of possession: the signed input, its digest and the canonical-DER check the hub runs (node enrolment, p4-nodes 4.2) |
 | `vectors` | Golden vectors, fixtures, the single runner and the reference harness |
 | `gen` | Generated protobuf and gRPC code, committed so builds need no `buf` |
 | `proto` | The `.proto` sources, `buf.yaml`, `buf.gen.yaml` |

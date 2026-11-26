@@ -35,6 +35,21 @@ const (
 	// claim or source hash, protocol), so labels alone do not bound it: one tenant with
 	// many clients and authorized prefixes could otherwise fill the map every tenant shares.
 	MaxKeysPerEndpoint = 20_000
+	// AcceptedIdle is how long an admitted label that the record does not list keeps its
+	// place against client_cap after it was last sent. The record lists only clients with a
+	// profile or an analytics level (P3 3.2), so the auto rows the hub made from these
+	// labels never appear in it and the record cannot tell the node which rows are gone
+	// (deleted by the tenant, or removed by the cleanup of P5). Time is the only signal the
+	// node has: without it the set only grew, and after client_cap labels had been admitted
+	// over the life of the agent every new label was dropped until it restarted.
+	AcceptedIdle = 24 * time.Hour
+	// DefaultLabel is the client every Plain DNS entry and every unlabelled encrypted query
+	// carries (P3 3.3, dns.defaultClient). It is the schema's default client row, the place
+	// overflow traffic goes to, so client_cap never applies to it. The record lists it only
+	// when the tenant gave it a profile or a level, and a cap that dropped it would drop the
+	// whole entry, claim_id included: the claim would look idle and ip_claim_take could hand
+	// its address to another tenant.
+	DefaultLabel = "default"
 )
 
 // Report is one thing dns saw: a query that passed step 4b (SC 7.6, Activity).
@@ -81,8 +96,8 @@ type Activity struct {
 
 	mu       sync.Mutex
 	pending  map[key]span
-	sent     map[key]int64 // latest bucket already sent for a key
-	accepted map[[16]byte]map[string]struct{}
+	sent     map[key]int64                 // latest bucket already sent for a key
+	accepted map[[16]byte]map[string]int64 // label -> unix second it was last sent
 	// eps is the intake state per Endpoint (see Add), refreshed at every flush.
 	eps     map[[16]byte]*epState
 	maxKeys int    // MaxPendingKeys; a field so a test can use a small map
@@ -104,9 +119,13 @@ type epState struct {
 	keys    int // pending keys of this Endpoint
 }
 
-// isKnown reports whether the record lists label. Such a label never counts against
-// client_cap (spec 7.3), so junk labels cannot crowd out a real client's activity.
+// isKnown reports whether label never counts against client_cap (spec 7.3), so junk
+// labels cannot crowd out a real client's activity: a label the record lists, and
+// DefaultLabel whether or not the record lists it (and before the record is learned).
 func (st *epState) isKnown(label string) bool {
+	if label == DefaultLabel {
+		return true
+	}
 	if !st.learned {
 		return false
 	}
@@ -129,7 +148,7 @@ func NewActivity(rec Records, now func() time.Time, newID func() uint64) *Activi
 	if newID == nil {
 		newID = randomID
 	}
-	return &Activity{now: now, newID: newID, rec: rec, pending: map[key]span{}, sent: map[key]int64{}, accepted: map[[16]byte]map[string]struct{}{},
+	return &Activity{now: now, newID: newID, rec: rec, pending: map[key]span{}, sent: map[key]int64{}, accepted: map[[16]byte]map[string]int64{},
 		eps: map[[16]byte]*epState{}, maxKeys: MaxPendingKeys, epKeys: MaxKeysPerEndpoint}
 }
 
@@ -163,7 +182,10 @@ func (a *Activity) Add(r Report) {
 		st = &epState{counted: map[string]struct{}{}}
 		a.eps[k.ep] = st
 	}
-	if st.keys >= a.epKeys {
+	// DefaultLabel is not held to the per-Endpoint key bound either: its keys are one per
+	// claim, authorized source and protocol, which the Endpoint's own setup bounds, and
+	// junk labels must not be able to fill the bound and starve claim activity.
+	if st.keys >= a.epKeys && k.label != DefaultLabel {
 		a.dropped++
 		return
 	}
@@ -173,15 +195,21 @@ func (a *Activity) Add(r Report) {
 	// a known client; before a flush has read the record every label counts.
 	known := st.isKnown(k.label)
 	_, counted := st.counted[k.label]
-	if !known && !counted && len(st.counted) >= st.limit() {
+	// A label the node admitted at an earlier flush already holds one of the cap's places
+	// (the hub's auto row for it is not in the record, so isKnown cannot see it). Counting
+	// it like a new label would let junk that arrived first in the window drop its report
+	// at intake although Flush would let it through; the bound stays, because accepted is
+	// itself held to the cap by admitUnknown.
+	_, admitted := a.accepted[k.ep][k.label]
+	if !known && !counted && !admitted && len(st.counted) >= st.limit() {
 		a.dropped++
 		return
 	}
-	if len(a.pending) >= a.maxKeys && !a.evictFor(k.ep, st) {
+	if len(a.pending) >= a.maxKeys && !a.evictFor(k.ep, st, k.label == DefaultLabel) {
 		a.dropped++
 		return
 	}
-	if !known {
+	if !known && !admitted {
 		st.counted[k.label] = struct{}{}
 	}
 	st.keys++
@@ -191,35 +219,86 @@ func (a *Activity) Add(r Report) {
 // evictFor makes room in the full map for a key of ep by removing one key of an
 // Endpoint that holds more than its fair share. An Endpoint at or over its own
 // share gets no room: it is the flooder. Caller holds a.mu.
-func (a *Activity) evictFor(ep [16]byte, st *epState) bool {
+//
+// A DefaultLabel key is the claim and authorized-address activity of Plain DNS, the
+// signal that keeps an address claim from looking idle (see DefaultLabel). So that an
+// Endpoint's own junk keys cannot decide whether that activity goes out, such a key is not
+// held to the fair share: it takes the place of a non-default key, of its own Endpoint
+// first, else of an Endpoint over its share. And a victim is a non-default key whenever
+// one is found; a default key goes only when its Endpoint is over its share and nothing
+// better turned up (else one tenant's map full of default keys could never be reclaimed,
+// and an Endpoint under its share keeps every claim key it has).
+func (a *Activity) evictFor(ep [16]byte, st *epState, isDefault bool) bool {
 	fair := a.maxKeys / max(1, len(a.eps))
-	if st.keys >= fair {
+	if !isDefault && st.keys >= fair {
 		return false
 	}
+	probes := 8
+	if isDefault {
+		probes = 32
+	}
+	var other, otherDefault *key // victims of another Endpoint over its share
 	// Map iteration starts at a random place, so a few probes find the big
 	// Endpoints in proportion to what they hold.
-	for try := 0; try < 8; try++ {
+	for try := 0; try < probes; try++ {
 		for k := range a.pending {
-			if v := a.eps[k.ep]; k.ep != ep && v != nil && v.keys > fair {
-				delete(a.pending, k)
-				v.keys--
-				a.dropped++
-				return true
+			v := a.eps[k.ep]
+			if v == nil {
+				break
+			}
+			isDefKey := k.label == DefaultLabel
+			if k.ep == ep {
+				if isDefault && !isDefKey {
+					a.evict(k, v)
+					return true
+				}
+			} else if v.keys > fair {
+				kc := k
+				switch {
+				case isDefKey && otherDefault == nil:
+					otherDefault = &kc
+				case !isDefKey && !isDefault:
+					a.evict(k, v)
+					return true
+				case !isDefKey && other == nil:
+					other = &kc
+				}
 			}
 			break
 		}
 	}
+	switch {
+	case other != nil:
+		a.evict(*other, a.eps[other.ep])
+		return true
+	case otherDefault != nil && st.keys < fair:
+		a.evict(*otherDefault, a.eps[otherDefault.ep])
+		return true
+	}
 	return false
+}
+
+// evict removes one pending key and counts it as dropped. Caller holds a.mu.
+func (a *Activity) evict(k key, v *epState) {
+	delete(a.pending, k)
+	v.keys--
+	a.dropped++
+}
+
+// epStateFor returns the intake state of ep, creating it. Caller holds a.mu.
+func (a *Activity) epStateFor(ep [16]byte) *epState {
+	st := a.eps[ep]
+	if st == nil {
+		st = &epState{counted: map[string]struct{}{}}
+		a.eps[ep] = st
+	}
+	return st
 }
 
 // place puts a key back in the pending map without the intake caps: it was admitted
 // once, and the caller checked the size of the map. Caller holds a.mu.
 func (a *Activity) place(k key, s span) {
-	st := a.eps[k.ep]
-	if st == nil {
-		st = &epState{counted: map[string]struct{}{}}
-		a.eps[k.ep] = st
-	}
+	st := a.epStateFor(k.ep)
 	if _, ok := a.pending[k]; !ok {
 		st.keys++
 		if !st.isKnown(k.label) {
@@ -261,7 +340,8 @@ func (a *Activity) Flush() *telemetryv1.ActivityBatch {
 		list = append(list, ep)
 	}
 	infos := a.rec.Lookup(list)
-	a.trimAccepted(infos)
+	nowUnix := a.now().Unix()
+	a.trimAccepted(infos, nowUnix)
 	a.mu.Lock()
 	// What the record says now governs the next window's intake. An Endpoint with no
 	// record held and nothing pending is forgotten.
@@ -297,7 +377,8 @@ func (a *Activity) Flush() *telemetryv1.ActivityBatch {
 			continue
 		}
 		_, known := info.Clients[identity.ClientHash(k.label)]
-		if !known && !a.admitUnknown(k.ep, k.label, info.Cap) {
+		known = known || k.label == DefaultLabel
+		if !known && !a.admitUnknown(k.ep, k.label, info.Cap, nowUnix) {
 			dropped++
 			continue
 		}
@@ -340,23 +421,26 @@ func (a *Activity) Flush() *telemetryv1.ActivityBatch {
 	return b
 }
 
-// trimAccepted keeps in the admission sets only the labels the record still lacks.
-// A label the record lists now has its own client row (the hub made it), so it no
-// longer counts against the cap, and the set of an Endpoint that is gone is dropped.
-// Without this the set only grew: after client_cap labels had ever been admitted,
-// every new label was dropped until the agent restarted, although the tenant had
-// deleted clients since.
-func (a *Activity) trimAccepted(infos map[[16]byte]EndpointInfo) {
+// trimAccepted keeps in the admission sets only the labels that still hold a place. A
+// label the record lists now has its own client row (the hub made it), so it no longer
+// counts against the cap; a label not sent for AcceptedIdle is let go, because the hub's
+// row for it may be gone (see AcceptedIdle) and the record does not say; and the set of
+// an Endpoint that is gone is dropped.
+func (a *Activity) trimAccepted(infos map[[16]byte]EndpointInfo, now int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	idle := int64(AcceptedIdle / time.Second)
 	for ep, set := range a.accepted {
 		info, ok := infos[ep]
 		if !ok {
 			delete(a.accepted, ep)
 			continue
 		}
-		for label := range set {
-			if _, known := info.Clients[identity.ClientHash(label)]; known {
+		for label, last := range set {
+			// last in the future means the node clock was ahead when it was stamped and has
+			// stepped back; judging only now-last would hold the place until real time
+			// caught up, so such a label is released like an idle one.
+			if _, known := info.Clients[identity.ClientHash(label)]; known || last > now || now-last >= idle {
 				delete(set, label)
 			}
 		}
@@ -367,24 +451,25 @@ func (a *Activity) trimAccepted(infos map[[16]byte]EndpointInfo) {
 }
 
 // admitUnknown allows at most capN distinct labels per Endpoint that its record
-// lacks. A label already allowed stays allowed. The hub bounds its auto client
-// rows by the same cap, so this keeps the traffic to labels from filling the
-// batches, not the table.
-func (a *Activity) admitUnknown(ep [16]byte, label string, capN uint32) bool {
+// lacks. A label already allowed stays allowed while it keeps being sent (its time is
+// renewed). The hub bounds its auto client rows by the same cap, so this keeps the
+// traffic to labels from filling the batches, not the table.
+func (a *Activity) admitUnknown(ep [16]byte, label string, capN uint32, now int64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	set := a.accepted[ep]
 	if _, ok := set[label]; ok {
+		set[label] = now
 		return true
 	}
 	if uint32(len(set)) >= capN {
 		return false
 	}
 	if set == nil {
-		set = map[string]struct{}{}
+		set = map[string]int64{}
 		a.accepted[ep] = set
 	}
-	set[label] = struct{}{}
+	set[label] = now
 	return true
 }
 
@@ -416,8 +501,12 @@ func (a *Activity) Requeue(b *telemetryv1.ActivityBatch) {
 		if cur, ok := a.pending[k]; ok {
 			s.first, s.last = min(s.first, cur.first), max(s.last, cur.last)
 		} else if len(a.pending) >= a.maxKeys {
-			a.dropped++
-			continue
+			// A default key was admitted once and carries claim activity: it makes room
+			// like a fresh one would (evictFor), every other key is dropped.
+			if k.label != DefaultLabel || !a.evictFor(k.ep, a.epStateFor(k.ep), true) {
+				a.dropped++
+				continue
+			}
 		}
 		a.place(k, s)
 	}

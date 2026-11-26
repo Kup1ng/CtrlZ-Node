@@ -259,7 +259,7 @@ func (h *Handler) route(ctx context.Context, req *listen.Request, set *Settings,
 	}
 
 	// Steps 5 to 9: SelectStack, Pre, the cache and router, Post.
-	stack, _ := sharedpolicy.SelectStack(id.st.view, policy.ClientHash(id.client), now.Unix())
+	stack, _ := sharedpolicy.SelectStack(id.st.view, id.stackClient(), now.Unix())
 	env := h.env()
 	final, pre := sharedpolicy.DecideWithPre(ctx, in, stack, &env, h.cfg.Resolver)
 	if final.WantGrant && h.cfg.Grants != nil && h.grantSafe(qn, pre.Params) {

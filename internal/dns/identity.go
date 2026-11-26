@@ -39,6 +39,35 @@ type ident struct {
 
 func (id *ident) known() bool { return id.st != nil || id.forceHard }
 
+// defaultClient is the label of the client a query that names none belongs to in
+// activity, in the analytics level and in the log (SC 12, P5 3.1). The hub makes
+// its row; a tenant may give it a profile or a level.
+const defaultClient = "default"
+
+// activityLabel is the client label of the activity report and of the effective
+// analytics level: the label the name or path carries, else "default".
+func (id *ident) activityLabel() string {
+	if id.client == "" {
+		return defaultClient
+	}
+	return id.client
+}
+
+// stackClient is the client hash SelectStack takes (SC 5.7). Plain DNS, which
+// has no label to carry, is the client "default" (P3 3.3: each claim identity
+// resolves as that client), so a profile set on "default" applies to it. An
+// encrypted query with no label is the identity "no client" of P3 3.3 and takes
+// no client stack: it goes on to the schedule and the base. The zero hash says so.
+func (id *ident) stackClient() [16]byte {
+	if id.claim != nil {
+		return identity.ClientHash(defaultClient)
+	}
+	if id.client == "" {
+		return [16]byte{}
+	}
+	return identity.ClientHash(id.client)
+}
+
 // identify finds the identity of a query by its transport (SC 3.3).
 func (h *Handler) identify(req *listen.Request, set *Settings, sv *Serving, now time.Time) ident {
 	switch req.Transport {
