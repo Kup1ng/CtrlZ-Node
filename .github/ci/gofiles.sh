@@ -17,7 +17,7 @@
 # the set ctrlz_lab, run by the job "tests (lab)" (.github/ci/lab.sh of each overlay): the
 # lab-tagged files and the lab-only golden vectors run there, and no release job builds them. The
 # second set, unboundlab, is the Node's T-031 test against a real Unbound, run by the job "unbound"
-# (.github/ci/unbound.sh), which runs that one package with the tag on the go test command line; the
+# (.github/ci/unbound.sh), which runs that one package with the tag on the go test command line (the Panel has no such job and no such set); the
 # test files that need it are built by that job only. A file
 # built under neither is refused. The table is keyed by the module path of the repository root, so a
 # repository that has no such job keeps the default build alone. The Panel runs this script on
@@ -44,7 +44,9 @@ bad=0
 # new one is a reviewed change that adds the job (ci.yml), names it here, and is read against the
 # workflow by ci/github/gofiles.test.mjs.
 case "$(cd "$root" && go list -m)" in
-  github.com/Kup1ng/CtrlZ-Node | github.com/Kup1ng/CtrlZ-Panel) tagsets="ctrlz_lab unboundlab" ;;
+  github.com/Kup1ng/CtrlZ-Node) tagsets="ctrlz_lab unboundlab" ;;
+  # The Panel has no job that runs unboundlab, so a Panel test behind it would be built by no job.
+  github.com/Kup1ng/CtrlZ-Panel) tagsets="ctrlz_lab" ;;
   *) tagsets="" ;;
 esac
 

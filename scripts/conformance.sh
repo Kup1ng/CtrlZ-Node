@@ -50,21 +50,78 @@ step_build() { go build -o "$bin" ./cmd/ctrlz-node; }
 # -p 2 and a timeout keep a hung test from holding a runner or a machine. CONFORMANCE_RUN, a go test -run
 # expression, narrows the test steps for debugging the suite on a small machine; a verdict for a bump is
 # never taken from a run that sets it.
+#
+# The run is -v so that a skipped test is seen. Some tests in these packages skip on purpose when a
+# library bump changes what they pin (dnsproxy no longer quoting the DoH query, "revisit D66"): a skip
+# there is the very signal this suite exists to give, and a plain "ok" would hide it. So every skipped
+# test is printed with its reason, and the step fails unless the reason is one of the environment skips
+# of skip_is_environment below.
 step_test() {
   run=""
   [ -z "${CONFORMANCE_RUN:-}" ] || run="-run $CONFORMANCE_RUN"
   log="$out/step-test.$$"
   rc=0
   # shellcheck disable=SC2086
-  go test -count=1 -p 2 -timeout 20m $run "$@" >"$log" 2>&1 || rc=$?
+  go test -v -count=1 -p 2 -timeout 20m $run "$@" >"$log" 2>&1 || rc=$?
   cat "$log"
   # A package with no test, or a -run that matches none, exits 0 and must not read as a pass.
   if grep -q -e 'no test files' -e 'no tests to run' "$log"; then
     echo "conformance: a package ran no test, which is a failure" >&2
     rc=1
   fi
+  skips_judged "$log" || rc=1
   rm -f "$log"
   return "$rc"
+}
+
+# The skips that depend on the machine and say nothing about a library: no IPv6 loopback, no 127.0.0.2,
+# and the Windows-only guards of tests that need a unix socket or a symlink rename. Anything else is a
+# test that gave up, and the step fails on it by name. A reason is matched, not a test name, because
+# the listener walk skips inside subtests whose names follow the transports.
+skip_is_environment() {
+  case "$1" in
+    *"no IPv6 loopback here"* | *"cannot use 127.0.0.2 here"* | *"which is Linux"*) return 0 ;;
+  esac
+  return 1
+}
+
+# skips_judged <go test -v log>: print every skipped test with its reason and return 1 when one of them
+# is not an environment skip. In -v output a test's log lines ("file_test.go:N: reason") follow its
+# "=== RUN" or "=== NAME" header and its "--- SKIP:" line comes later, so the reason is kept per test.
+skips_judged() {
+  list=$(awk '
+    /^=== (RUN|NAME|CONT) / { cur = $3; next }
+    /^ *[A-Za-z0-9_]+_test\.go:[0-9]+: / { r = $0; sub(/^ *[A-Za-z0-9_]+_test\.go:[0-9]+: /, "", r); reason[cur] = r; next }
+    /^ *--- SKIP: / { names[++k] = $3 }
+    # A parent whose subtests all skipped is reported as skipped itself and has no reason of its own:
+    # the subtests carry the reasons, so the parent is left out.
+    END {
+      for (i = 1; i <= k; i++) {
+        parent = 0
+        for (j = 1; j <= k; j++) if (index(names[j], names[i] "/") == 1) parent = 1
+        if (!parent) print names[i] "\t" reason[names[i]]
+      }
+    }
+  ' "$1")
+  [ -n "$list" ] || return 0
+  bad="$out/skip-bad.$$"
+  : >"$bad"
+  tab=$(printf '\t')
+  echo "$list" | while IFS="$tab" read -r name why; do
+    if skip_is_environment "$why"; then
+      echo "conformance: SKIPPED (environment) $name: $why" >&2
+    else
+      echo "conformance: SKIPPED $name: $why" >&2
+      echo x >>"$bad"
+    fi
+  done
+  if [ -s "$bad" ]; then
+    rm -f "$bad"
+    echo "conformance: a test skipped itself for a reason that is not an environment one, which is a failure (a skip in these packages pins a library behaviour)" >&2
+    return 1
+  fi
+  rm -f "$bad"
+  return 0
 }
 
 # Exit status 77 is "skipped", the convention of automake test drivers.

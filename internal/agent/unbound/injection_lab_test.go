@@ -262,14 +262,36 @@ func labParams(t *testing.T, k Kind, dir, name, usr string) Params {
 	return p
 }
 
+// stderrLogging turns the node's silent logging (logfile /dev/null, verbosity 0) into
+// errors on stderr, so a lame mark, a failed query or an anchor problem leaves a trace
+// in the output the test prints when it fails. Logging is not a setting under test: it
+// changes no answer. Every line it replaces must be present, so a template change that
+// moves one fails here and not silently.
+func stderrLogging(t *testing.T, conf string) string {
+	t.Helper()
+	for _, r := range [][2]string{
+		{"verbosity: 0", "verbosity: 1"},
+		{"logfile: \"/dev/null\"", "logfile: \"\""},
+		{"log-servfail: no", "log-servfail: yes"},
+	} {
+		if !strings.Contains(conf, r[0]) {
+			t.Fatalf("the rendered configuration has no %q: the lab cannot route Unbound's log to stderr", r[0])
+		}
+		conf = strings.Replace(conf, r[0], r[1], 1)
+	}
+	return conf
+}
+
 // startUnbound renders p (edit may change the text), starts the real process in
-// the foreground and waits until it answers.
+// the foreground and waits until it answers. Its stderr is printed when the test
+// fails (see stderrLogging).
 func startUnbound(t *testing.T, bin, dir, name string, p Params, edit func(string) string) {
 	t.Helper()
 	conf, err := Render(p)
 	if err != nil {
 		t.Fatal(err)
 	}
+	conf = stderrLogging(t, conf)
 	if edit != nil {
 		conf = edit(conf)
 	}
@@ -280,6 +302,17 @@ func startUnbound(t *testing.T, bin, dir, name string, p Params, edit func(strin
 	cmd := exec.Command(bin, "-d", "-c", path)
 	out := &syncBuf{}
 	cmd.Stdout, cmd.Stderr = out, out
+	// Registered before the kill below, so it runs after it and sees the whole output.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		o := out.String()
+		if len(o) > 16000 {
+			o = "...\n" + o[len(o)-16000:]
+		}
+		t.Logf("unbound %s output:\n%s", name, o)
+	})
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("%s: start: %v", name, err)
 	}
@@ -506,6 +539,12 @@ func TestInjectionLab(t *testing.T) {
 			}
 			wantA("poisoned.example.", dns.TypeA, "11.0.0.81")
 
+			// Only the first hostile name must be seen by the lab root. A reply stripped
+			// of every address may leave Unbound marking the lab root (its only server)
+			// lame, so a later name can be answered with no query sent; that is still a
+			// refusal, and demanding a query for it would turn a setup effect into a
+			// failed refusal. The first name and the controls prove the lab is reached.
+			firstHostile := true
 			refused := func(name string, qtype uint16, mixed bool) {
 				t.Helper()
 				m := ask(t, proc.at, name, qtype)
@@ -518,9 +557,10 @@ func TestInjectionLab(t *testing.T) {
 				if got := answerAddrs(m); !mixed && len(got) != 0 {
 					t.Errorf("%s: the client was given %v (rcode %s)", name, got, dns.RcodeToString[m.Rcode])
 				}
-				if !h.asked(name, proc.name) && !strings.HasPrefix(name, "chain") {
+				if firstHostile && !h.asked(name, proc.name) {
 					t.Errorf("%s: the lab root never saw this process ask, so the refusal proves nothing", name)
 				}
+				firstHostile = false
 			}
 			refused("mixed.example.", dns.TypeA, true)
 			for _, n := range []string{"inj1.example.", "inj2.example.", "chain-inj.example.", "chain-priv.example."} {
