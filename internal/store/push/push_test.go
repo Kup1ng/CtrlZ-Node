@@ -123,7 +123,13 @@ func TestRefusals(t *testing.T) {
 		{"lower version", f.signed(99, 2), hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION},
 		{"equal version with another flag", f.signed(100, 0, 1), hubv1.PushRefusal_PUSH_REFUSAL_FLAG_CONFLICT},
 	}
+	// SC 8a.5: a refused LOWER_VERSION is counted and is the last refusal, but it never
+	// replaces latest_refusal, so the previous case's refusal stays in force.
+	var wantLatest hubv1.PushRefusal
 	for i, c := range cases {
+		if c.want != hubv1.PushRefusal_PUSH_REFUSAL_LOWER_VERSION {
+			wantLatest = c.want
+		}
 		res := f.apply(c.env)
 		if res.Accepted || res.Refusal != c.want || res.Err == nil {
 			t.Errorf("%s: %+v", c.name, res)
@@ -133,7 +139,7 @@ func TestRefusals(t *testing.T) {
 			t.Errorf("%s changed the table in use", c.name)
 		}
 		st := f.w.Status()
-		if st.Refusals != uint64(i+1) || st.LastRefusal != c.want || st.LatestRefusal != c.want {
+		if st.Refusals != uint64(i+1) || st.LastRefusal != c.want || st.LatestRefusal != wantLatest {
 			t.Errorf("%s: %+v", c.name, st)
 		}
 	}
