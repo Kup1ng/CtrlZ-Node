@@ -164,6 +164,10 @@ func (e *glueEval) Evaluate(ctx context.Context, r *vectors.Request) (*vectors.O
 	st, _ := sharedpolicy.SelectStack(ep, r.ClientHash, in.Now)
 	envv := h.env()
 	envv.Locs = e.env.Locs
+	// The case's own node state (Self) and published latency go in through the shared
+	// Request.Apply, the call every harness makes (shared vectors, reference.go), so a
+	// case that changes the state of the node changes it the same way here.
+	envv = r.Apply(envv)
 	f, pre := sharedpolicy.DecideWithPre(ctx, &in, st, &envv, r.Resolver)
 	// The answer goes through the message the client would get and back.
 	m := new(dns.Msg)
