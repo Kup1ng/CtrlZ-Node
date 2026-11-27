@@ -192,3 +192,59 @@ func TestDNSBridgeBeforeAndAfterBind(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 }
+
+// fragPanics is a FragmentPart whose Fragments panics, as one that reads state its
+// Run has not set up yet would.
+type fragPanics struct{ fakePart }
+
+func (*fragPanics) Fragments() bool { panic("nil state") }
+
+// B1n-r2-1 and r2-4: Fragments is part-supplied code. A panic there costs that part
+// its fragments and is counted, and the config still reaches every part.
+func TestPartsConfigSurvivesAPanicInFragments(t *testing.T) {
+	bad := &fragPanics{}
+	after := &fakePart{}
+	a := &Agent{cfg: Config{Parts: []Part{bad, after}}}
+	nc := &hubv1.NodeConfig{Version: 4, XrayConfigs: []*hubv1.XrayConfig{{FragmentJson: []byte("{}")}}}
+	a.partsConfig(nc, nodecfg.Strip(nc))
+	if len(bad.configs) != 1 || len(bad.configs[0].XrayConfigs[0].FragmentJson) != 0 {
+		t.Fatal("the part whose Fragments panicked did not get the stripped copy")
+	}
+	if len(after.configs) != 1 || a.PartPanics() != 1 {
+		t.Fatalf("later part %d configs, %d panics", len(after.configs), a.PartPanics())
+	}
+}
+
+// B1n-r2-5: the proof_key is the one secret P4 keeps off disk, and only dns uses
+// it, so no part gets it, a FragmentPart included.
+func TestPartsConfigHasNoProofKey(t *testing.T) {
+	plain, frag := &fakePart{}, &fragPart{}
+	a := &Agent{cfg: Config{Parts: []Part{plain, frag}}}
+	nc := &hubv1.NodeConfig{Version: 4, ProofKey: []byte("0123456789abcdef0123456789abcdef")}
+	a.partsConfig(nc, nodecfg.Strip(nc))
+	if len(plain.configs[0].ProofKey) != 0 || len(frag.configs[0].ProofKey) != 0 {
+		t.Fatal("a part got the proof_key")
+	}
+	if len(nc.ProofKey) == 0 {
+		t.Fatal("the agent's own config lost its proof_key")
+	}
+}
+
+// B1n-r2-2 and r2-7: a message that the server would refuse is refused before the
+// server exists too, so the answer does not depend on timing.
+func TestDNSPublishChecksBeforeBind(t *testing.T) {
+	d := &DNS{}
+	bad := &sock.Msg{Type: sock.TypeLocations, Locations: &sock.Locations{Direct: "not-an-address"}}
+	if err := d.Publish(bad); err == nil {
+		t.Fatal("a bad locations message was accepted before bind")
+	}
+	if len(d.held) != 0 {
+		t.Fatal("a refused message was held")
+	}
+	good := &sock.Msg{Type: sock.TypeLocations, Locations: &sock.Locations{Direct: "127.0.0.1:1"}}
+	_ = d.Publish(good)
+	_ = d.Publish(bad)
+	if len(d.held) != 1 || d.held[0] != good {
+		t.Fatal("a refused message replaced the valid one that was held")
+	}
+}

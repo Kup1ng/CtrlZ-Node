@@ -331,8 +331,8 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 	// A NodeConfig is applied only above the highest version applied (L1), which is
 	// persisted with the config, so a replay of an older one changes nothing.
 	// What the agent keeps, and what dns gets, is the config without its Xray
-	// fragments (7.5): they hold the credentials of the exits. The parts get the whole
-	// config, below, and nothing else does.
+	// fragments (7.5): they hold the credentials of the exits. Only a FragmentPart gets
+	// the whole config, below, and nothing else does.
 	kept := nodecfg.Strip(c)
 	cur := a.cfgVersion.Load()
 	if c.Version < cur {

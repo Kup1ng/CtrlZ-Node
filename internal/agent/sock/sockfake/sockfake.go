@@ -90,6 +90,7 @@ const (
 	UIDProxy uint32 = 1002
 	UIDAgent uint32 = 1003
 	UIDBlock uint32 = 1004
+	UIDXray  uint32 = 1005 // ctrlz-xray, the account of xrayctl
 	UIDRoot  uint32 = 0
 )
 
@@ -113,8 +114,9 @@ func BlockPair() (block, agent *Endpoint[sock.BlockMsg]) {
 	return &Endpoint[sock.BlockMsg]{Conn: s, Codec: sock.BlockCodec}, &Endpoint[sock.BlockMsg]{Conn: c, Codec: sock.BlockCodec}
 }
 
-// CtlPair is the two ends of ctl.sock: xrayctl and its client.
+// CtlPair is the two ends of ctl.sock: xrayctl and its client. The client reads
+// the server as UIDXray, the account xrayctl runs as.
 func CtlPair() (ctl, client *Endpoint[sock.CtlMsg]) {
-	s, c := Pair(UIDAgent, UIDDNS)
+	s, c := Pair(UIDAgent, UIDXray)
 	return &Endpoint[sock.CtlMsg]{Conn: s, Codec: sock.CtlCodec}, &Endpoint[sock.CtlMsg]{Conn: c, Codec: sock.CtlCodec}
 }

@@ -67,7 +67,9 @@ func lenMax(name string, n, max int) error {
 // node (a SOCKS inbound, the bind address). Hostnames are refused: nothing here
 // may cause a lookup.
 func ipPort(name, s string) error {
-	if _, err := netip.ParseAddrPort(s); err != nil {
+	// A zone ("fe80::1%text") is refused: the text is peer-chosen and as long as the
+	// frame, and an interface-scoped address is not a thing 2.1 allows anywhere.
+	if a, err := netip.ParseAddrPort(s); err != nil || a.Addr().Zone() != "" {
 		return fmt.Errorf("sock: %s is not ip:port", name)
 	}
 	return nil
@@ -81,7 +83,10 @@ func hostOrIP(name, s string) error {
 	if s == "" || len(s) > 253 {
 		return fmt.Errorf("sock: %s is empty or too long", name)
 	}
-	if _, err := netip.ParseAddr(s); err == nil {
+	if a, err := netip.ParseAddr(s); err == nil {
+		if a.Zone() != "" {
+			return fmt.Errorf("sock: %s carries an IPv6 zone", name)
+		}
 		return nil
 	}
 	if !hostRE.MatchString(s) {
@@ -104,7 +109,7 @@ func reasonName(name, s string) error {
 
 // ipOnly checks a bare IP address (the proxy bind address).
 func ipOnly(name, s string) error {
-	if _, err := netip.ParseAddr(s); err != nil {
+	if a, err := netip.ParseAddr(s); err != nil || a.Zone() != "" {
 		return fmt.Errorf("sock: %s is not an IP address", name)
 	}
 	return nil

@@ -24,7 +24,8 @@ import (
 // Part is one of those parts, as the agent runs it.
 //
 // Run is started with the agent and ends with its context. Config gets each
-// applied NodeConfig, a copy of its own that the part may keep and change. The
+// applied NodeConfig, a copy of its own that the part may keep and change (it has no
+// proof_key). The
 // fragments (the credentials of the exits, 7.5) are in it only for a part that
 // says so with FragmentPart: the agent stores and hands dns a stripped copy, and
 // every other part gets one too, so a fragment reaches the one part that runs Xray
@@ -134,6 +135,11 @@ func (d *DNS) Publish(m *sock.Msg) error {
 	if m.Type != sock.TypeLocations {
 		return errors.New("agent: only the locations slot is published by a part")
 	}
+	// Checked before the server exists too: otherwise the same message is accepted
+	// early and refused later, and the replay in bind would drop it with nobody told.
+	if err := sock.Check(m); err != nil {
+		return err
+	}
 	d.mu.Lock()
 	srv := d.srv
 	if srv == nil {
@@ -204,15 +210,22 @@ func (a *Agent) PartPanics() uint64 { return a.partPanics.Load() }
 
 // partsConfig hands an applied NodeConfig on to every part, each its own copy:
 // kept is the config without fragments, c the whole one. A part that edits or keeps
-// its copy changes nothing for the agent or for another part, and only a
-// FragmentPart holds the credentials.
+// its copy changes nothing for the agent or for another part. Only a FragmentPart
+// holds the credentials, and no part gets the proof_key: only dns uses it, and it is
+// the one secret that P4 keeps off disk, which a part that stores its copy would
+// break.
 func (a *Agent) partsConfig(c, kept *hubv1.NodeConfig) {
 	for _, p := range a.cfg.Parts {
+		// Fragments() is part-supplied code, so it runs inside a recover too: a
+		// panic there must not unwind the config worker, which would kill the agent
+		// again at each restart (the hub resends the same version). The safe answer
+		// to a panic is the stripped copy.
 		src := kept
-		if fp, ok := p.(FragmentPart); ok && fp.Fragments() {
+		if fp, ok := p.(FragmentPart); ok && a.wantsFragments(p, fp) {
 			src = c
 		}
 		nc := proto.Clone(src).(*hubv1.NodeConfig)
+		nc.ProofKey = nil
 		func() {
 			defer func() {
 				if recover() != nil {
@@ -222,6 +235,17 @@ func (a *Agent) partsConfig(c, kept *hubv1.NodeConfig) {
 			p.Config(nc)
 		}()
 	}
+}
+
+// wantsFragments asks a FragmentPart and treats a panic as "no", counting it.
+func (a *Agent) wantsFragments(p Part, fp FragmentPart) (yes bool) {
+	defer func() {
+		if recover() != nil {
+			yes = false
+			notePanic(&a.partPanics, fmt.Sprintf("Fragments of %T", p))
+		}
+	}()
+	return fp.Fragments()
 }
 
 // partsHeartbeat lets every part fill the Heartbeat, then adds the fault set.

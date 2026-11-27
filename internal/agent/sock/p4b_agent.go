@@ -104,6 +104,10 @@ func isP4bType(t string) bool {
 	return false
 }
 
+// Check is the check that Send, Publish and the codec all make of a Msg, for a
+// caller that holds a message before there is a connection to send it on.
+func Check(m *Msg) error { return checkEnvelope(m) }
+
 // checkEnvelope is the one-field rule across both generations of Msg. A P4b type
 // is checked by checkP4b and may carry no P4 field beside its own; a P4 type may
 // carry no P4b field. Without it a grant_out frame could bring an unchecked

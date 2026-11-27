@@ -585,3 +585,36 @@ func TestFakePairsDoNotMakeTheProxyRoot(t *testing.T) {
 		t.Fatalf("the proxy reads dns as uid %d", u)
 	}
 }
+
+// B1n-r2-6: an IPv6 zone is peer-chosen text of any length and names an
+// interface-scoped address, so every IP field refuses it.
+func TestAddressFieldsRefuseAZone(t *testing.T) {
+	zone := "fe80::1%eth1"
+	src := []byte{10, 1, 2, 3}
+	cases := map[string]*sock.LinkMsg{
+		"open socks":  {Type: sock.TLinkOpen, Open: &sock.LinkOpen{Items: []sock.OpenItem{{ID: 1, Source: src, Socks: "[" + zone + "]:1"}}}},
+		"target host": {Type: sock.TLinkVerdict, Verdict: &sock.LinkVerdict{ID: 1, Kind: sock.VerdictProxy, Tag: []byte("t"), Targets: []sock.Target{{Socks: "127.0.0.20:1", Host: zone, Port: 443}}}},
+		"bind ip":     {Type: sock.TLinkConfig, Config: &sock.ProxyConfig{BindIP: zone}},
+		"end socks":   {Type: sock.TLinkEnd, End: &sock.LinkEnd{Socks: []string{"[" + zone + "]:1"}}},
+		"moved socks": {Type: sock.TLinkMoved, Moved: &sock.LinkMoved{ID: 1, Socks: "[" + zone + "]:1"}},
+	}
+	for name, m := range cases {
+		if err := sock.LinkCodec.Write(&bytes.Buffer{}, m); err == nil {
+			t.Errorf("%s: a zone was accepted", name)
+		}
+	}
+	m := &sock.Msg{Type: sock.TypeLocations, Locations: &sock.Locations{Direct: "[" + zone + "]:1"}}
+	if sock.Check(m) == nil {
+		t.Error("locations direct: a zone was accepted")
+	}
+}
+
+// B1n-r2-3: the client of ctl.sock reads the server as the xray account, not dns.
+func TestCtlPairServerIsXray(t *testing.T) {
+	ctl, client := sockfake.CtlPair()
+	defer ctl.Close()
+	defer client.Close()
+	if u, _ := sockfake.GetUID(client.Conn); u != sockfake.UIDXray || u == sockfake.UIDDNS {
+		t.Fatalf("the client reads the ctl server as uid %d", u)
+	}
+}
