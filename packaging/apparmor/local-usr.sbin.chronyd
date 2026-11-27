@@ -1,0 +1,10 @@
+# Local addition to Ubuntu's AppArmor profile of /usr/sbin/chronyd, which the
+# package's profile includes from /etc/apparmor.d/local/usr.sbin.chronyd
+# (p4-nodes 7.1, 7.10). The profile lets chronyd read /etc/chrony and nothing of
+# /etc/ctrlz, so without these lines it silently ignores the agent's drop-in and
+# the panel's CA file: the node would have no time source and keep a wrong clock.
+# Read-only, one directory.
+#
+# A host whose chrony package has no such profile ignores the file.
+/etc/ctrlz/chrony/ r,
+/etc/ctrlz/chrony/** r,
