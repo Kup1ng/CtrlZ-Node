@@ -18,6 +18,7 @@ import (
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/zonekeys"
+	"github.com/Kup1ng/CtrlZ-Node/internal/store/nodecfg"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store/push"
 )
 
@@ -329,6 +330,10 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 	}
 	// A NodeConfig is applied only above the highest version applied (L1), which is
 	// persisted with the config, so a replay of an older one changes nothing.
+	// What the agent keeps, and what dns gets, is the config without its Xray
+	// fragments (7.5): they hold the credentials of the exits. The parts get the whole
+	// config, below, and nothing else does.
+	kept := nodecfg.Strip(c)
 	cur := a.cfgVersion.Load()
 	if c.Version < cur {
 		return
@@ -344,12 +349,16 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 			return
 		}
 		a.cfgTaken.Store(true)
-		a.nodeCfg.Store(proto.Clone(c).(*hubv1.NodeConfig))
+		a.nodeCfg.Store(kept)
 		if a.srv != nil {
-			if b, err := proto.Marshal(c); err == nil {
+			if b, err := proto.Marshal(kept); err == nil {
 				_ = a.srv.Publish(&sock.Msg{Type: sock.TypeConfig, Config: &sock.Config{NodeConfig: b}})
 			}
 		}
+		// The parts have no other source for the fragments after a restart of the
+		// agent that their own files could not give back, so they get this build too.
+		// It is the same version, which is why Part.Config must be idempotent.
+		a.partsConfig(c)
 		return
 	}
 	a.cfgTaken.Store(true)
@@ -367,12 +376,13 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 		return
 	}
 	a.cfgVersion.Store(c.Version)
-	a.nodeCfg.Store(proto.Clone(c).(*hubv1.NodeConfig))
+	a.nodeCfg.Store(kept)
 	if a.srv != nil {
-		if b, err := proto.Marshal(c); err == nil {
+		if b, err := proto.Marshal(kept); err == nil {
 			_ = a.srv.Publish(&sock.Msg{Type: sock.TypeConfig, Config: &sock.Config{NodeConfig: b}})
 		}
 	}
+	a.partsConfig(c)
 	// dns binds its listeners once, at its start, from the NodeConfig on disk: a
 	// first config ends its Plain-only fallback, and a new bind address moves it.
 	a.mu.Lock()
@@ -386,9 +396,10 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 }
 
 // sameConfigButKey reports whether two NodeConfigs are the same apart from the
-// proof_key, which the stored one holds only as a stand-in.
+// proof_key, which the stored one holds only as a stand-in, and the Xray fragments,
+// which it does not hold at all.
 func sameConfigButKey(a, b *hubv1.NodeConfig) bool {
-	x, y := proto.Clone(a).(*hubv1.NodeConfig), proto.Clone(b).(*hubv1.NodeConfig)
+	x, y := nodecfg.Strip(a), nodecfg.Strip(b)
 	x.ProofKey, y.ProofKey = nil, nil
 	return proto.Equal(x, y)
 }
@@ -534,7 +545,7 @@ func (a *Agent) heartbeat() *hubv1.Heartbeat {
 			hb.Upstreams, hb.Qps, hb.CacheHitPermille, hb.Isolated = nil, 0, 0, false
 		}
 	}
-	return hb
+	return a.partsHeartbeat(hb)
 }
 
 // upstreamHealth turns dns's list into what a Heartbeat may carry: ids of 16

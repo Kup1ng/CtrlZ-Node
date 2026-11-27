@@ -77,6 +77,14 @@ type Msg struct {
 	Activity   *Activity   `json:"activity,omitempty"`
 	Stats      *Stats      `json:"stats,omitempty"`
 	Outbound   *Outbound   `json:"outbound,omitempty"`
+
+	// P4b (p4b-proxy 2.1), see p4b_agent.go.
+	Locations  *Locations  `json:"locations,omitempty"`
+	GrantIn    *GrantIn    `json:"grant_in,omitempty"`
+	GrantSent  *GrantSent  `json:"grant_sent,omitempty"`
+	GrantRes   *GrantRes   `json:"grant_res,omitempty"`
+	GrantOut   *GrantOut   `json:"grant_out,omitempty"`
+	ProxyState *ProxyState `json:"proxy_state,omitempty"`
 }
 
 // Hello opens the agent's side. RunID changes with every start of the agent,
@@ -265,11 +273,16 @@ var errFrame = errors.New("sock: frame over the size cap")
 
 // Write sends one frame.
 func Write(w io.Writer, m *Msg, max int) error {
+	if isP4bType(m.Type) {
+		if err := checkP4b(m); err != nil {
+			return err
+		}
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("sock: marshal: %w", err)
 	}
-	if len(b) > max {
+	if len(b) > max || isP4bType(m.Type) && len(b) > MaxFrame {
 		return errFrame
 	}
 	var h [4]byte
@@ -303,6 +316,14 @@ func Read(r io.Reader, max int) (*Msg, error) {
 	}
 	if m.Type == "" {
 		return nil, errors.New("sock: frame without a type")
+	}
+	if isP4bType(m.Type) && len(b) > MaxFrame {
+		return nil, errFrame
+	}
+	if isP4bType(m.Type) {
+		if err := checkP4b(m); err != nil {
+			return nil, err
+		}
 	}
 	return m, nil
 }

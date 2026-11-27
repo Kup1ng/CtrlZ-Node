@@ -31,6 +31,9 @@ type Handlers struct {
 	Activity   func(items []ActivityItem)
 	Stats      func(s Stats)
 	Outbound   func(nodeMessage []byte)
+	// Message gets the P4b types dns sends (grant_res, grant_out, proxy_state), whole,
+	// on the reader goroutine; the same rule as the handlers above: it must not block.
+	Message func(m *Msg)
 	// Connected is called with true after a dns connection passed the check and
 	// was given its state, and with false when it ends.
 	Connected func(up bool)
@@ -189,7 +192,7 @@ func (s *Server) Connected() bool {
 // same slot replaces the old.
 func keyOf(m *Msg) (string, bool) {
 	switch m.Type {
-	case TypeImage, TypeTable, TypeFacts, TypeConfig, TypeRevocations:
+	case TypeImage, TypeTable, TypeFacts, TypeConfig, TypeRevocations, TypeLocations:
 		return m.Type, true
 	case TypeZoneKey:
 		if m.ZoneKey == nil {
@@ -227,6 +230,11 @@ func (s *Server) Publish(m *Msg) error {
 	k, ok := keyOf(m)
 	if !ok {
 		return errors.New("sock: a message of this type cannot be published")
+	}
+	if isP4bType(m.Type) {
+		if err := checkP4b(m); err != nil {
+			return err
+		}
 	}
 	// The enqueue is under the lock, so two Publishes of one slot reach the
 	// connection in the order they were stored; enqueue never blocks.
@@ -382,8 +390,39 @@ func (s *Server) dispatch(m *Msg) (ok bool) {
 		if m.Outbound != nil && h.Outbound != nil {
 			h.Outbound(m.Outbound.NodeMessage)
 		}
+	case TypeGrantRes, TypeGrantOut, TypeProxyState:
+		if h.Message != nil {
+			h.Message(m)
+		}
 	default:
 		return false
 	}
 	return true
+}
+
+// Send queues an event for the connected dns and reports whether it was queued: an
+// event is not part of the snapshot, so a dns that is not connected, or that does
+// not keep up, simply does not get it. grant_in and grant_sent are events, and their
+// senders have a rule for the loss (a forward that is unanswered is `unsent`, 4.5).
+func (s *Server) Send(m *Msg) bool {
+	if m.Type != TypeGrantIn && m.Type != TypeGrantSent {
+		return false
+	}
+	// Check before queueing: a writer that fails on a bad message would otherwise
+	// close the connection of a dns that did nothing wrong.
+	if err := checkP4b(m); err != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return false
+	}
+	select {
+	case s.cur.out <- m:
+		return true
+	default:
+		s.cur.close()
+		return false
+	}
 }

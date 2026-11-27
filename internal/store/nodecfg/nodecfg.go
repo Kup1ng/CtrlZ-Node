@@ -84,10 +84,25 @@ func New(dir string, w *fsx.Writer) *Store {
 	return &Store{dir: dir, w: w}
 }
 
-// Redact returns a copy of c with proof_key replaced by ZeroProofKeyLen zero
-// bytes. It is the only form that reaches a file.
-func Redact(c *hubv1.NodeConfig) *hubv1.NodeConfig {
+// Strip returns a copy of c without the Xray fragments (p4b-proxy 7.5, finding 15).
+// A fragment holds the credentials of an exit. The agent keeps them in the Xray
+// manager's own 0600 files, and neither this store, which dns may read, nor the copy
+// dns gets over agent.sock holds one. The rest of each XrayConfig row stays: dns and
+// the validators need the ids, locations and priorities.
+func Strip(c *hubv1.NodeConfig) *hubv1.NodeConfig {
 	out := proto.Clone(c).(*hubv1.NodeConfig)
+	for _, x := range out.XrayConfigs {
+		if x != nil {
+			x.FragmentJson = nil
+		}
+	}
+	return out
+}
+
+// Redact returns a copy of c with proof_key replaced by ZeroProofKeyLen zero
+// bytes and the fragments stripped. It is the only form that reaches a file.
+func Redact(c *hubv1.NodeConfig) *hubv1.NodeConfig {
+	out := Strip(c)
 	out.ProofKey = make([]byte, ZeroProofKeyLen)
 	return out
 }

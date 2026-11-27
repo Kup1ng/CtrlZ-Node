@@ -98,6 +98,14 @@ type Config struct {
 	// NoSystem skips Unbound, nftables and chrony (a lab run, and most tests).
 	NoSystem bool
 
+	// Parts are the P4b parts (proxy link, Xray manager, block, peer): run with the
+	// agent, handed each applied NodeConfig, asked to fill each Heartbeat (parts.go).
+	// Faults is the set they raise faults in, and DNS their way to agent.sock; both are
+	// made before the parts so that the parts can hold them, and are made here when nil.
+	Parts  []Part
+	Faults *Faults
+	DNS    *DNS
+
 	// FSHook is a fault-injection point on the node's own disk writes, for tests.
 	FSHook func(path string, s fsx.Step) error
 
@@ -243,6 +251,12 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.Faults == nil {
+		cfg.Faults = NewFaults()
+	}
+	if cfg.DNS == nil {
+		cfg.DNS = &DNS{}
 	}
 	if cfg.Runner == nil || cfg.Files == nil {
 		return nil, errors.New("agent: a Runner and Files are required")
@@ -400,6 +414,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.srv = srv
 	go srv.Serve(ctx)
+	a.cfg.DNS.bind(srv)
 	a.publishAll()
 
 	var wg sync.WaitGroup
@@ -416,6 +431,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	start(func() { a.revSaveLoop(ctx) })
 	start(func() { a.systemLoop(ctx) })
 	start(func() { a.renewLoop(ctx) })
+	for _, p := range a.cfg.Parts {
+		start(func() { runPart(ctx, p) })
+	}
 	<-ctx.Done()
 	wg.Wait()
 	srv.Close()

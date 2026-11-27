@@ -422,6 +422,7 @@ func (a *Agent) sockHandlers() sock.Handlers {
 			}
 			a.ctl.Outside(m)
 		},
+		Message:   a.cfg.DNS.dispatch,
 		Connected: func(bool) { a.pokeTable() },
 	}
 }

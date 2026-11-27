@@ -230,3 +230,38 @@ func TestReadBindIP(t *testing.T) {
 		t.Logf("error: %v", err)
 	}
 }
+
+// A fragment holds the credentials of an exit. It must reach neither the stored
+// file (which dns may read) nor the copy Strip makes for dns (p4b-proxy 7.5), and
+// the caller's own config must keep it, because the Xray manager takes it from there.
+func TestSaveAndStripHoldNoXrayFragment(t *testing.T) {
+	dir := t.TempDir()
+	s := nodecfg.New(dir, nil)
+	secret := []byte(`{"outbounds":[{"settings":{"password":"hunter2-not-a-real-secret"}}]}`)
+	c := cfg(9, storetest.RandomSecret(t, 32))
+	c.XrayConfigs = []*hubv1.XrayConfig{{Id: bytes.Repeat([]byte{1}, 16), Location: 3, Tag: "exit-a", Priority: 1, Enabled: true, FragmentJson: secret}}
+	if err := s.Save(c); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(c.XrayConfigs[0].FragmentJson, secret) {
+		t.Fatal("Save edited the caller's fragment")
+	}
+	if storetest.Contains(t, dir, []byte("hunter2-not-a-real-secret")) {
+		t.Fatal("a fragment reached a file")
+	}
+	got, err := s.LoadServing(agentConf(t, goodConf))
+	if err != nil || got.Source != nodecfg.Current {
+		t.Fatalf("%+v %v", got, err)
+	}
+	x := got.Config.XrayConfigs
+	if len(x) != 1 || x[0].Tag != "exit-a" || x[0].Location != 3 || len(x[0].FragmentJson) != 0 {
+		t.Fatalf("the stored row is not the row without its fragment: %+v", x)
+	}
+	st := nodecfg.Strip(c)
+	if len(st.XrayConfigs[0].FragmentJson) != 0 || !bytes.Equal(st.ProofKey, c.ProofKey) {
+		t.Fatal("Strip must drop the fragment and keep the proof_key dns needs")
+	}
+	if len(c.XrayConfigs[0].FragmentJson) == 0 {
+		t.Fatal("Strip edited its argument")
+	}
+}
