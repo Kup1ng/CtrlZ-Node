@@ -110,10 +110,10 @@ func (c Codec[M]) ReadSized(r io.Reader) (*M, int, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(m); err != nil {
-		return nil, 0, fmt.Errorf("sock: decode: %w", err)
+		return nil, 0, decodeErr(err)
 	}
-	if dec.More() {
-		return nil, 0, errors.New("sock: bytes after the message")
+	if err := noTrailing(dec); err != nil {
+		return nil, 0, err
 	}
 	if c.IsList != nil && c.IsList(m) && int(n) > MaxPartBytes {
 		return nil, 0, ErrFrame
@@ -122,6 +122,36 @@ func (c Codec[M]) ReadSized(r io.Reader) (*M, int, error) {
 		return nil, 0, err
 	}
 	return m, int(n), nil
+}
+
+// decodeErr turns an encoding/json error into a fixed text. The library quotes the
+// key of an unknown field and the literal of a wrong number, both chosen by the
+// peer and as long as the frame, and a reader that logs its read error would then
+// write the peer's text into the journal on every reconnect (an error names the
+// field and never a value: 5.2 step 7).
+func decodeErr(err error) error {
+	kind := "field or value"
+	var syn *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &syn):
+		kind = "syntax"
+	case errors.As(err, &typ):
+		kind = "type"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		kind = "short body"
+	}
+	return errors.New("sock: decode failed: " + kind)
+}
+
+// noTrailing refuses any byte after the first value but white space. Decoder.More
+// is not that check: it answers false before a closing bracket, so `}` or `]` after
+// the message would pass. A second Token call must report the end of the input.
+func noTrailing(dec *json.Decoder) error {
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("sock: bytes after the message")
+	}
+	return nil
 }
 
 // SplitList cuts items into the parts of a list: at most MaxPartItems each and at

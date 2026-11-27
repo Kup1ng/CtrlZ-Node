@@ -88,7 +88,7 @@ type GrantSent struct {
 }
 
 // ProxyState is what dns knows of the proxy, every 10 s and on a change of DNSBind
-// or Listening. Full is true while a node_cap refusal is less than 60 s old.
+// or Listening. DNSBind is a bare IP. Full is true while a node_cap refusal is less than 60 s old.
 type ProxyState struct {
 	DNSBind   string `json:"dns_bind,omitempty"`
 	Listening bool   `json:"listening"`
@@ -102,6 +102,35 @@ func isP4bType(t string) bool {
 		return true
 	}
 	return false
+}
+
+// checkEnvelope is the one-field rule across both generations of Msg. A P4b type
+// is checked by checkP4b and may carry no P4 field beside its own; a P4 type may
+// carry no P4b field. Without it a grant_out frame could bring an unchecked
+// outbound along to every subscriber that receives the whole Msg.
+func checkEnvelope(m *Msg) error {
+	if isP4bType(m.Type) {
+		if m.hasP4Field() {
+			return errors.New("sock: a P4b frame carries a P4 field")
+		}
+		return checkP4b(m)
+	}
+	if m.hasP4bField() {
+		return errors.New("sock: a P4 frame carries a P4b field")
+	}
+	return nil
+}
+
+func (m *Msg) hasP4bField() bool {
+	return m.Locations != nil || m.GrantIn != nil || m.GrantSent != nil ||
+		m.GrantRes != nil || m.GrantOut != nil || m.ProxyState != nil
+}
+
+func (m *Msg) hasP4Field() bool {
+	return m.Hello != nil || m.Image != nil || m.Table != nil || m.Facts != nil ||
+		m.ZoneKey != nil || m.Config != nil || m.Revocations != nil || m.Acme != nil ||
+		m.ImageAck != nil || m.FreeCounts != nil || m.Activity != nil ||
+		m.Stats != nil || m.Outbound != nil
 }
 
 // checkP4b validates the P4b types of a Msg. The older types are left alone: their
@@ -131,7 +160,9 @@ func checkP4b(m *Msg) error {
 			if m.ProxyState.DNSBind == "" {
 				return nil
 			}
-			return ipPort("dns_bind", m.ProxyState.DNSBind)
+			// A bare IP, the dns_bind_ip that dns serves on (2.1); the port is the one
+			// of DNS and adds nothing.
+			return ipOnly("dns_bind", m.ProxyState.DNSBind)
 		}},
 	)
 }

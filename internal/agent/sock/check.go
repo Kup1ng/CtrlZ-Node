@@ -109,3 +109,37 @@ func ipOnly(name, s string) error {
 	}
 	return nil
 }
+
+// wireName checks the wire form of a lookup name: length-prefixed labels of 1 to
+// 63 bytes, ended by the zero label, at most 255 bytes, in the lower-case form
+// `names` makes (a to z, 0 to 9, hyphen, underscore). The proxy parses hostile
+// ClientHellos, so dns must not take on trust that a name it is handed was
+// normalised: a label that runs past the end, or a byte outside the set, is a bug
+// or an attack, and either way the frame ends the connection.
+func wireName(b []byte) error {
+	if len(b) < 2 || len(b) > MaxNameWire {
+		return errors.New("sock: lookup name has the wrong length")
+	}
+	i := 0
+	for {
+		if i >= len(b) {
+			return errors.New("sock: lookup name is not rooted")
+		}
+		l := int(b[i])
+		if l == 0 {
+			if i != len(b)-1 || i == 0 {
+				return errors.New("sock: lookup name has bytes after its root or no label")
+			}
+			return nil
+		}
+		if l > 63 || i+1+l >= len(b) {
+			return errors.New("sock: lookup name has a bad label")
+		}
+		for _, c := range b[i+1 : i+1+l] {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return errors.New("sock: lookup name has a byte outside its form")
+			}
+		}
+		i += 1 + l
+	}
+}

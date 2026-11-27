@@ -273,10 +273,8 @@ var errFrame = errors.New("sock: frame over the size cap")
 
 // Write sends one frame.
 func Write(w io.Writer, m *Msg, max int) error {
-	if isP4bType(m.Type) {
-		if err := checkP4b(m); err != nil {
-			return err
-		}
+	if err := checkEnvelope(m); err != nil {
+		return err
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -312,7 +310,7 @@ func Read(r io.Reader, max int) (*Msg, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(m); err != nil {
-		return nil, fmt.Errorf("sock: decode: %w", err)
+		return nil, decodeErr(err)
 	}
 	if m.Type == "" {
 		return nil, errors.New("sock: frame without a type")
@@ -320,10 +318,15 @@ func Read(r io.Reader, max int) (*Msg, error) {
 	if isP4bType(m.Type) && len(b) > MaxFrame {
 		return nil, errFrame
 	}
+	// The P4 types keep their older reading; the P4b ones are held to the rule of
+	// the other sockets: nothing after the message.
 	if isP4bType(m.Type) {
-		if err := checkP4b(m); err != nil {
+		if err := noTrailing(dec); err != nil {
 			return nil, err
 		}
+	}
+	if err := checkEnvelope(m); err != nil {
+		return nil, err
 	}
 	return m, nil
 }

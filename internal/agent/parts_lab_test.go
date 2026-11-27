@@ -30,6 +30,7 @@ func (p *labPart) Config(nc *hubv1.NodeConfig) {
 	p.configs = append(p.configs, nc)
 	p.mu.Unlock()
 }
+func (p *labPart) Fragments() bool { return true }
 func (p *labPart) Heartbeat(hb *hubv1.Heartbeat) {
 	hb.Proxy = &hubv1.ProxyState{Listening: true, OpenConnections: 3}
 }

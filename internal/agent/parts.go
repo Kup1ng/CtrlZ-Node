@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -21,9 +24,12 @@ import (
 // Part is one of those parts, as the agent runs it.
 //
 // Run is started with the agent and ends with its context. Config gets each
-// applied NodeConfig with its Xray fragments (the agent stores and hands dns a
-// stripped copy, 7.5), and only hands it on: the part must copy what it needs and
-// return quickly, because the config worker waits for it. The same config version
+// applied NodeConfig, a copy of its own that the part may keep and change. The
+// fragments (the credentials of the exits, 7.5) are in it only for a part that
+// says so with FragmentPart: the agent stores and hands dns a stripped copy, and
+// every other part gets one too, so a fragment reaches the one part that runs Xray
+// and nobody else. Config only hands the config on: the part must copy what it
+// needs and return quickly, because the config worker waits for it. The same config version
 // can arrive again once per run, when the hub resends it to a new stream, so Config
 // must be idempotent. Heartbeat fills the part's fields in the Heartbeat that is
 // due. It reads atomics and takes no lock that the part's own work holds (L11): a
@@ -34,6 +40,12 @@ type Part interface {
 	Run(ctx context.Context)
 	Config(nc *hubv1.NodeConfig)
 	Heartbeat(hb *hubv1.Heartbeat)
+}
+
+// FragmentPart is implemented by the part that needs the Xray fragments (the Xray
+// manager). Fragments is read at each config, so it may depend on the part's state.
+type FragmentPart interface {
+	Fragments() bool
 }
 
 // Guard is the nftables guard of 5.5 as the Xray manager sees it: Check reads the
@@ -60,9 +72,11 @@ func NewFaults() *Faults { return &Faults{} }
 // 5 and p6-ops starts at 6, so 31 leaves room.
 const maxFault = 31
 
-// Set turns a fault on or off. A value outside the enum's range is ignored, so a
-// part built against a newer shared than the hub's cannot make a Heartbeat that the
-// hub refuses (the hub refuses an unknown fault).
+// Set turns a fault on or off. A value that the enum of this build does not know
+// is ignored, so a typo or a bit past the set cannot reach a Heartbeat. This does
+// not protect against a hub whose shared is older than the node's: it would refuse
+// a fault that only the node's shared knows, and the panel is therefore deployed
+// with a shared at least as new as the nodes' before a part sets such a fault.
 func (f *Faults) Set(fault hubv1.NodeFault, on bool) {
 	if fault <= 0 || fault > maxFault || !validFault(fault) {
 		return
@@ -106,17 +120,24 @@ type DNS struct {
 	mu   sync.Mutex
 	srv  *sock.Server
 	subs []func(*sock.Msg)
-	// held are the state slots published before the server existed.
+	// held are the state slots published before the server existed, the last
+	// message of each: a slot is the whole list each time, so an older one has no
+	// use and replaying it after a newer one would put the stale list back.
 	held []*sock.Msg
+	// panics counts the subscribers that panicked.
+	panics atomic.Uint64
 }
 
-// Publish sets a state slot of agent.sock (`locations`): dns gets it now if it is
-// connected, and with every later snapshot.
+// Publish sets a state slot of agent.sock (`locations`, the only slot a part
+// owns): dns gets it now if it is connected, and with every later snapshot.
 func (d *DNS) Publish(m *sock.Msg) error {
+	if m.Type != sock.TypeLocations {
+		return errors.New("agent: only the locations slot is published by a part")
+	}
 	d.mu.Lock()
 	srv := d.srv
 	if srv == nil {
-		d.held = append(d.held, m)
+		d.held = []*sock.Msg{m}
 	}
 	d.mu.Unlock()
 	if srv == nil {
@@ -142,16 +163,17 @@ func (d *DNS) Subscribe(f func(*sock.Msg)) {
 	d.mu.Unlock()
 }
 
-// bind attaches the server and sends what was published before it existed.
+// bind attaches the server and sends what was published before it existed. The
+// replay is under the lock that makes the server visible: a Publish that comes
+// right after the release then goes behind the replayed message and not before it.
 func (d *DNS) bind(srv *sock.Server) {
 	d.mu.Lock()
-	d.srv = srv
-	held := d.held
-	d.held = nil
-	d.mu.Unlock()
-	for _, m := range held {
+	defer d.mu.Unlock()
+	for _, m := range d.held {
 		_ = srv.Publish(m)
 	}
+	d.held = nil
+	d.srv = srv
 }
 
 func (d *DNS) dispatch(m *sock.Msg) {
@@ -160,17 +182,43 @@ func (d *DNS) dispatch(m *sock.Msg) {
 	d.mu.Unlock()
 	for _, f := range subs {
 		func() {
-			defer func() { _ = recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					notePanic(&d.panics, "a subscriber of agent.sock")
+				}
+			}()
 			f(m)
 		}()
 	}
 }
 
-// partsConfig hands an applied NodeConfig on to every part.
-func (a *Agent) partsConfig(nc *hubv1.NodeConfig) {
+// notePanic counts a recovered panic and logs where it was, with fixed text. The
+// panic value is never logged: it may be built from a fragment or a key.
+func notePanic(n *atomic.Uint64, where string) {
+	n.Add(1)
+	log.Printf("agent: a panic was recovered in %s", where)
+}
+
+// PartPanics is the number of panics of the parts that the agent recovered.
+func (a *Agent) PartPanics() uint64 { return a.partPanics.Load() }
+
+// partsConfig hands an applied NodeConfig on to every part, each its own copy:
+// kept is the config without fragments, c the whole one. A part that edits or keeps
+// its copy changes nothing for the agent or for another part, and only a
+// FragmentPart holds the credentials.
+func (a *Agent) partsConfig(c, kept *hubv1.NodeConfig) {
 	for _, p := range a.cfg.Parts {
+		src := kept
+		if fp, ok := p.(FragmentPart); ok && fp.Fragments() {
+			src = c
+		}
+		nc := proto.Clone(src).(*hubv1.NodeConfig)
 		func() {
-			defer func() { _ = recover() }()
+			defer func() {
+				if recover() != nil {
+					notePanic(&a.partPanics, fmt.Sprintf("Config of %T", p))
+				}
+			}()
 			p.Config(nc)
 		}()
 	}
@@ -188,6 +236,7 @@ func (a *Agent) partsHeartbeat(hb *hubv1.Heartbeat) *hubv1.Heartbeat {
 			defer func() {
 				if recover() != nil {
 					ok = false
+					notePanic(&a.partPanics, fmt.Sprintf("Heartbeat of %T", p))
 				}
 			}()
 			p.Heartbeat(try)
@@ -203,10 +252,15 @@ func (a *Agent) partsHeartbeat(hb *hubv1.Heartbeat) *hubv1.Heartbeat {
 	return cur
 }
 
-// runPart runs one part. A part that panics ends alone: the agent keeps serving, and
-// the part's own supervision (systemd for its unit, the fault it raised) tells the
-// admin. It is not restarted here, because a part that panics at once would spin.
-func runPart(ctx context.Context, p Part) {
-	defer func() { _ = recover() }()
+// runPart runs one part. A part that panics ends alone: the agent keeps serving.
+// It is not restarted here, because a part that panics at once would spin; the
+// panic is logged and counted (PartPanics), and a part that has to tell the admin
+// does so by its own fault.
+func (a *Agent) runPart(ctx context.Context, p Part) {
+	defer func() {
+		if recover() != nil {
+			notePanic(&a.partPanics, fmt.Sprintf("Run of %T", p))
+		}
+	}()
 	p.Run(ctx)
 }

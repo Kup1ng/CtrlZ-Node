@@ -9,6 +9,7 @@ import (
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
+	"github.com/Kup1ng/CtrlZ-Node/internal/store/nodecfg"
 )
 
 func TestFaultsSetListAndRange(t *testing.T) {
@@ -99,14 +100,47 @@ func TestPartsHeartbeatKeepsGoodPartsAndDropsBadOnes(t *testing.T) {
 	}
 }
 
+// fragPart opts in to the fragments.
+type fragPart struct{ fakePart }
+
+func (*fragPart) Fragments() bool { return true }
+
 func TestPartsConfigGoesToEveryPartAndSurvivesAPanic(t *testing.T) {
 	p1 := &fakePart{cfg: func(*hubv1.NodeConfig) { panic("boom") }}
 	p2 := &fakePart{}
 	a := &Agent{cfg: Config{Parts: []Part{p1, p2}}}
 	nc := &hubv1.NodeConfig{Version: 4, XrayConfigs: []*hubv1.XrayConfig{{FragmentJson: []byte("{}")}}}
-	a.partsConfig(nc)
-	if len(p2.configs) != 1 || p2.configs[0] != nc || len(p2.configs[0].XrayConfigs[0].FragmentJson) == 0 {
-		t.Fatal("the part after a panicking one did not get the whole config")
+	a.partsConfig(nc, nodecfg.Strip(nc))
+	if len(p2.configs) != 1 || p2.configs[0].Version != 4 {
+		t.Fatal("the part after a panicking one did not get the config")
+	}
+	if a.PartPanics() != 1 {
+		t.Fatalf("the panic was not counted: %d", a.PartPanics())
+	}
+}
+
+// B1n-r1-3: a fragment reaches only the part that asked for it, and every part has
+// a copy of its own, so an edit by one changes neither the agent's config nor
+// another part's.
+func TestPartsConfigFragmentsOnlyToTheirPartAndCopiesAreOwn(t *testing.T) {
+	var edit = func(nc *hubv1.NodeConfig) { nc.Version = 99; nc.XrayConfigs[0].Tag = "edited" }
+	plain := &fakePart{cfg: edit}
+	frag := &fragPart{}
+	plain2 := &fakePart{}
+	a := &Agent{cfg: Config{Parts: []Part{plain, frag, plain2}}}
+	nc := &hubv1.NodeConfig{Version: 4, XrayConfigs: []*hubv1.XrayConfig{{Tag: "t", FragmentJson: []byte("{}")}}}
+	a.partsConfig(nc, nodecfg.Strip(nc))
+	if len(plain.configs[0].XrayConfigs[0].FragmentJson) != 0 || len(plain2.configs[0].XrayConfigs[0].FragmentJson) != 0 {
+		t.Fatal("a part that did not ask for fragments got one")
+	}
+	if string(frag.configs[0].XrayConfigs[0].FragmentJson) != "{}" {
+		t.Fatal("the fragment part did not get its fragment")
+	}
+	if nc.Version != 4 || nc.XrayConfigs[0].Tag != "t" || frag.configs[0].Version != 4 || plain2.configs[0].XrayConfigs[0].Tag != "t" {
+		t.Fatal("one part's edit reached the agent's config or another part")
+	}
+	if frag.configs[0] == nc {
+		t.Fatal("the part got the agent's own pointer")
 	}
 }
 
@@ -114,8 +148,12 @@ func TestRunPartSurvivesAPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { defer close(done); runPart(ctx, &panicRunner{}) }()
+	a := &Agent{}
+	go func() { defer close(done); a.runPart(ctx, &panicRunner{}) }()
 	<-done
+	if a.PartPanics() != 1 {
+		t.Fatalf("the panic of Run was not counted: %d", a.PartPanics())
+	}
 }
 
 type panicRunner struct{ fakePart }
@@ -134,6 +172,16 @@ func TestDNSBridgeBeforeAndAfterBind(t *testing.T) {
 	}
 	if len(d.held) != 1 {
 		t.Fatal("the published slot was not held")
+	}
+	// Two publishes before the server: only the last is held, so a replay cannot put
+	// an older list over a newer one (B1n-r1-6).
+	newer := &sock.Msg{Type: sock.TypeLocations, Locations: &sock.Locations{Direct: "127.0.0.1:1"}}
+	_ = d.Publish(newer)
+	if len(d.held) != 1 || d.held[0] != newer {
+		t.Fatalf("held %d messages, the last one is not the newer", len(d.held))
+	}
+	if err := d.Publish(&sock.Msg{Type: sock.TypeImage}); err == nil {
+		t.Fatal("a part published a slot that is not its own")
 	}
 	var got []string
 	d.Subscribe(func(m *sock.Msg) { got = append(got, "a:"+m.Type) })

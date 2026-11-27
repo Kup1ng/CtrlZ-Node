@@ -358,7 +358,7 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 		// The parts have no other source for the fragments after a restart of the
 		// agent that their own files could not give back, so they get this build too.
 		// It is the same version, which is why Part.Config must be idempotent.
-		a.partsConfig(c)
+		a.partsConfig(c, kept)
 		return
 	}
 	a.cfgTaken.Store(true)
@@ -382,7 +382,7 @@ func (a *Agent) onNodeConfig(ctx context.Context, c *hubv1.NodeConfig) {
 			_ = a.srv.Publish(&sock.Msg{Type: sock.TypeConfig, Config: &sock.Config{NodeConfig: b}})
 		}
 	}
-	a.partsConfig(c)
+	a.partsConfig(c, kept)
 	// dns binds its listeners once, at its start, from the NodeConfig on disk: a
 	// first config ends its Plain-only fallback, and a new bind address moves it.
 	a.mu.Lock()

@@ -2,6 +2,8 @@ package sock
 
 import (
 	"bytes"
+	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,7 +98,7 @@ func TestDNSSendsTheP4bTypesItMay(t *testing.T) {
 	for _, m := range []*Msg{
 		{Type: TypeGrantRes, GrantRes: &GrantRes{GrantID: gid, Accepted: true}},
 		{Type: TypeGrantOut, GrantOut: &GrantOut{Forward: []byte("f")}},
-		{Type: TypeProxyState, ProxyState: &ProxyState{DNSBind: "203.0.113.5:53", Listening: true, Open: 4}},
+		{Type: TypeProxyState, ProxyState: &ProxyState{DNSBind: "203.0.113.5", Listening: true, Open: 4}},
 	} {
 		if err := Write(c, m, MaxFrameFromDNS); err != nil {
 			t.Fatal(err)
@@ -142,5 +144,103 @@ func TestP4bTypeNeedsExactlyItsField(t *testing.T) {
 	}
 	if err := Write(&buf, &Msg{Type: TypeProxyState, ProxyState: &ProxyState{DNSBind: "dns.example:53"}}, MaxFrameFromDNS); err == nil {
 		t.Fatal("a name where an address belongs")
+	}
+}
+
+// B1n-r1-1: dns_bind is the bare IP of dns_bind_ip, not ip:port.
+func TestProxyStateDNSBindIsABareIP(t *testing.T) {
+	var buf bytes.Buffer
+	for _, ok := range []string{"", "203.0.113.5", "2001:db8::5"} {
+		if err := Write(&buf, &Msg{Type: TypeProxyState, ProxyState: &ProxyState{DNSBind: ok, Listening: true}}, MaxFrameFromDNS); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"203.0.113.5:53", "[2001:db8::5]:53", "dns.example"} {
+		if err := Write(&buf, &Msg{Type: TypeProxyState, ProxyState: &ProxyState{DNSBind: bad}}, MaxFrameFromDNS); err == nil {
+			t.Errorf("%q was written", bad)
+		}
+	}
+}
+
+// B1n-r1-13: a frame carries the field of its own generation alone.
+func TestEnvelopeKeepsTheGenerationsApart(t *testing.T) {
+	var buf bytes.Buffer
+	gid := bytes.Repeat([]byte{1}, 16)
+	p4bWithP4 := &Msg{Type: TypeGrantOut, GrantOut: &GrantOut{Forward: []byte("f")}, Outbound: &Outbound{NodeMessage: []byte("x")}}
+	if err := Write(&buf, p4bWithP4, MaxFrameFromDNS); err == nil {
+		t.Fatal("a grant_out frame with an outbound was written")
+	}
+	p4withP4b := &Msg{Type: TypeOutbound, Outbound: &Outbound{NodeMessage: []byte("x")}, GrantRes: &GrantRes{GrantID: gid}}
+	if err := Write(&buf, p4withP4b, MaxFrameFromDNS); err == nil {
+		t.Fatal("an outbound frame with a grant_res was written")
+	}
+	// The reader refuses the same two frames.
+	for _, body := range []string{
+		`{"t":"grant_out","grant_out":{"fwd":"Zg=="},"outbound":{"nm":"eA=="}}`,
+		`{"t":"outbound","outbound":{"nm":"eA=="},"grant_res":{"gid":"AAAAAAAAAAAAAAAAAAAAAA==","ok":true}}`,
+	} {
+		var f bytes.Buffer
+		f.Write([]byte{0, 0, 0, byte(len(body))})
+		f.WriteString(body)
+		if _, err := Read(&f, MaxFrameFromDNS); err == nil {
+			t.Errorf("read %s", body[:20])
+		}
+	}
+	s := startServer(t, ServerConfig{})
+	if err := s.Publish(p4bWithP4); err == nil {
+		t.Fatal("Publish took a mixed frame")
+	}
+}
+
+// B1n-r1-4 and 10: nothing but white space follows a P4b frame's message, also on
+// agent.sock, and a decode error does not carry the peer's text.
+func TestAgentSockReadTrailingAndDecodeText(t *testing.T) {
+	gid := `"AAAAAAAAAAAAAAAAAAAAAA=="`
+	good := `{"t":"grant_res","grant_res":{"gid":` + gid + `,"ok":true}}`
+	frame := func(body string) *bytes.Reader {
+		var f bytes.Buffer
+		f.Write([]byte{0, 0, 0, byte(len(body))})
+		f.WriteString(body)
+		return bytes.NewReader(f.Bytes())
+	}
+	if _, err := Read(frame(good+" \n"), MaxFrameFromDNS); err != nil {
+		t.Fatalf("white space after the message: %v", err)
+	}
+	for _, tail := range []string{"}", "]", " } junk", "{}"} {
+		if _, err := Read(frame(good+tail), MaxFrameFromDNS); err == nil {
+			t.Errorf("tail %q accepted", tail)
+		}
+	}
+	key := strings.Repeat("K", 100)
+	_, err := Read(frame(`{"t":"grant_res","`+key+`":1}`), MaxFrameFromDNS)
+	if err == nil || strings.Contains(err.Error(), key[:10]) {
+		t.Fatalf("the error is missing or quotes the peer's key: %v", err)
+	}
+}
+
+// B1n-r1-8: dns's Client refuses a bad P4b message before it is queued, so the
+// writer never fails on it and the link stays up.
+func TestClientSendRefusesABadP4bMessage(t *testing.T) {
+	p := sockPath(t)
+	cfg := ServerConfig{Path: p, Check: allow}
+	s, err := Listen(cfg)
+	if err != nil {
+		t.Skip(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Serve(ctx)
+	defer s.Close()
+	cl := NewClient(p, ClientHandlers{})
+	go cl.Run(ctx)
+	eventually(t, "client up", cl.Up)
+	if cl.Send(&Msg{Type: TypeGrantRes, GrantRes: &GrantRes{GrantID: bytes.Repeat([]byte{1}, 15)}}) {
+		t.Fatal("a grant_res with a 15 byte id was queued")
+	}
+	if !cl.Send(&Msg{Type: TypeGrantRes, GrantRes: &GrantRes{GrantID: bytes.Repeat([]byte{1}, 16), Accepted: true}}) {
+		t.Fatal("a good grant_res was refused")
+	}
+	if !cl.Up() {
+		t.Fatal("the link went down")
 	}
 }

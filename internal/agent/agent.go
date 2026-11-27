@@ -133,7 +133,9 @@ type Config struct {
 // Agent is a running agent.
 type Agent struct {
 	cfg Config
-	now func() time.Time
+	// partPanics counts the panics of parts that were recovered (parts.go).
+	partPanics atomic.Uint64
+	now        func() time.Time
 
 	root  *store.Root
 	fsw   *fsx.Writer
@@ -432,7 +434,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	start(func() { a.systemLoop(ctx) })
 	start(func() { a.renewLoop(ctx) })
 	for _, p := range a.cfg.Parts {
-		start(func() { runPart(ctx, p) })
+		start(func() { a.runPart(ctx, p) })
 	}
 	<-ctx.Done()
 	wg.Wait()

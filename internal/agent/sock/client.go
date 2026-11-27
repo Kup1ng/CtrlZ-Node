@@ -43,6 +43,11 @@ func (c *Client) Up() bool {
 // the link is down or the queue is full: counters and activity are best effort,
 // and a message dns cannot send now is dropped rather than held in memory.
 func (c *Client) Send(m *Msg) bool {
+	// Checked before queueing: the writer goroutine would otherwise fail on a bad
+	// P4b message and close the whole link, with the image acks and counters on it.
+	if checkEnvelope(m) != nil {
+		return false
+	}
 	c.mu.Lock()
 	out := c.out
 	c.mu.Unlock()

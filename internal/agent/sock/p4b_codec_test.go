@@ -458,3 +458,130 @@ func mustJSON(t *testing.T, v any) string {
 }
 
 func newPipe() (net.Conn, net.Conn) { return net.Pipe() }
+
+// B1n-r1-4 and 10: a closing bracket after the message is a byte after the
+// message, though json.Decoder.More says there is nothing more.
+func TestLinkRefusesAClosingBracketAfterTheMessage(t *testing.T) {
+	base := `{"t":"hello","hello":{"run":1}}`
+	if _, err := sock.LinkCodec.Read(bytes.NewReader(raw(base + " \n"))); err != nil {
+		t.Fatalf("white space after the message: %v", err)
+	}
+	for _, tail := range []string{"}", "]", "}}", " ]junk", "{}"} {
+		if _, err := sock.LinkCodec.Read(bytes.NewReader(raw(base + tail))); err == nil {
+			t.Errorf("tail %q accepted", tail)
+		}
+	}
+}
+
+// B1n-r1-12: the error of a decode does not carry text the peer chose.
+func TestDecodeErrorsDoNotQuoteThePeer(t *testing.T) {
+	key := strings.Repeat("Z", 5000)
+	for _, body := range []string{
+		`{"t":"hello","` + key + `":1}`,
+		`{"t":"hello","hello":{"run":"` + key + `"}}`,
+		`{"t":"hello","hello":{"run":1.5e999999}}`,
+	} {
+		_, err := sock.LinkCodec.Read(bytes.NewReader(raw(body)))
+		if err == nil {
+			t.Fatal("accepted")
+		}
+		if len(err.Error()) > 100 || strings.Contains(err.Error(), "ZZZZ") {
+			t.Fatalf("the error carries the peer's text: %.120s", err.Error())
+		}
+	}
+}
+
+// B1n-r1-2: a node that has seen many operators can still answer stats.
+func TestStatsResHoldsTheCountersOfManyASNs(t *testing.T) {
+	mk := func(n int) *sock.LinkMsg {
+		c := make([]sock.Counter, n)
+		for i := range c {
+			c[i] = sock.Counter{Name: "prefix24_unique", Value: uint64(i)}
+		}
+		return &sock.LinkMsg{Type: sock.TLinkStatsRes, StatsRes: &sock.LinkStatsRes{Counters: c}}
+	}
+	var buf bytes.Buffer
+	if err := sock.LinkCodec.Write(&buf, mk(600)); err != nil { // about 100 ASNs at six names
+		t.Fatalf("600 counters: %v", err)
+	}
+	if _, err := sock.LinkCodec.Read(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := sock.LinkCodec.Write(&bytes.Buffer{}, mk(sock.MaxCounters)); err != nil {
+		t.Fatalf("the cap itself: %v", err)
+	}
+	if err := sock.LinkCodec.Write(&bytes.Buffer{}, mk(sock.MaxCounters+1)); err == nil {
+		t.Fatal("over the cap")
+	}
+}
+
+// B1n-r1-5: a block-page connection has no SOCKS leg; the open list may name it
+// with an empty socks, and a socks that is there must still be ip:port.
+func TestOpenItemOfABlockPageHasNoSocks(t *testing.T) {
+	src := []byte{10, 1, 2, 3}
+	ok := &sock.LinkMsg{Type: sock.TLinkOpen, Open: &sock.LinkOpen{Items: []sock.OpenItem{{ID: 1, Source: src, Tag: []byte("t")}}, Last: true}}
+	var buf bytes.Buffer
+	if err := sock.LinkCodec.Write(&buf, ok); err != nil {
+		t.Fatal(err)
+	}
+	got, err := sock.LinkCodec.Read(&buf)
+	if err != nil || got.Open.Items[0].Socks != "" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	bad := &sock.LinkMsg{Type: sock.TLinkOpen, Open: &sock.LinkOpen{Items: []sock.OpenItem{{ID: 1, Source: src, Socks: "localhost:1"}}}}
+	if err := sock.LinkCodec.Write(&bytes.Buffer{}, bad); err == nil {
+		t.Fatal("a socks that is not ip:port")
+	}
+}
+
+// B1n-r1-11: a lookup name is held to the wire form `names` makes.
+func TestLookupNameIsHeldToItsWireForm(t *testing.T) {
+	src := []byte{10, 1, 2, 3}
+	try := func(name string) error {
+		return sock.LinkCodec.Write(&bytes.Buffer{}, &sock.LinkMsg{Type: sock.TLinkLookup, Lookup: &sock.LinkLookup{ID: 1, Source: src, Name: []byte(name), Port: 443}})
+	}
+	for _, ok := range []string{"\x03www\x07example\x03com\x00", "\x01a\x00", "\x05a-b_1\x00", "\x0b" + strings.Repeat("a", 11) + "\x00"} {
+		if err := try(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	long := strings.Repeat("\x3f"+strings.Repeat("a", 63), 4) + "\x00" // 257 bytes
+	for name, bad := range map[string]string{
+		"label past the end": "\x3fA\x00",
+		"upper case":         "\x03WWW\x00",
+		"not rooted":         "\x03www",
+		"root only":          "\x00",
+		"bytes after root":   "\x01a\x00\x01b\x00",
+		"label of 64":        "\x40" + strings.Repeat("a", 64) + "\x00",
+		"compression":        "\xc0\x0c",
+		"dot in a label":     "\x03a.b\x00",
+		"space":              "\x03a b\x00",
+		"too long":           long,
+		"zero label inside":  "\x01a\x00\x00",
+	} {
+		if try(bad) == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// B1n-r1-15: the fake pairs give each end its own uid, and the proxy is not root.
+func TestFakePairsDoNotMakeTheProxyRoot(t *testing.T) {
+	dns, proxy := sockfake.LinkPair()
+	defer dns.Close()
+	defer proxy.Close()
+	w, err := sock.PeerRole(sockfake.GetUID, dns.Conn, sockfake.UIDProxy)
+	if err != nil || w != sock.WhoProxy || !w.May(sock.TLinkHello) {
+		t.Fatalf("the proxy end: %v %v", w, err)
+	}
+	rdns, rclient := sockfake.LinkPairAs(sockfake.UIDRoot)
+	defer rdns.Close()
+	defer rclient.Close()
+	w, err = sock.PeerRole(sockfake.GetUID, rdns.Conn, sockfake.UIDProxy)
+	if err != nil || w != sock.WhoRoot || w.May(sock.TLinkHello) || !w.May(sock.TLinkStats) {
+		t.Fatalf("the root client: %v %v", w, err)
+	}
+	if u, _ := sockfake.GetUID(proxy.Conn); u != sockfake.UIDDNS {
+		t.Fatalf("the proxy reads dns as uid %d", u)
+	}
+}

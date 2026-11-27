@@ -231,10 +231,8 @@ func (s *Server) Publish(m *Msg) error {
 	if !ok {
 		return errors.New("sock: a message of this type cannot be published")
 	}
-	if isP4bType(m.Type) {
-		if err := checkP4b(m); err != nil {
-			return err
-		}
+	if err := checkEnvelope(m); err != nil {
+		return err
 	}
 	// The enqueue is under the lock, so two Publishes of one slot reach the
 	// connection in the order they were stored; enqueue never blocks.
@@ -410,7 +408,7 @@ func (s *Server) Send(m *Msg) bool {
 	}
 	// Check before queueing: a writer that fails on a bad message would otherwise
 	// close the connection of a dns that did nothing wrong.
-	if err := checkP4b(m); err != nil {
+	if err := checkEnvelope(m); err != nil {
 		return false
 	}
 	s.mu.Lock()

@@ -82,20 +82,39 @@ func (e *Endpoint[M]) Recv() (*M, error) {
 // Close closes the connection.
 func (e *Endpoint[M]) Close() { _ = e.Conn.Close() }
 
-// LinkPair is the two ends of proxy.sock: the dns end and the proxy end.
+// The uids of the fake processes. They are distinct and only root is 0: a pair that
+// gave every end uid 0 would make the proxy read as root, and a test that wanted
+// its frames accepted would then be tempted to skip the role check.
+const (
+	UIDDNS   uint32 = 1001
+	UIDProxy uint32 = 1002
+	UIDAgent uint32 = 1003
+	UIDBlock uint32 = 1004
+	UIDRoot  uint32 = 0
+)
+
+// LinkPair is the two ends of proxy.sock: the dns end and the proxy end. dns reads
+// its peer as UIDProxy and the proxy reads dns as UIDDNS, so PeerRole with
+// UIDProxy says WhoProxy.
 func LinkPair() (dns, proxy *Endpoint[sock.LinkMsg]) {
-	s, c := Pair(0, 0)
+	return LinkPairAs(UIDProxy)
+}
+
+// LinkPairAs is LinkPair with the uid that dns reads its peer as: UIDRoot for the
+// client of stats, another value for a stranger.
+func LinkPairAs(peerUID uint32) (dns, proxy *Endpoint[sock.LinkMsg]) {
+	s, c := Pair(peerUID, UIDDNS)
 	return &Endpoint[sock.LinkMsg]{Conn: s, Codec: sock.LinkCodec}, &Endpoint[sock.LinkMsg]{Conn: c, Codec: sock.LinkCodec}
 }
 
 // BlockPair is the two ends of the block agent socket: block and the agent.
 func BlockPair() (block, agent *Endpoint[sock.BlockMsg]) {
-	s, c := Pair(0, 0)
+	s, c := Pair(UIDAgent, UIDBlock)
 	return &Endpoint[sock.BlockMsg]{Conn: s, Codec: sock.BlockCodec}, &Endpoint[sock.BlockMsg]{Conn: c, Codec: sock.BlockCodec}
 }
 
 // CtlPair is the two ends of ctl.sock: xrayctl and its client.
 func CtlPair() (ctl, client *Endpoint[sock.CtlMsg]) {
-	s, c := Pair(0, 0)
+	s, c := Pair(UIDAgent, UIDDNS)
 	return &Endpoint[sock.CtlMsg]{Conn: s, Codec: sock.CtlCodec}, &Endpoint[sock.CtlMsg]{Conn: c, Codec: sock.CtlCodec}
 }

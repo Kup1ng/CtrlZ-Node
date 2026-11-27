@@ -39,10 +39,14 @@ const (
 
 // Caps of the link's fields.
 const (
-	MaxTag       = 1 << 10 // an opaque tag of the verdict, 1 KiB (2.1)
-	MaxTargets   = 3
-	MaxNameWire  = 255
-	MaxCounters  = 256
+	MaxTag      = 1 << 10 // an opaque tag of the verdict, 1 KiB (2.1)
+	MaxTargets  = 3
+	MaxNameWire = 255
+	// MaxCounters is a stats_res: the width counters of 4.3 are six names for each
+	// client ASN, so 4096 holds about 680 operators and stays near 250 KiB, well
+	// inside the 1 MiB frame. A smaller cap made a node that had seen many operators
+	// unable to answer stats at all.
+	MaxCounters  = 4096
 	MaxRefusals  = 64
 	MaxIDsPerMsg = MaxPartItems
 	// maxStartMS is the age of a connection at its end (12: 24 h), so a start
@@ -78,10 +82,13 @@ type LinkHello struct {
 // OpenItem is one open connection the proxy reports after it connects: its id (a
 // counter of 64 bits), the client source (4 or 16 bytes), the SOCKS address of its
 // target, and the tag of the verdict that opened it (the charge it keeps, 4.3).
+// A block-page connection (kind 2) is spliced to serve.sock and has no SOCKS leg:
+// its Socks is empty, and that is how dns tells it from a kind 1 connection when it
+// rebuilds its table and counts the open connections of each kind (5.4).
 type OpenItem struct {
 	ID     uint64 `json:"id"`
 	Source []byte `json:"src"`
-	Socks  string `json:"socks"`
+	Socks  string `json:"socks,omitempty"`
 	Tag    []byte `json:"tag,omitempty"`
 }
 
@@ -288,8 +295,10 @@ func (o *LinkOpen) check() error {
 		if err := srcIP("open source", it.Source); err != nil {
 			return err
 		}
-		if err := ipPort("open socks", it.Socks); err != nil {
-			return err
+		if it.Socks != "" {
+			if err := ipPort("open socks", it.Socks); err != nil {
+				return err
+			}
 		}
 		if err := lenMax("tag", len(it.Tag), MaxTag); err != nil {
 			return err
@@ -324,8 +333,8 @@ func (l *LinkLookup) check() error {
 	if err := srcIP("lookup source", l.Source); err != nil {
 		return err
 	}
-	if len(l.Name) == 0 || len(l.Name) > MaxNameWire {
-		return errors.New("sock: lookup name has the wrong length")
+	if err := wireName(l.Name); err != nil {
+		return err
 	}
 	if l.Port != 80 && l.Port != 443 {
 		return errors.New("sock: lookup port is not 80 or 443")

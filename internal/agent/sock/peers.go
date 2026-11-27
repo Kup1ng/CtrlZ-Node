@@ -12,12 +12,13 @@ import (
 // the P4b sockets are built from these names, resolved to uids once, when the
 // socket is created: a uid is never read from a file the peer can write.
 const (
-	UserDNS    = "ctrlz-dns"
-	UserAgent  = "ctrlz-agent"
-	UserProxy  = "ctrlz-proxy"
-	UserBlock  = "ctrlz-block"
-	UserXray   = "ctrlz-xray"
-	UserXrayct = "ctrlz-xrayctl"
+	UserDNS   = "ctrlz-dns"
+	UserAgent = "ctrlz-agent"
+	UserProxy = "ctrlz-proxy"
+	UserBlock = "ctrlz-block"
+	// UserXray is also the account of ctrlz-xrayctl (7.5): there is no account of
+	// its own, and ctl.sock's peers are the agent and root.
+	UserXray = "ctrlz-xray"
 )
 
 // UIDGetter reads a connection's peer uid. PeerUID is the real one; tests give
