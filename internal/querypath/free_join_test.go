@@ -338,16 +338,40 @@ func TestFreeJoinRefusesWhenTheUpstreamPoolIsFull(t *testing.T) {
 	cfg := labConfig(t, 1, commonv1.ResolveMode_RESOLVE_MODE_UPSTREAM, upstreamRow('D', up.addr, 20000))
 	l := startJoinLab(t, 5389, local.addr, querypath.FreeOptions{Unbound: netip.MustParseAddrPort(free.addr), MissCap: 10000}, cfg)
 
+	// The fill is written at once over a few connections and never read. A miss holds
+	// its stream for policy.FetchDeadline (8 s), so the pool is full only while all 256
+	// are in flight together. One connection a query took seconds to deliver on a
+	// loaded host (SYN retransmits on a full accept queue): the first fills had expired
+	// before the last arrived, which left room for the one-too-many query, and the
+	// silent upstream turned that into an i/o timeout (red-1 of INT2 review 3).
 	const fill = resolve.FreeTCPConns * resolve.FreeStreamCap
-	var wg sync.WaitGroup
-	for i := 0; i < fill; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			_, _ = l.ask("fill"+strconv.Itoa(i)+".example.net", true) // waits for the upstream, which never answers
-		}(i)
+	const fillConns = 8
+	d := &net.Dialer{Timeout: 3 * time.Second, LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.9")}}
+	var open []net.Conn
+	t.Cleanup(func() {
+		for _, c := range open {
+			_ = c.Close()
+		}
+	})
+	for c := 0; c < fillConns; c++ {
+		cn, err := d.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(l.ports.DNS))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		open = append(open, cn)
+		var burst []byte
+		for i := 0; i < fill/fillConns; i++ {
+			b, err := q("fill"+strconv.Itoa(c)+"-"+strconv.Itoa(i)+".example.net", dns.TypeA).Pack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			burst = append(append(burst, byte(len(b)>>8), byte(len(b))), b...)
+		}
+		_ = cn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := cn.Write(burst); err != nil {
+			t.Fatal(err)
+		}
 	}
-	t.Cleanup(wg.Wait)
 	eventually(t, 30*time.Second, "every connection full", func() bool { return up.frames.Load() >= fill })
 
 	r, err := l.ask("one-too-many.example.net", true)

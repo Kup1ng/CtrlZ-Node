@@ -170,13 +170,37 @@ func (g *Guard) IsSettled() bool {
 // chains, whatever this process has applied. The table outlives the agent, so after a
 // restart this is the only way to know that the uids of running slots are still
 // bound; the agent keeps such a table rather than replace it by one without them.
-func (g *Guard) HoldsProxyChains(ctx context.Context) bool {
+//
+// known is false when the kernel could not be asked: a timeout, a busy nft, a
+// cancelled ctx. That is not the answer "no chains", and the caller must not act on
+// it as if it were (INT2-r2-1, INT2-r2-4). The Runner drops stderr, so a missing table
+// cannot be told from another failure by its text; it is told by asking for the list of
+// tables, which succeeds without ours when ours is absent.
+func (g *Guard) HoldsProxyChains(ctx context.Context) (holds, known bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	rctx, cancel := context.WithTimeout(ctx, readTimeout)
 	defer cancel()
-	out, err := g.run.Run(ctx, nil, "nft", "-s", "list", "table", "inet", Table)
-	return err == nil && bytes.Contains(out, []byte("chain xray_out"))
+	out, err := g.run.Run(rctx, nil, "nft", "-s", "list", "table", "inet", Table)
+	if err == nil {
+		return bytes.Contains(out, []byte("chain xray_out")), true
+	}
+	if ctx.Err() != nil {
+		return false, false
+	}
+	lctx, lcancel := context.WithTimeout(ctx, readTimeout)
+	defer lcancel()
+	tabs, err := g.run.Run(lctx, nil, "nft", "list", "tables")
+	if err != nil {
+		return false, false
+	}
+	for _, l := range bytes.Split(tabs, []byte{0x0a}) {
+		if f := bytes.Fields(l); len(f) == 3 && string(f[0]) == "table" && string(f[1]) == "inet" && string(f[2]) == Table {
+			// Listed, yet the read failed: nft is struggling, not the table missing.
+			return false, false
+		}
+	}
+	return false, true
 }
 
 func (g *Guard) settle() { g.settledOnce.Do(func() { close(g.settled) }) }

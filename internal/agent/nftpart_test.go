@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 
@@ -292,6 +293,9 @@ type fakeKernel struct {
 	mu     sync.Mutex
 	table  string
 	refuse func(script string) bool
+	// failRead makes every read of the kernel fail with an error that is not "no such
+	// table" (nft busy, a timeout): the answer is unknown.
+	failRead bool
 }
 
 func (k *fakeKernel) reply(c fake.Call) ([]byte, error) {
@@ -303,7 +307,17 @@ func (k *fakeKernel) reply(c fake.Call) ([]byte, error) {
 			return nil, errors.New("refused")
 		}
 		k.table = string(c.Stdin)
+	case len(c.Args) == 2 && c.Args[0] == "list" && c.Args[1] == "tables":
+		if k.failRead {
+			return nil, errors.New("busy")
+		}
+		if k.table != "" {
+			return []byte("table inet ctrlz_agent\n"), nil
+		}
 	case len(c.Args) > 0 && c.Args[0] == "-s":
+		if k.failRead {
+			return nil, errors.New("busy")
+		}
 		if k.table == "" {
 			return nil, errors.New("no such table")
 		}
@@ -448,5 +462,94 @@ func TestNftAnsweredLookupIsStored(t *testing.T) {
 	later.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no such host") }
 	if got := later.resolvePanel(context.Background(), cfg); len(got) != 1 || got[0] != want {
 		t.Errorf("the stored address was not used: %v", got)
+	}
+}
+
+// INT2-r2-1, INT2-r2-4: a kernel that cannot be read is not a kernel with no chains. The
+// older table stays over an unrenderable proxy part, and over a script nft refuses.
+func TestNftUnreadableKernelKeepsTheOlderTable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		prep func(a *Agent, k *fakeKernel)
+	}{
+		{"unrenderable part", func(a *Agent, k *fakeKernel) { a.cfg.Conf.ProxyBindIP = a.cfg.Conf.DNSBindIP }},
+		{"nft refuses the script", func(a *Agent, k *fakeKernel) {
+			k.refuse = func(s string) bool { return strings.Contains(s, "chain xray_out") }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := kernelWithChains(t)
+			before := k.table
+			a, r := restarted(t, k, goodUIDs)
+			tc.prep(a, k)
+			k.failRead = true
+			a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+			for _, s := range nftScripts(r) {
+				if !strings.Contains(s, "chain xray_out") {
+					t.Fatal("the table of P4 was applied over a kernel that could not be read")
+				}
+			}
+			k.failRead = false
+			if k.table != before {
+				t.Error("the kernel table changed")
+			}
+		})
+	}
+}
+
+// HoldsProxyChains tells a table that is absent from a kernel that cannot be asked.
+func TestHoldsProxyChainsKnownAndUnknown(t *testing.T) {
+	ctx := context.Background()
+	k := &fakeKernel{}
+	g := nft.NewGuard(&fake.Runner{Reply: k.reply})
+	if holds, known := g.HoldsProxyChains(ctx); holds || !known {
+		t.Errorf("no table: holds=%v known=%v, want false true", holds, known)
+	}
+	k.table = "chain input {}"
+	if holds, known := g.HoldsProxyChains(ctx); holds || !known {
+		t.Errorf("a table without chains: holds=%v known=%v, want false true", holds, known)
+	}
+	k.table = "chain xray_out {}"
+	if holds, known := g.HoldsProxyChains(ctx); !holds || !known {
+		t.Errorf("a table with chains: holds=%v known=%v, want true true", holds, known)
+	}
+	k.failRead = true
+	if _, known := g.HoldsProxyChains(ctx); known {
+		t.Error("a failed read was taken as an answer")
+	}
+	// The read fails but the table is listed: nft is struggling, not the table missing.
+	k.failRead = false
+	g2 := nft.NewGuard(&fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
+		if len(c.Args) > 0 && c.Args[0] == "-s" {
+			return nil, errors.New("busy")
+		}
+		return []byte("table inet ctrlz_agent\n"), nil
+	}})
+	if _, known := g2.HoldsProxyChains(ctx); known {
+		t.Error("a listed table that could not be read was taken as absent")
+	}
+}
+
+// INT2-r2-2, INT2-r2-3: a hub lookup that never answers is cut short, so the first
+// apply is made with the stored addresses well inside the guard's settle wait.
+func TestNftBlockedHubLookupFallsBackToTheStoredAddresses(t *testing.T) {
+	k := kernelWithChains(t)
+	a, _ := restarted(t, k, goodUIDs)
+	a.cfg.Conf.Hub = "hub.invalid:443"
+	a.nftTable.lookupWait = 50 * time.Millisecond
+	a.nftTable.lookup = func(ctx context.Context, _ string) ([]netip.Addr, error) {
+		<-ctx.Done() // a resolver that drops packets
+		return nil, ctx.Err()
+	}
+	a.cfg.Root = "/var/lib/ctrlz"
+	a.cfg.Files = fake.NewFiles(nil)
+	a.cfg.Files.(*fake.Files).Set(panelFile(a.cfg), "198.51.100.20\n")
+	start := time.Now()
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the apply waited %s on the lookup", d)
+	}
+	if !a.cfg.NftGuard.IsSettled() || !a.cfg.NftGuard.Check() {
+		t.Error("the guard is not on with the stored addresses")
 	}
 }

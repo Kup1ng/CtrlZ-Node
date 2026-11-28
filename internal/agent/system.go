@@ -207,6 +207,8 @@ type nftApplier struct {
 	panel []netip.Addr
 	// lookup resolves the hub name; nil takes the system resolver (a test gives its own).
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// lookupWait bounds one hub lookup; 0 means defaultLookupWait. A test shortens it.
+	lookupWait time.Duration
 	// g, when set, applies the table and keeps the read-back of 5.5 (nftpart.go).
 	g *nft.Guard
 }
@@ -217,19 +219,22 @@ func (n *nftApplier) apply(ctx context.Context, cfg Config, al alert.Alerter, dn
 
 // applyWith is apply with the proxy chains of p4b-proxy 5.5 (px nil: the table of P4).
 func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter, dnsIP netip.Addr, px *nft.ProxyParams) {
-	// kept says whether the kernel holds a table of ours with the proxy chains. It is read
+	// kept says whether the older table is to be kept: the kernel holds a table of ours
+	// with the proxy chains, or it could not be asked (an unknown answer is no proof that
+	// the chains are gone, INT2-r2-1, INT2-r2-4). It is read
 	// from the kernel and not from this process: the table outlives the agent (no
 	// ExecStop), so a restarted agent has applied nothing and still faces the chains
 	// that bind the uids of the slots that kept running (INT2-r1-1, INT2-r1-4). The
 	// answer cannot change under us: a refused script leaves the table as it was, and
 	// this loop is the only one that applies.
-	var keptKnown, keptVal bool
+	var keptRead, keptVal bool
 	kept := func() bool {
 		if n.g == nil {
 			return false
 		}
-		if !keptKnown {
-			keptVal, keptKnown = n.g.HoldsProxyChains(ctx), true
+		if !keptRead {
+			holds, known := n.g.HoldsProxyChains(ctx)
+			keptVal, keptRead = holds || !known, true
 		}
 		return keptVal
 	}
@@ -317,6 +322,10 @@ func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter
 	n.mu.Unlock()
 }
 
+// defaultLookupWait is the bound of one hub lookup, far below the 30 s the Xray manager
+// waits for the guard's first attempt.
+const defaultLookupWait = 3 * time.Second
+
 // panelFile is where the hub's addresses of the last answered lookup are kept. The
 // table is rendered from addresses, and a restarted agent whose host resolver cannot
 // answer yet (it may be the Unbound that was just started) would otherwise render
@@ -335,13 +344,24 @@ func panelFile(cfg Config) string {
 // none.
 func (n *nftApplier) resolvePanel(ctx context.Context, cfg Config) []netip.Addr {
 	var got []netip.Addr
+	// The lookup is bounded well under the guard's settle wait (Timing.GuardSettle): a
+	// resolver that drops packets takes the system's retries, 30 s or more, and the
+	// Xray manager would read the guard as off and stop slots whose table is intact
+	// in the kernel. The addresses stored on disk stand in for a lookup that did not
+	// answer in time (INT2-r2-2, INT2-r2-3).
+	wait := n.lookupWait
+	if wait <= 0 {
+		wait = defaultLookupWait
+	}
+	lctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
 	lookup := n.lookup
 	if lookup == nil {
 		lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 		}
 	}
-	if ips, err := lookup(ctx, cfg.Conf.HubHost()); err == nil {
+	if ips, err := lookup(lctx, cfg.Conf.HubHost()); err == nil {
 		for _, ip := range ips {
 			got = append(got, ip.Unmap())
 		}
