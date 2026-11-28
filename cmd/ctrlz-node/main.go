@@ -1,0 +1,88 @@
+// Command ctrlz-node is the one node binary. systemd starts it as separate
+// services (dns, proxy, agent), so a crash in the proxy cannot take DNS down and
+// each service gets only the privileges and sockets it needs. One binary keeps
+// the roles in lockstep: they cannot be upgraded out of sync.
+//
+// Roles: dns serves queries, agent holds the panel link and the host side, proxy
+// is idle in P4 and binds nothing, block serves the branded block page (internal/blockpage), upgrade is the root one-shot that installs a
+// downloaded node bundle (internal/upgrade), version prints the version.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
+	"github.com/Kup1ng/CtrlZ-Node/internal/blockpage"
+	"github.com/Kup1ng/CtrlZ-Node/internal/dnsrole"
+	"github.com/Kup1ng/CtrlZ-Node/internal/upgrade"
+)
+
+// version is stamped at release time with -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ctrlz-node dns|proxy|agent|block|upgrade <version>|version")
+		return 2
+	}
+	if args[0] == "version" {
+		fmt.Println(version)
+		return 0
+	}
+	// upgrade is the root one-shot of 7.1. It handles HUP, INT and TERM itself, so that
+	// apply.sh's exit trap runs and the staging directory is removed; it must not sit
+	// under the signal context below, which would turn the first signal into a plain
+	// cancel that nothing here waits for.
+	if args[0] == "upgrade" {
+		return upgrade.Run(args[1:])
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var err error
+	switch args[0] {
+	case "dns":
+		err = runDNS(ctx)
+	case "proxy":
+		// Idle in P4: the proxy role binds nothing and holds nothing. The unit exists
+		// so the install and the sandbox are the final ones when P4b fills it.
+		<-ctx.Done()
+	case "agent":
+		err = agent.Main(ctx, version)
+	case "block":
+		// The branded block page process (p4b-proxy 10): unit ctrlz-block, no capability.
+		err = blockpage.Run(ctx, blockpage.Config{})
+	default:
+		fmt.Fprintf(os.Stderr, "unknown role %q\n", args[0])
+		return 2
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "ctrlz-node %s: %v\n", args[0], err)
+		return 1
+	}
+	return 0
+}
+
+func runDNS(ctx context.Context) error {
+	return dnsrole.Run(ctx, dnsrole.Config{
+		Root:      envOr("CTRLZ_ROOT", agent.DefaultRoot),
+		AgentConf: envOr("CTRLZ_AGENT_CONF", agent.DefaultConf),
+		SockPath:  envOr("CTRLZ_AGENT_SOCK", agent.DefaultSock),
+		Build:     queryPath(),
+	})
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
