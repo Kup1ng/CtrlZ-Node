@@ -33,26 +33,40 @@ func (m *Manager) sleep(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	case <-t.C:
-		return true
+		return !m.guardLost()
 	}
 }
 
 // reconcile brings the running set to the wanted one, one config at a time (7.5).
 func (m *Manager) reconcile(ctx context.Context) {
 	if !m.guardOn {
-		return // both slots are down; onGuard starts them again and reconciles
+		return // both slots are down; syncGuard starts them again and reconciles
 	}
 	m.ensureActive(ctx)
-	if m.baseSig == "" {
-		m.baseSig = m.baseSignature()
-	} else if sig := m.baseSignature(); sig != m.baseSig {
-		m.baseSig = sig
+	// st.BaseSig is the base the running process was rendered from, kept in state.json
+	// because the slots outlive the agent: a node address that changed while the agent
+	// was down is a change of the base like any other (7.5 step 5). A signature is asked
+	// for once per run of the agent, so a rebuild that is refused does not start again
+	// at every tick.
+	switch cur := m.baseSignature(); {
+	case m.st.BaseSig == "":
+		m.st.BaseSig = cur
+	case cur != m.st.BaseSig && cur != m.baseTried && m.slotUp:
+		m.baseTried = cur
 		m.queueRebuild(rbBase, "")
 	}
 	// Removed or disabled.
 	for _, r := range append([]runRec(nil), m.st.Running...) {
 		if _, ok := m.wanted[r.ID]; !ok {
 			m.removeConfig(ctx, r.ID)
+		}
+	}
+	// A config that only an older generation or the draining slot still carries (a rebuild
+	// that left it out, a search that took it out) goes from there too (7.5, removed or
+	// disabled): its credential must not stay for the rest of a drain.
+	for _, id := range m.onlyInOldSlots() {
+		if _, ok := m.wanted[id]; !ok && m.running(id) == nil {
+			m.removeFromOld(ctx, id)
 		}
 	}
 	for id := range m.status {
@@ -92,9 +106,13 @@ func (m *Manager) reconcile(ctx context.Context) {
 			}
 			continue
 		}
-		if s := m.status[id]; s != nil && s.hash == c.hash && (s.kind == kRefused || s.kind == kLastGood) {
+		if m.waitsForAdmin(c) {
 			continue // refused for this very fragment: waits for the admin
 		}
+		if m.guardLost() {
+			return
+		}
+		m.between(ctx)
 		m.applyOne(ctx, c)
 	}
 	_ = m.saveState()
@@ -102,8 +120,47 @@ func (m *Manager) reconcile(ctx context.Context) {
 }
 
 // ensureActive starts the active slot from its file when it is not up (7.5 end).
+// retryIn asks the loop to look again at what a transient failure left undone (the
+// control socket not up yet, a start that failed, no release installed yet): without
+// it only the next NodeConfig would, and the hub does not resend an unchanged one.
+func (m *Manager) retryIn(d time.Duration) {
+	t := m.opt.Now().Add(d)
+	if m.retryAt.IsZero() || t.Before(m.retryAt) {
+		m.retryAt = t
+	}
+}
+
+// retryDelay is the short wait before a transient failure is tried again.
+func (m *Manager) retryDelay() time.Duration { return 10 * m.t.Tick }
+
+// waitsForAdmin is a refusal that stays until the fragment changes: the config's
+// status is for this very fragment and says refused or last_good, unless it was
+// marked to be tried again (rbFail).
+func (m *Manager) waitsForAdmin(c *cfgRec) bool {
+	s := m.status[c.hex]
+	if s == nil || s.hash != c.hash || (s.kind != kRefused && s.kind != kLastGood) {
+		return false
+	}
+	return s.retryAt.IsZero() || m.opt.Now().Before(s.retryAt)
+}
+
+// between is what the loop looks at between two configs of a long reconcile: a first
+// import of 64 configs takes minutes (5 s of trial each), and an end of the process,
+// a hang or the end of a drain must not wait for all of it. It touches no config.
+func (m *Manager) between(ctx context.Context) {
+	if !m.guardOn || m.guardLost() {
+		return
+	}
+	now := m.opt.Now()
+	m.supervise(ctx)
+	m.expireRetired(ctx, now)
+	m.superviseDrain(ctx, now)
+	m.hangCheck(ctx, now)
+}
+
+// ensureActive starts the active slot from its file when it is not up (7.5 end).
 func (m *Manager) ensureActive(ctx context.Context) {
-	if m.slotUp || !m.guardOn {
+	if m.slotUp || !m.guardOn || m.guardLost() {
 		return
 	}
 	if m.version == "" {
@@ -113,17 +170,27 @@ func (m *Manager) ensureActive(ctx context.Context) {
 		m.version = m.lowestAllowed()
 	}
 	if m.version == "" {
+		m.retryIn(m.retryDelay())
 		return // no release is installed yet: nothing can run
 	}
 	if m.st.Version != m.version {
 		m.st.Version = m.version
 	}
 	if err := m.writeSlotFiles(m.st.Slot, m.version, m.st.Running); err != nil {
+		m.retryIn(m.retryDelay())
 		return
 	}
 	if m.opt.Units.Start(ctx, m.st.Slot) != nil {
+		m.retryIn(m.retryDelay())
 		return
 	}
+	if m.guardLost() {
+		// The guard went off between the check and the start: the watcher's stop came
+		// first, so this start would leave a slot up with no guard.
+		m.stopSlots(ctx)
+		return
+	}
+	m.st.BaseSig = m.baseSignature()
 	m.rewatch(ctx)
 	m.afterRestart()
 	m.slotUp = m.waitUp(ctx, m.st.Slot, m.t.StartWait)
@@ -149,7 +216,7 @@ func (m *Manager) waitUp(ctx context.Context, slot string, d time.Duration) bool
 		if m.opt.Prober.Greet(ctx, socksAddr(slot, DirectPort)) {
 			return true
 		}
-		if ctx.Err() != nil || !m.opt.Now().Before(deadline) {
+		if ctx.Err() != nil || !m.opt.Now().Before(deadline) || m.guardLost() {
 			return false
 		}
 		m.sleep(ctx, m.poll())
@@ -158,6 +225,7 @@ func (m *Manager) waitUp(ctx context.Context, slot string, d time.Duration) bool
 
 // rewatch takes the process of the active slot as the baseline for end detection.
 func (m *Manager) rewatch(ctx context.Context) {
+	m.death = nil
 	if st, err := m.opt.Units.Status(ctx, m.st.Slot); err == nil {
 		m.watch = watchState{pid: st.PID, restarts: st.Restarts, known: true}
 	}
@@ -180,9 +248,13 @@ func (m *Manager) afterRestart() {
 
 // applyOne is steps 1 to 3 of 7.5 for one config.
 func (m *Manager) applyOne(ctx context.Context, c *cfgRec) {
-	tbl := m.table()
-	res := tbl.Check(c.Fragment, c.Accepted)
 	old := m.running(c.hex)
+	tbl, known := m.table()
+	if !known {
+		m.refuse(c, old, "this release has no allow list in the agent")
+		return
+	}
+	res := tbl.Check(c.Fragment, c.Accepted)
 	if !res.OK() {
 		m.refuse(c, old, issueText(res))
 		return
@@ -209,12 +281,24 @@ func (m *Manager) applyOne(ctx context.Context, c *cfgRec) {
 	}
 	if err := m.testConfig(ctx, m.version, cfg); err != nil {
 		if _, isExit := err.(*CtlError); !isExit {
-			return // ctrlz-xrayctl is not answering: try again at the next change or tick
+			// ctrlz-xrayctl is not answering: nothing was judged about the fragment, so it
+			// is tried again soon and not left for the admin to edit.
+			m.pendingAgain(c)
+			return
 		}
 		m.refuse(c, old, errText(err, c.Fragment))
 		return
 	}
 	m.liveAdd(ctx, c, rec, old)
+}
+
+// pendingAgain leaves a config that has no state yet pending and asks the loop to
+// try it again soon.
+func (m *Manager) pendingAgain(c *cfgRec) {
+	if m.status[c.hex] == nil {
+		m.setStatus(c.hex, kPending, "", c.hash)
+	}
+	m.retryIn(m.retryDelay())
 }
 
 func (m *Manager) refuse(c *cfgRec, old *runRec, text string) {
@@ -244,17 +328,24 @@ func (m *Manager) freePort() int {
 	return 0
 }
 
+// processEnded tells whether the slot's process is not the one that was looked at
+// before: it ended (a restart or the wait before it), or the unit is not active.
+func processEnded(before, after UnitStatus) bool {
+	return !after.Active || after.AutoRestart || after.PID != before.PID || after.Restarts != before.Restarts
+}
+
 // liveAdd is steps 2 and 3: write the trial record, add through the API, probe, and
 // require that the same process runs on after TrialWait.
 func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRec) {
 	slot, ver := m.st.Slot, m.version
 	st, err := m.opt.Units.Status(ctx, slot)
 	if err != nil {
+		m.pendingAgain(c)
 		return
 	}
 	m.st.Trial = &trialRec{Rec: rec, Boot: m.opt.BootID(), PID: st.PID}
 	_ = m.saveState()
-	ado, adr, adi, err := addCalls(slot, rec)
+	ado, adr, adi, err := addCalls(m.base(slot), rec)
 	if err == nil {
 		err = m.ctlDo(ctx, ver, slot, sock.OpAddOut, nil, ado)
 	}
@@ -265,21 +356,50 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 		err = m.ctlDo(ctx, ver, slot, sock.OpAddIn, nil, adi)
 	}
 	if err != nil {
+		if m.guardLost() {
+			m.endTrial() // the slot was stopped under it: nothing was judged
+			return
+		}
+		// The call may have failed because the fragment killed the process while it was
+		// built into a handler, which is exactly what a trial is for.
+		after, serr := m.opt.Units.Status(ctx, slot)
+		if serr == nil && processEnded(st, after) {
+			m.trialCrashed(ctx, c, rec, old)
+			return
+		}
 		// An API error while the process runs: undo what went in, keep the config out
 		// until it changes, and rebuild (step 5).
 		m.removeHandlers(ctx, slot, ver, rec)
 		m.st.Trial = nil
+		var ce *CtlError
+		if !asCtl(err, &ce) {
+			// ctl.sock did not answer: that says nothing about this fragment.
+			_ = m.saveState()
+			m.pendingAgain(c)
+			return
+		}
 		m.refuse(c, old, errText(err, c.Fragment))
 		m.queueRebuild(rbAPI, "")
+		_ = m.saveState()
 		return
 	}
 	lat, ok := m.opt.Prober.Probe(ctx, socksAddr(slot, rec.Port), m.probeURLs())
 	if !m.sleep(ctx, m.t.TrialWait) {
+		if ctx.Err() == nil {
+			m.endTrial() // the guard went off: the slots are stopped, the file never held it
+		}
 		return // the agent is stopping; the trial record is what the next start reads
 	}
 	after, serr := m.opt.Units.Status(ctx, slot)
-	if serr != nil || after.PID != st.PID || after.Restarts != st.Restarts || !after.Active {
-		m.trialCrashed(c, rec, old)
+	if serr != nil {
+		m.removeHandlers(ctx, slot, ver, rec)
+		m.st.Trial = nil
+		_ = m.saveState()
+		m.pendingAgain(c)
+		return
+	}
+	if processEnded(st, after) {
+		m.trialCrashed(ctx, c, rec, old)
 		return
 	}
 	// Passed: the slot's file is rewritten with the running set, so that a restart of
@@ -301,9 +421,17 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 	m.publish()
 }
 
+// endTrial drops a trial that a stopped slot cut short.
+func (m *Manager) endTrial() {
+	m.st.Trial = nil
+	_ = m.saveState()
+}
+
 // trialCrashed: the process ended while a config was on trial. The hash is marked,
-// and systemd starts the slot from its file, which never held the config.
-func (m *Manager) trialCrashed(c *cfgRec, rec runRec, old *runRec) {
+// and systemd starts the slot from its file, which never held the config. The end is
+// the trial's alone: the new process becomes the baseline of end detection, so the
+// same death is not counted again as an end outside a trial (7.5 step 4).
+func (m *Manager) trialCrashed(ctx context.Context, c *cfgRec, rec runRec, old *runRec) {
 	m.st.Crashed[c.hex] = rec.Hash
 	m.st.Trial = nil
 	if old != nil {
@@ -312,6 +440,24 @@ func (m *Manager) trialCrashed(c *cfgRec, rec runRec, old *runRec) {
 		m.setStatus(c.hex, kRefused, "crashed", c.hash)
 	}
 	_ = m.saveState()
+	m.settleRestart(ctx)
+}
+
+// settleRestart waits for systemd to bring the active slot back and takes the new
+// process as the baseline of end detection.
+func (m *Manager) settleRestart(ctx context.Context) {
+	deadline := m.opt.Now().Add(m.t.StartWait)
+	for {
+		st, err := m.opt.Units.Status(ctx, m.st.Slot)
+		if err == nil && st.Active && !st.AutoRestart && st.PID != 0 {
+			break
+		}
+		if ctx.Err() != nil || !m.opt.Now().Before(deadline) || m.guardLost() {
+			break
+		}
+		m.sleep(ctx, m.poll())
+	}
+	m.rewatch(ctx)
 	m.afterRestart()
 }
 
@@ -360,6 +506,36 @@ func (m *Manager) removeConfig(ctx context.Context, id string) {
 	}
 	_ = m.writeActive()
 	m.removeHandlers(ctx, m.st.Slot, m.version, rec)
+	m.removeFromOld(ctx, id)
+	_ = m.saveState()
+}
+
+// onlyInOldSlots are the ids that an older generation or the draining slot carries.
+func (m *Manager) onlyInOldSlots() []string {
+	seen := map[string]bool{}
+	var ids []string
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, rt := range m.st.Retired {
+		add(rt.Rec.ID)
+	}
+	if d := m.st.Drain; d != nil {
+		for _, dr := range d.Running {
+			add(dr.ID)
+		}
+	}
+	return ids
+}
+
+// removeFromOld takes a config out of the older generations and the draining slot. A
+// stateful one cannot be taken out of a live process (`rmo` leaves its device or
+// session up), so the draining slot that holds it ends at once, as the removal of a
+// stateful config does (7.5 step 5).
+func (m *Manager) removeFromOld(ctx context.Context, id string) {
 	keep := m.st.Retired[:0]
 	for _, rt := range m.st.Retired {
 		if rt.Rec.ID == id {
@@ -369,18 +545,30 @@ func (m *Manager) removeConfig(ctx context.Context, id string) {
 		keep = append(keep, rt)
 	}
 	m.st.Retired = keep
-	if d := m.st.Drain; d != nil {
-		keepD := d.Running[:0]
-		for _, dr := range d.Running {
-			if dr.ID == id {
-				m.removeHandlers(ctx, d.Slot, d.Version, dr)
-				continue
-			}
-			keepD = append(keepD, dr)
-		}
-		d.Running = keepD
-		_ = m.writeSlotFiles(d.Slot, d.Version, d.Running)
+	d := m.st.Drain
+	if d == nil {
+		_ = m.saveState()
+		return
 	}
+	stateful := false
+	keepD := d.Running[:0]
+	for _, dr := range d.Running {
+		if dr.ID == id {
+			if dr.Stateful {
+				stateful = true
+			} else {
+				m.removeHandlers(ctx, d.Slot, d.Version, dr)
+			}
+			continue
+		}
+		keepD = append(keepD, dr)
+	}
+	d.Running = keepD
+	if stateful {
+		m.endDrain(ctx)
+		return
+	}
+	_ = m.writeSlotFiles(d.Slot, d.Version, d.Running)
 	_ = m.saveState()
 }
 
@@ -388,6 +576,11 @@ func (m *Manager) removeConfig(ctx context.Context, id string) {
 
 func (m *Manager) tick(ctx context.Context) {
 	now := m.opt.Now()
+	m.syncGuard(ctx)
+	if !m.retryAt.IsZero() && !now.Before(m.retryAt) {
+		m.retryAt = time.Time{}
+		m.step(ctx) // what a transient failure left undone (retryIn)
+	}
 	if m.guardOn {
 		m.supervise(ctx)
 	}
@@ -406,6 +599,12 @@ func (m *Manager) tick(ctx context.Context) {
 	m.tickAlerts()
 	m.refreshView()
 	m.publish()
+}
+
+// deathRec is how a process ended, as read while systemd waited to restart it.
+type deathRec struct {
+	result string
+	exit   int
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -427,8 +626,21 @@ func (m *Manager) supervise(ctx context.Context) {
 		m.watch = watchState{pid: st.PID, restarts: st.Restarts, known: true}
 		return
 	}
+	if st.AutoRestart {
+		// The only moment systemd still says how the process ended: once it starts the
+		// unit again, Result is success and ExecMainStatus is 0 (UnitStatus.AutoRestart).
+		// RestartSec is 2 s and a tick is 1 s, so a tick lands in it.
+		if m.death == nil {
+			m.death = &deathRec{result: st.Result, exit: st.ExitStatus}
+		}
+		return
+	}
 	if st.Restarts > m.watch.restarts || (st.PID != 0 && m.watch.pid != 0 && st.PID != m.watch.pid) {
 		ended := IsEnd(st.Result, st.ExitStatus)
+		if m.death != nil {
+			ended = IsEnd(m.death.result, m.death.exit)
+		}
+		m.death = nil
 		m.watch = watchState{pid: st.PID, restarts: st.Restarts, known: true}
 		m.afterRestart()
 		if ended {
@@ -464,8 +676,11 @@ func (m *Manager) hangCheck(ctx context.Context, now time.Time) {
 
 func (m *Manager) restartSlot(ctx context.Context) {
 	_ = m.opt.Units.Stop(ctx, m.st.Slot)
-	if m.guard() {
+	if !m.guardLost() {
 		_ = m.opt.Units.Start(ctx, m.st.Slot)
+		if m.guardLost() {
+			m.stopSlots(ctx)
+		}
 	}
 	m.rewatch(ctx)
 	m.afterRestart()
@@ -745,28 +960,4 @@ func (m *Manager) onProbe(r probeResult) {
 		m.hl[r.id] = h
 	}
 	h.observe(r.ok, r.lat)
-}
-
-// ---- guard -----------------------------------------------------------------------
-
-// onGuard: with the guard off both slots stop (finalRules alone is not enough for
-// more than the few seconds another tool takes to flush the rules, 5.5); when it
-// is back the active slot starts again.
-func (m *Manager) onGuard(ctx context.Context, on bool) {
-	if on == m.guardOn {
-		return
-	}
-	m.guardOn = on
-	if !on {
-		_ = m.opt.Units.Stop(ctx, "a")
-		_ = m.opt.Units.Stop(ctx, "b")
-		m.slotUp = false
-		m.watch = watchState{}
-		m.st.Drain = nil
-		m.rb = nil
-		_ = m.saveState()
-		return
-	}
-	m.slotUp = false
-	m.ensureActive(ctx)
 }

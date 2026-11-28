@@ -51,6 +51,10 @@ type persisted struct {
 	Trial   *trialRec         `json:"trial,omitempty"`
 	Crashed map[string]string `json:"crashed,omitempty"` // config id -> hash of the fragment that ended the process
 	Gens    map[string]int    `json:"gens,omitempty"`    // last generation of each config
+	// BaseSig is the signature of the base (the blocked ranges) that the active slot's
+	// process was started with: the slots outlive the agent, so a change of the node
+	// addresses while the agent was down is found by comparing it at the next start.
+	BaseSig string `json:"base_sig,omitempty"`
 	// CandidateRun is the run id of the last xray.candidate this agent acted on.
 	CandidateRun string `json:"candidate_run,omitempty"`
 }

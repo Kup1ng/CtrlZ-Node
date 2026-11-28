@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
@@ -78,8 +79,11 @@ type Options struct {
 	// `direct` refuses beside the non-public ranges (7.4).
 	NodeAddrs func() []netip.Addr
 	BootID    func() string
-	Timing    Timing
-	Now       func() time.Time
+	// Tables finds the allow list of a release; the default is xrayschema.For. A test
+	// gives it a second release that this build has no table of.
+	Tables func(version string) (xrayschema.Table, error)
+	Timing Timing
+	Now    func() time.Time
 }
 
 // cfgRec is a config the hub wants.
@@ -107,6 +111,9 @@ type cfgStatus struct {
 	kind hubv1.XrayConfigStateKind
 	err  string
 	hash string // hash of the wanted fragment this status is about
+	// retryAt, when set, ends the wait for the admin: the refusal was a failure of the
+	// node (rbFail), not a verdict on the fragment.
+	retryAt time.Time
 }
 
 // hbView is what Heartbeat copies into the message, made by the loop.
@@ -150,15 +157,30 @@ type Manager struct {
 	probing map[string]bool
 	probeSm chan struct{}
 
-	guardOn  bool
-	slotUp   bool
-	watch    watchState
-	lastPub  []byte
-	pubErr   bool
-	version  string // release the active slot runs
-	cur      *snapshot
-	baseSig  string
-	stopping bool
+	guardOn   bool
+	slotUp    bool
+	watch     watchState
+	lastPub   []byte
+	pubErr    bool
+	version   string // release the active slot runs
+	cur       *snapshot
+	baseTried string // the base signature a rebuild was last asked for
+	stopping  bool
+
+	// The guard (5.5) is watched by its own goroutine, because the loop can be busy
+	// for minutes (a first import of 64 configs, a rebuild) and the open-proxy window
+	// of a flushed table must not wait for it. guardNow is the guard's last word; cut
+	// says the watcher stopped both slots and the loop has not yet taken that into its
+	// own state; guardEv wakes the loop.
+	guardNow atomic.Bool
+	cut      atomic.Bool
+	guardEv  chan struct{}
+
+	// death is how the active slot's process ended, read in the window of auto-restart
+	// (UnitStatus.AutoRestart) before systemd resets it.
+	death *deathRec
+	// retryAt is when the loop looks again at what a transient failure left undone.
+	retryAt time.Time
 
 	// 7.5 step 4
 	ends        int
@@ -212,7 +234,8 @@ func New(o Options) *Manager {
 		wanted: map[string]*cfgRec{}, status: map[string]*cfgStatus{}, hl: map[string]*health{},
 		nextPr: map[string]time.Time{}, probing: map[string]bool{}, probeSm: make(chan struct{}, 8),
 		noHealthy: map[uint32]time.Time{}, alerted: map[uint32]bool{},
-		stuck: newStuckState(),
+		stuck:   newStuckState(),
+		guardEv: make(chan struct{}, 1),
 	}
 }
 
@@ -303,13 +326,18 @@ func (m *Manager) Run(ctx context.Context) {
 	m.loadState()
 	m.lastQuiet = m.opt.Now()
 	m.guardOn = m.guard()
+	m.guardNow.Store(m.guardOn)
+	if m.opt.Sockets == nil {
+		// 5.5 rule 2 is the only bound on the sockets of a silent TLS or REALITY
+		// handshake; a node that runs without the count says so.
+		m.opt.Alert.Alert(alert.Alert{Code: "xray_sockets_unbounded", Detail: "the socket count of the Xray slots is not running"})
+	}
+	if m.opt.Guard != nil {
+		go m.watchGuard(ctx)
+	}
 	m.recover(ctx)
 	tick := time.NewTicker(m.t.Tick)
 	defer tick.Stop()
-	var guardCh <-chan bool
-	if m.opt.Guard != nil {
-		guardCh = m.opt.Guard.Changed()
-	}
 	m.step(ctx)
 	for {
 		select {
@@ -317,8 +345,8 @@ func (m *Manager) Run(ctx context.Context) {
 			return
 		case <-m.wake:
 			m.step(ctx)
-		case g := <-guardCh:
-			m.onGuard(ctx, g)
+		case <-m.guardEv:
+			m.syncGuard(ctx)
 			m.step(ctx)
 		case r := <-m.probeCh:
 			m.onProbe(r)
@@ -328,7 +356,79 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 }
 
+// guard reads the nftables guard now. A nil Guard is a guard that is off: the
+// manager fails closed.
 func (m *Manager) guard() bool { return m.opt.Guard != nil && m.opt.Guard.Check() }
+
+// watchGuard stops both slots the moment the guard turns false, whatever the loop is
+// doing (5.5: the finalRules of `direct` are no more than a few seconds of cover).
+// The loop then takes the rest into its own state in syncGuard.
+func (m *Manager) watchGuard(ctx context.Context) {
+	ch := m.opt.Guard.Changed()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case on := <-ch:
+			m.guardNow.Store(on)
+			if !on {
+				m.stopSlots(ctx)
+				m.cut.Store(true)
+			}
+			select { // a pending wake is as good as a second one: syncGuard reads the state
+			case m.guardEv <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// guardLost reports that the guard is off, or went off since the loop last looked and
+// the watcher stopped the slots, for the long steps of the loop to give up: a guard
+// that is back by the time a step ends does not bring a stopped slot back with it.
+func (m *Manager) guardLost() bool { return !m.guardNow.Load() || m.cut.Load() }
+
+// stopSlots stops both units. It is safe from any goroutine and idempotent.
+func (m *Manager) stopSlots(ctx context.Context) {
+	_ = m.opt.Units.Stop(ctx, "a")
+	_ = m.opt.Units.Stop(ctx, "b")
+}
+
+// syncGuard brings the loop's state to the guard's: the guard turning off ends the
+// slots and the drain, and the guard coming back starts the active slot.
+func (m *Manager) syncGuard(ctx context.Context) {
+	if m.cut.Swap(false) {
+		m.guardOff()
+	}
+	on := m.guardNow.Load()
+	if on == m.guardOn {
+		return
+	}
+	m.guardOn = on
+	if !on {
+		m.stopSlots(ctx)
+		m.guardOff()
+		return
+	}
+	m.slotUp = false
+	m.ensureActive(ctx)
+}
+
+// guardOff is the loop's side of a guard that turned off (both slots are already
+// stopped): nothing runs, the draining slot's file, which holds credentials, is
+// deleted with its drain, and a queued rebuild is dropped.
+func (m *Manager) guardOff() {
+	m.guardOn = false
+	m.slotUp = false
+	m.watch = watchState{}
+	m.death = nil
+	if d := m.st.Drain; d != nil {
+		m.dropSlotFile(d.Slot)
+		m.st.Drain = nil
+	}
+	m.dropRebuild()
+	_ = m.saveState()
+}
 
 // step takes the newest snapshot, if any, and reconciles.
 func (m *Manager) step(ctx context.Context) {
@@ -357,13 +457,20 @@ func (m *Manager) step(ctx context.Context) {
 
 // table is the allow list of the release the node runs, or the newest while it has
 // none (7.2).
-func (m *Manager) table() xrayschema.Table { return m.tableFor(m.version) }
+func (m *Manager) table() (xrayschema.Table, bool) { return m.tableFor(m.version) }
 
-func (m *Manager) tableFor(version string) xrayschema.Table {
-	if t, err := xrayschema.For(version); err == nil {
-		return t
+// tableFor is false for a release that this build has no table for: nothing is checked
+// against another release's spellings (7.2: an unknown tag is refused).
+func (m *Manager) tableFor(version string) (xrayschema.Table, bool) {
+	if version == "" {
+		return xrayschema.Newest(), true
 	}
-	return xrayschema.Newest()
+	lookup := m.opt.Tables
+	if lookup == nil {
+		lookup = xrayschema.For
+	}
+	t, err := lookup(version)
+	return t, err == nil
 }
 
 func (m *Manager) probeURLs() []string {

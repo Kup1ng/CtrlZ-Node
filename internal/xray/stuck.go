@@ -90,9 +90,16 @@ func (s *stuckState) any() bool {
 	return len(s.markedR) > 0 || len(s.allMarked) > 0
 }
 
-func (s *stuckState) rebuildEnded(_ string, _ time.Time) {
-	s.rebuilding = false
-	s.allRebuild = false
+// rebuildEnded clears the latches of the rebuild requests that a finished, failed or
+// dropped rebuild carried, whichever reason it ran under: a request that was merged
+// into another one has no rebuild of its own to clear them.
+func (s *stuckState) rebuildEnded(stuck, allSilent bool) {
+	if stuck {
+		s.rebuilding = false
+	}
+	if allSilent {
+		s.allRebuild = false
+	}
 }
 
 func remoteKey(a netip.Addr, port int) string {
@@ -110,8 +117,13 @@ func (m *Manager) refreshRemotes(ctx context.Context, now time.Time) {
 	}
 	sort.Strings(ids)
 	sig := strings.Join(ids, ",")
-	if m.opt.Resolve != nil && !s.resolving && now.Sub(s.resolveAt) >= m.t.ResolveEvery {
+	s.mu.Lock()
+	start := m.opt.Resolve != nil && !s.resolving && now.Sub(s.resolveAt) >= m.t.ResolveEvery
+	if start {
 		s.resolving, s.resolveAt = true, now
+	}
+	s.mu.Unlock()
+	if start {
 		hosts := map[string]bool{}
 		for _, r := range m.st.Running {
 			for _, h := range hopsOf(r.Frag) {

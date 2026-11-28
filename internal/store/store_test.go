@@ -367,3 +367,19 @@ func TestPeekMemberReadsAndChangesNothing(t *testing.T) {
 		t.Fatal("PeekMember quarantined the file")
 	}
 }
+
+// PeekMemberAt reads the same table with no Open of its own.
+func TestPeekMemberAtReadsTheOpenStore(t *testing.T) {
+	dir := t.TempDir()
+	r := open(t, dir, nil)
+	if store.PeekMemberAt(dir) != nil {
+		t.Fatal("a table from no state")
+	}
+	a, _ := fullState(t, r)
+	if err := r.SaveApplied(a); err != nil {
+		t.Fatal(err)
+	}
+	if m := store.PeekMemberAt(dir); m == nil || len(m.Nodes) != 2 {
+		t.Fatalf("member %v", m)
+	}
+}

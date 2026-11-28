@@ -11,6 +11,7 @@ import (
 	"time"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
+	"github.com/Kup1ng/CtrlZ-Shared/xrayschema"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xrayrun"
@@ -42,6 +43,9 @@ type rebuildReq struct {
 	remote  string // for rbStuck
 	tries   int
 	retryAt time.Time
+	// stuck and allSilent say which latches of 5.5 this request holds, also when it was
+	// merged into a request of another reason.
+	stuck, allSilent bool
 }
 
 // queueRebuild asks for a rebuild. A request that stops the draining slot outranks
@@ -49,16 +53,22 @@ type rebuildReq struct {
 func (m *Manager) queueRebuild(reason rbReason, version string) {
 	if m.rb == nil {
 		m.rb = &rebuildReq{reason: reason, version: version}
-		return
+	} else {
+		if !reason.waitsForDrain() && m.rb.reason.waitsForDrain() {
+			m.rb.reason = reason
+		}
+		if reason == rbAllSilent {
+			m.rb.reason = reason
+		}
+		if version != "" {
+			m.rb.version = version
+		}
 	}
-	if !reason.waitsForDrain() && m.rb.reason.waitsForDrain() {
-		m.rb.reason = reason
-	}
-	if reason == rbAllSilent {
-		m.rb.reason = reason
-	}
-	if version != "" {
-		m.rb.version = version
+	switch reason {
+	case rbStuck:
+		m.rb.stuck = true
+	case rbAllSilent:
+		m.rb.allSilent = true
 	}
 }
 
@@ -189,78 +199,188 @@ func (m *Manager) runRebuild(ctx context.Context) {
 	if version == "" {
 		version = m.version
 	}
+	tbl, known := m.tableFor(version)
+	if !known {
+		// A release this build has no allow list for is judged by no other release's
+		// list (7.2): nothing is rendered, the old slot stays.
+		m.blockUpgrade(rb)
+		m.rbDone(rb, false)
+		return
+	}
 	idle := otherSlot(m.st.Slot)
-	tbl := m.tableFor(version)
+	sig := m.baseSignature()
 	var recs []runRec
 	port := FirstPort
-	refused := map[string]bool{}
 	for _, id := range m.order {
 		c := m.wanted[id]
-		if m.st.Crashed[id] == c.hash || m.inSearch(id) {
+		if m.inSearch(id) {
 			continue
 		}
-		res := tbl.Check(c.Fragment, c.Accepted)
-		if !res.OK() {
-			m.setStatus(id, kRefused, issueText(res), c.hash)
-			refused[id] = true
-			continue
+		rec, ok, fatal := m.renderForRebuild(ctx, rb, version, tbl, idle, c, port)
+		if fatal {
+			m.rbFail(rb, "ctl")
+			return
 		}
-		if s := m.status[id]; s != nil && s.hash == c.hash && s.kind == kRefused && m.running(id) == nil && rb.reason != rbUpgrade && rb.reason != rbBase {
-			// Refused by the binary for this very fragment (an API error): it stays out
-			// until it changes (step 5), though a new release or base gets another try.
-			continue
-		}
-		rec := runRec{ID: id, Gen: m.st.Gens[id] + 1, Port: port, Outs: len(outboundsOf(res.Normalized)), Hash: c.hash,
-			Frag: res.Normalized, Location: c.Location, Priority: c.Priority, Stateful: tbl.Stateful(c.Fragment)}
-		cfg, err := slotConfig(m.base(idle), []runRec{rec})
-		if err != nil {
-			continue
-		}
-		if err := m.testConfig(ctx, version, cfg); err != nil {
-			if _, isExit := err.(*CtlError); !isExit {
-				m.rbFail(rb, "ctl")
-				return
+		if !ok {
+			// The wanted fragment is out (marked, refused, or waiting for the admin), but a
+			// generation of it runs: its last good fragment goes on (7.5 step 1,
+			// last_good), or the rebuild would take its exit away.
+			if old := m.running(id); old != nil {
+				rec, ok, fatal = m.carryRunning(ctx, version, tbl, idle, c, old, port)
+				if fatal {
+					m.rbFail(rb, "ctl")
+					return
+				}
 			}
-			m.setStatus(id, kRefused, errText(err, c.Fragment), c.hash)
-			continue
 		}
-		recs = append(recs, rec)
-		port++
+		if ok {
+			recs = append(recs, rec)
+			port++
+		}
 	}
+	// The new slot must hold at least as many healthy configs as the old one. A config
+	// that the new release refuses in both of its fragments is missing from it, and so
+	// blocks an upgrade (7.7 steps 3 and 5).
 	need := 0
 	for _, r := range m.st.Running {
 		if m.effectiveHealthy(r.ID) {
 			need++
 		}
 	}
-	if len(recs) < need {
-		need = len(recs) // a config that the new release refuses cannot count against it
-	}
 	if err := m.writeSlotFiles(idle, version, recs); err != nil {
 		m.rbFail(rb, "files")
 		return
 	}
 	if m.opt.Units.Start(ctx, idle) != nil || !m.waitUp(ctx, idle, m.t.StartWait) {
-		_ = m.opt.Units.Stop(ctx, idle)
-		m.dropSlotFile(idle)
+		m.abandonIdle(ctx, idle)
+		if m.guardLost() {
+			return // syncGuard drops the request
+		}
 		m.rbFail(rb, "start")
 		return
 	}
+	started, serr := m.opt.Units.Status(ctx, idle)
 	results, healthy := m.probeAll(ctx, idle, recs, need, rb.reason == rbAllSilent)
-	if healthy < need && rb.reason != rbAllSilent {
-		// The new slot is no better: it is stopped and the old one stays (7.7 step 5).
-		_ = m.opt.Units.Stop(ctx, idle)
-		m.dropSlotFile(idle)
-		if rb.reason == rbUpgrade {
-			m.upgrade.blocked = true
-			m.upgrade.ok = false
-			m.opt.Alert.Alert(alert.Alert{Code: "xray_upgrade_blocked"})
-		}
+	if m.guardLost() {
+		m.abandonIdle(ctx, idle)
+		return
+	}
+	if after, err := m.opt.Units.Status(ctx, idle); serr == nil && (err != nil || processEnded(started, after)) {
+		// The new slot's process ended before the switch: whatever this rebuild adds or
+		// changes is marked as the cause, as a trial's end is (7.5 step 4), and the old
+		// slot stays.
+		m.abandonIdle(ctx, idle)
+		m.markRebuildCrash(recs)
+		m.blockUpgrade(rb)
 		m.rbDone(rb, false)
 		return
 	}
-	m.switchTo(ctx, rb, idle, version, recs, results)
+	if healthy < need && rb.reason != rbAllSilent {
+		// The new slot is no better: it is stopped and the old one stays (7.7 step 5).
+		m.abandonIdle(ctx, idle)
+		m.blockUpgrade(rb)
+		m.rbDone(rb, false)
+		return
+	}
+	m.switchTo(ctx, rb, idle, version, sig, recs, results)
 	m.rbDone(rb, true)
+}
+
+// renderForRebuild is the wanted fragment of a config as the new slot would run it.
+// ok is false when the config stays out of it for now; fatal when the control
+// socket did not answer, which says nothing about the fragment.
+func (m *Manager) renderForRebuild(ctx context.Context, rb *rebuildReq, version string, tbl xrayschema.Table, idle string, c *cfgRec, port int) (rec runRec, ok, fatal bool) {
+	old := m.running(c.hex)
+	if m.st.Crashed[c.hex] == c.hash {
+		return runRec{}, false, false // nothing renders a marked hash (7.5 step 4)
+	}
+	res := tbl.Check(c.Fragment, c.Accepted)
+	if !res.OK() {
+		m.refuse(c, old, issueText(res))
+		return runRec{}, false, false
+	}
+	if m.waitsForAdmin(c) && rb.reason != rbUpgrade && rb.reason != rbBase {
+		// Refused by the binary for this very fragment (an API error): it stays out
+		// until it changes (step 5), though a new release or base gets another try.
+		return runRec{}, false, false
+	}
+	rec = runRec{ID: c.hex, Gen: m.st.Gens[c.hex] + 1, Port: port, Outs: len(outboundsOf(res.Normalized)), Hash: c.hash,
+		Frag: res.Normalized, Location: c.Location, Priority: c.Priority, Stateful: tbl.Stateful(c.Fragment)}
+	cfg, err := slotConfig(m.base(idle), []runRec{rec})
+	if err != nil {
+		return runRec{}, false, false
+	}
+	if err := m.testConfig(ctx, version, cfg); err != nil {
+		if _, isExit := err.(*CtlError); !isExit {
+			return runRec{}, false, true
+		}
+		m.refuse(c, old, errText(err, c.Fragment))
+		return runRec{}, false, false
+	}
+	return rec, true, false
+}
+
+// carryRunning renders the fragment that a config runs now, for the new slot, when
+// its wanted fragment cannot go in. A release that refuses it too leaves it out.
+func (m *Manager) carryRunning(ctx context.Context, version string, tbl xrayschema.Table, idle string, c *cfgRec, old *runRec, port int) (rec runRec, ok, fatal bool) {
+	frag := old.Frag
+	if version != m.version {
+		res := tbl.Check(old.Frag, c.Accepted)
+		if !res.OK() {
+			return runRec{}, false, false
+		}
+		frag = res.Normalized
+	}
+	rec = runRec{ID: c.hex, Gen: m.st.Gens[c.hex] + 1, Port: port, Outs: len(outboundsOf(frag)), Hash: old.Hash,
+		Frag: frag, Location: c.Location, Priority: c.Priority, Stateful: old.Stateful}
+	cfg, err := slotConfig(m.base(idle), []runRec{rec})
+	if err != nil {
+		return runRec{}, false, false
+	}
+	if err := m.testConfig(ctx, version, cfg); err != nil {
+		_, isExit := err.(*CtlError)
+		return runRec{}, false, !isExit
+	}
+	return rec, true, false
+}
+
+// abandonIdle stops the idle slot and deletes its file, which holds credentials.
+func (m *Manager) abandonIdle(ctx context.Context, idle string) {
+	_ = m.opt.Units.Stop(ctx, idle)
+	m.dropSlotFile(idle)
+}
+
+// blockUpgrade is the end of an upgrade that did not come up (7.7 step 5).
+func (m *Manager) blockUpgrade(rb *rebuildReq) {
+	if rb.reason != rbUpgrade {
+		return
+	}
+	m.upgrade.blocked = true
+	m.upgrade.ok = false
+	m.opt.Alert.Alert(alert.Alert{Code: "xray_upgrade_blocked"})
+}
+
+// markRebuildCrash marks the hashes that a rebuild added or changed when the new
+// slot's process ended before the switch (7.5 step 4, last bullet of "In a trial"):
+// they are the ones that cannot have run before.
+func (m *Manager) markRebuildCrash(recs []runRec) {
+	for _, r := range recs {
+		old := m.running(r.ID)
+		if old != nil && old.Hash == r.Hash {
+			continue
+		}
+		c := m.wanted[r.ID]
+		if c == nil || c.hash != r.Hash {
+			continue
+		}
+		m.st.Crashed[r.ID] = r.Hash
+		if old != nil {
+			m.setStatus(r.ID, kLastGood, "crashed", c.hash)
+		} else {
+			m.setStatus(r.ID, kRefused, "crashed", c.hash)
+		}
+	}
+	_ = m.saveState()
 }
 
 func (m *Manager) dropSlotFile(slot string) {
@@ -269,28 +389,46 @@ func (m *Manager) dropSlotFile(slot string) {
 }
 
 // rbFail keeps the request and tries again later, three times; then the configs that
-// waited for it are refused with a plain text, and the admin sees it.
+// waited for it are refused with a plain text, and the admin sees it. The refusal is
+// the node's, not the fragment's, so it is tried again after a longer wait.
 func (m *Manager) rbFail(rb *rebuildReq, why string) {
 	rb.tries++
 	if rb.tries < 3 {
 		rb.retryAt = m.opt.Now().Add(30 * time.Second)
 		return
 	}
+	wait := 300 * m.t.Tick
 	for _, id := range m.order {
 		if s := m.status[id]; s != nil && s.kind == kPending {
 			m.setStatus(id, kRefused, "the rebuild of the Xray slot failed: "+why, m.wanted[id].hash)
+			m.status[id].retryAt = m.opt.Now().Add(wait)
 		}
 	}
-	m.rb = nil
+	m.retryIn(wait)
+	m.rbDone(rb, false)
 }
 
+// rbDone ends a request, however it ended, and releases what it held.
 func (m *Manager) rbDone(rb *rebuildReq, ok bool) {
 	if m.rb == rb {
 		m.rb = nil
 	}
-	if rb.reason == rbStuck || rb.reason == rbAllSilent {
-		m.stuck.rebuildEnded(rb.remote, m.opt.Now())
+	m.rbEnded(rb)
+}
+
+// dropRebuild forgets the queued request (the guard went off).
+func (m *Manager) dropRebuild() {
+	if rb := m.rb; rb != nil {
+		m.rb = nil
+		m.rbEnded(rb)
 	}
+}
+
+// rbEnded clears the stuck latches of 5.5 that the request carried. A request merged
+// into another one carries its flag along, so the latch is cleared when the merged
+// request ends, not only when one that ran under its own reason does.
+func (m *Manager) rbEnded(rb *rebuildReq) {
+	m.stuck.rebuildEnded(rb.stuck, rb.allSilent)
 }
 
 // probeAll probes every config of the new slot at once, again and again until the
@@ -335,7 +473,7 @@ func (m *Manager) probeAll(ctx context.Context, slot string, recs []runRec, need
 // switchTo moves the map to the new slot: the old slot drains 10 min and stops, or
 // stops at once when a wireguard outbound is in the wanted set or in the old slot's
 // running set, or when the memory of the uid asked for the rebuild (7.5 step 5).
-func (m *Manager) switchTo(ctx context.Context, rb *rebuildReq, idle, version string, recs []runRec, res map[string]probeResult) {
+func (m *Manager) switchTo(ctx context.Context, rb *rebuildReq, idle, version, sig string, recs []runRec, res map[string]probeResult) {
 	oldSlot, oldVersion := m.st.Slot, m.version
 	oldRunning := append([]runRec(nil), m.st.Running...)
 	for _, rt := range m.st.Retired {
@@ -349,6 +487,7 @@ func (m *Manager) switchTo(ctx context.Context, rb *rebuildReq, idle, version st
 	}
 	m.hadWG = false
 	m.st.Slot, m.version, m.st.Version = idle, version, version
+	m.st.BaseSig = sig
 	m.st.Running = recs
 	m.st.Retired = nil
 	for _, r := range recs {
@@ -359,7 +498,16 @@ func (m *Manager) switchTo(ctx context.Context, rb *rebuildReq, idle, version st
 		}
 		m.hl[r.ID] = h
 		m.nextPr[r.ID] = m.opt.Now().Add(m.spread(r.ID))
-		m.setStatus(r.ID, kApplied, "", r.Hash)
+		if c := m.wanted[r.ID]; c != nil && c.hash != r.Hash {
+			// A last-good generation carried over: the wanted fragment stays refused.
+			text := ""
+			if s := m.status[r.ID]; s != nil {
+				text = s.err
+			}
+			m.setStatus(r.ID, kLastGood, text, c.hash)
+		} else {
+			m.setStatus(r.ID, kApplied, "", r.Hash)
+		}
 	}
 	for id := range m.hl {
 		if m.running(id) == nil {
@@ -425,8 +573,12 @@ func (m *Manager) recover(ctx context.Context) {
 	if m.version == "" {
 		m.version = m.lowestAllowed()
 	}
-	if m.guardOn {
-		if st, err := m.opt.Units.Status(ctx, m.st.Slot); err == nil && st.Active {
+	// The slots are read whatever the guard says: a trial's verdict must not depend on
+	// whether the guard happens to be off at this start.
+	live, livePID := false, 0
+	if st, err := m.opt.Units.Status(ctx, m.st.Slot); err == nil && st.Active {
+		live, livePID = true, st.PID
+		if m.guardOn {
 			m.slotUp = true
 			m.watch = watchState{pid: st.PID, restarts: st.Restarts, known: true}
 		}
@@ -434,15 +586,15 @@ func (m *Manager) recover(ctx context.Context) {
 	if t := m.st.Trial; t != nil {
 		m.st.Trial = nil
 		boot := m.opt.BootID()
-		same := m.slotUp && m.watch.pid == t.PID && t.Boot == boot
+		same := live && livePID == t.PID && t.Boot == boot
 		switch {
-		case t.Boot == boot && !same:
+		case t.Boot == boot && !same && m.guardOn:
 			// A trial of this boot with another process: the process ended in it.
 			m.st.Crashed[t.Rec.ID] = t.Rec.Hash
 		case t.Rec.Stateful:
 			// `rmo` would leave its device or session beside a second `ado`: step 5.
 			m.queueRebuild(rbAdd, "")
-		case same:
+		case same && m.guardOn:
 			m.removeHandlers(ctx, m.st.Slot, m.version, t.Rec)
 		}
 	}
@@ -454,6 +606,13 @@ func (m *Manager) recover(ctx context.Context) {
 	m.st.Retired = nil
 	if m.st.Drain != nil {
 		m.endDrain(ctx)
+	}
+	if !m.guardOn {
+		// The units are not tied to the agent: slots that outlived it keep serving, and
+		// with the guard off (or no guard yet) they would be open proxies. Only a change of
+		// the guard stops them otherwise (5.5).
+		m.stopSlots(ctx)
+		m.slotUp = false
 	}
 	_ = m.saveState()
 	m.ensureActive(ctx)

@@ -24,6 +24,13 @@ type UnitStatus struct {
 	Restarts   int
 	Result     string // systemd's Result of the last end: success, signal, exit-code, oom-kill, core-dump, ...
 	ExitStatus int    // ExecMainStatus
+	// AutoRestart is SubState auto-restart: the process ended and systemd waits
+	// RestartSec before it starts it again. It is the one moment where Result and
+	// ExecMainStatus still tell how the process ended: starting the unit again resets
+	// Result to success and the new process clears ExecMainStatus (service_start and
+	// exec_status_start in systemd), and NRestarts moves only when the restart job is
+	// queued, at the end of that wait.
+	AutoRestart bool
 }
 
 // IsEnd reports whether the last end of the process is an *end* in the sense of 7.5
@@ -62,7 +69,7 @@ func (u SystemdUnits) Stop(ctx context.Context, slot string) error {
 // Status implements Units.
 func (u SystemdUnits) Status(ctx context.Context, slot string) (UnitStatus, error) {
 	out, err := u.Runner.Run(ctx, nil, "systemctl", "show",
-		"-p", "ActiveState,MainPID,NRestarts,Result,ExecMainStatus", unitName(slot))
+		"-p", "ActiveState,SubState,MainPID,NRestarts,Result,ExecMainStatus", unitName(slot))
 	if err != nil {
 		return UnitStatus{}, err
 	}
@@ -76,6 +83,8 @@ func (u SystemdUnits) Status(ctx context.Context, slot string) (UnitStatus, erro
 		switch k {
 		case "ActiveState":
 			st.Active = v == "active" || v == "activating"
+		case "SubState":
+			st.AutoRestart = v == "auto-restart"
 		case "MainPID":
 			st.PID = n
 		case "NRestarts":

@@ -104,7 +104,7 @@ func TestRenderChainAndForceIPv4(t *testing.T) {
 
 func TestAddCallsAndRemoveTags(t *testing.T) {
 	rec := runRec{ID: hexID(1), Gen: 2, Port: 20005, Outs: 2, Frag: mustNormalize(t, vless("198.51.100.7"))}
-	ado, adr, adi, err := addCalls("b", rec)
+	ado, adr, adi, err := addCalls(baseInput{Slot: "b", Blocked: blockedRanges(nil)}, rec)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -180,5 +181,68 @@ func TestExecRunnerKillsATimedOutChild(t *testing.T) {
 	res := s.Exec(ctx, &sock.CtlRun{Version: "v26.11.9", Op: sock.OpTest, Stdin: []byte("SLEEP")})
 	if res.Exit != -1 || time.Since(start) > 10*time.Second {
 		t.Fatalf("%+v after %v", res, time.Since(start))
+	}
+}
+
+// gateRunner holds the first operation until released and counts the runs.
+type gateRunner struct {
+	mu      sync.Mutex
+	runs    int
+	hold    chan struct{}
+	started chan struct{}
+}
+
+func (g *gateRunner) Run(ctx context.Context, _ string, _ []string, _ []byte) (int, []byte, error) {
+	g.mu.Lock()
+	g.runs++
+	first := g.runs == 1
+	g.mu.Unlock()
+	if first {
+		close(g.started)
+		select {
+		case <-g.hold:
+		case <-ctx.Done():
+		}
+	}
+	return 0, nil, nil
+}
+
+// An operation that was queued behind another one while its client gave up must not
+// run afterwards: the agent has undone it and forgotten it (B5 r1-25).
+func TestQueuedOperationOfAClientThatLeftNeverRuns(t *testing.T) {
+	g := &gateRunner{hold: make(chan struct{}), started: make(chan struct{})}
+	s := server(g)
+	req := &sock.CtlMsg{Type: sock.CtlTypeRun, Run: &sock.CtlRun{ID: 1, Version: "v26.11.9", Op: sock.OpTest, Stdin: []byte("{}")}}
+
+	a1, b1 := net.Pipe()
+	defer b1.Close()
+	go s.Handle(context.Background(), a1)
+	if err := sock.CtlCodec.Write(b1, req); err != nil {
+		t.Fatal(err)
+	}
+	<-g.started
+
+	a2, b2 := net.Pipe()
+	done := make(chan struct{})
+	go func() { s.Handle(context.Background(), a2); close(done) }()
+	if err := sock.CtlCodec.Write(b2, req); err != nil {
+		t.Fatal(err)
+	}
+	b2.Close() // the client's deadline ran out
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the queued operation of a client that left still waits")
+	}
+
+	close(g.hold)
+	b1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if m, err := sock.CtlCodec.Read(b1); err != nil || m.Result == nil || m.Result.Exit != 0 {
+		t.Fatalf("the first client: %v %+v", err, m)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.runs != 1 {
+		t.Errorf("%d runs, want the first only", g.runs)
 	}
 }

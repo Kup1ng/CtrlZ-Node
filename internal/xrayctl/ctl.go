@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -52,10 +53,12 @@ type Server struct {
 	// ReadFile reads the allow file; the default is os.ReadFile.
 	ReadFile func(string) ([]byte, error)
 
-	// one makes the operations run one at a time (7.5): two test runs of an admin's
+	// gate makes the operations run one at a time (7.5): two test runs of an admin's
 	// text must not add up to a memory spike, and the API calls of one apply are
-	// ordered by their caller.
-	one sync.Mutex
+	// ordered by their caller. It is a channel and not a mutex so that an operation
+	// whose client has gone leaves the queue.
+	gate chan struct{}
+	once sync.Once
 }
 
 // Serve accepts connections until ctx ends or the listener fails.
@@ -87,11 +90,38 @@ func (s *Server) Handle(ctx context.Context, c net.Conn) {
 		if err != nil || m.Type != sock.CtlTypeRun || m.Run == nil {
 			return
 		}
-		res := s.Exec(ctx, m.Run)
+		res, alive := s.execWatched(ctx, c, m.Run)
+		if !alive {
+			return
+		}
 		if err := sock.CtlCodec.Write(c, &sock.CtlMsg{Type: sock.CtlTypeResult, Result: res}); err != nil {
 			return
 		}
 	}
+}
+
+// execWatched runs an operation for as long as its client is there. The client sends
+// nothing between its request and our answer, so a read that returns means it gave
+// up (its call has a deadline of 15 s) or broke the protocol: an operation that was
+// queued behind another one must then not run later, or it would leave a handler
+// that the agent already undid and forgot (7.5).
+func (s *Server) execWatched(ctx context.Context, c net.Conn, r *sock.CtlRun) (*sock.CtlResult, bool) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	gone := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := c.Read(b[:]) // a byte before the answer is a broken client too
+		gone <- err
+		cancel()
+	}()
+	res := s.Exec(ctx, r)
+	// Unblock the watcher and take its read back before the next request is read: only
+	// the deadline that is set here ends it for a client that is still there.
+	_ = c.SetReadDeadline(time.Now())
+	err := <-gone
+	_ = c.SetReadDeadline(time.Time{})
+	return res, errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // Exec runs one operation and describes how it ended. The error text is the
@@ -120,8 +150,16 @@ func (s *Server) Exec(ctx context.Context, r *sock.CtlRun) *sock.CtlResult {
 		bin = s.Binary(r.Version)
 	}
 
-	s.one.Lock()
-	defer s.one.Unlock()
+	s.once.Do(func() { s.gate = make(chan struct{}, 1) })
+	select {
+	case s.gate <- struct{}{}:
+		defer func() { <-s.gate }()
+	case <-ctx.Done():
+		return fail("cancelled")
+	}
+	if ctx.Err() != nil {
+		return fail("cancelled")
+	}
 	cctx, cancel := context.WithTimeout(ctx, RunTimeout)
 	defer cancel()
 	exit, out, err := s.Runner.Run(cctx, bin, args, r.Stdin)

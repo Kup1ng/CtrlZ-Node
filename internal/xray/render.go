@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nets"
@@ -87,16 +88,9 @@ func blockedRanges(addrs []netip.Addr) []netip.Prefix {
 // running config. It is what the slot starts from, so a restart of Xray comes up
 // with the running set, and what `run -test` is given.
 func slotConfig(b baseInput, running []runRec) ([]byte, error) {
-	cidrs := make([]string, 0, len(b.Blocked))
-	for _, p := range b.Blocked {
-		cidrs = append(cidrs, p.String())
-	}
 	direct := map[string]any{
 		"tag": "direct", "protocol": "freedom",
-		"settings": map[string]any{"finalRules": []any{
-			map[string]any{"action": "block", "ip": cidrs},
-			map[string]any{"action": "allow", "network": []string{"tcp"}},
-		}},
+		"settings":       map[string]any{"finalRules": finalRules(b.Blocked)},
 		"streamSettings": map[string]any{"sockopt": map[string]any{"domainStrategy": "ForceIPv4"}},
 	}
 	outbounds := []any{map[string]any{"tag": "blocked", "protocol": "blackhole"}, direct}
@@ -106,7 +100,7 @@ func slotConfig(b baseInput, running []runRec) ([]byte, error) {
 	sorted := append([]runRec(nil), running...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 	for _, r := range sorted {
-		p, err := renderConfig(b.Slot, r)
+		p, err := renderConfig(b, r)
 		if err != nil {
 			return nil, err
 		}
@@ -152,7 +146,7 @@ type pieces struct {
 // renderConfig turns a normalised fragment into the outbounds, rule and inbound of
 // generation r.Gen. The tag n of the normal form is the position in the chain
 // (0 to 7), so `L<id>.<g>.<n>` and each dialerProxy are rewritten to it.
-func renderConfig(slot string, r runRec) (pieces, error) {
+func renderConfig(b baseInput, r runRec) (pieces, error) {
 	dec := json.NewDecoder(bytes.NewReader(r.Frag))
 	dec.UseNumber()
 	var doc struct {
@@ -166,6 +160,7 @@ func renderConfig(slot string, r runRec) (pieces, error) {
 		if err := forceStrategy(o, r.ID, r.Gen); err != nil {
 			return pieces{}, err
 		}
+		setFinalRules(o, b.Blocked)
 	}
 	in := inTag(r.ID, r.Gen)
 	outs := make([]any, len(doc.Outbounds))
@@ -174,12 +169,41 @@ func renderConfig(slot string, r runRec) (pieces, error) {
 	}
 	return pieces{
 		outbounds: outs,
-		inbound:   socksInbound(in, slot, r.Port),
+		inbound:   socksInbound(in, b.Slot, r.Port),
 		rule: map[string]any{
 			"type": "field", "ruleTag": ruleTag(r.ID, r.Gen),
 			"inboundTag": []string{in}, "outboundTag": outTag(r.ID, r.Gen, 0),
 		},
 	}, nil
+}
+
+// finalRules is the allow list of a freedom outbound: it judges the address that
+// was dialled, after the name was resolved (7.4).
+func finalRules(blocked []netip.Prefix) []any {
+	cidrs := make([]string, 0, len(blocked))
+	for _, p := range blocked {
+		cidrs = append(cidrs, p.String())
+	}
+	return []any{
+		map[string]any{"action": "block", "ip": cidrs},
+		map[string]any{"action": "allow", "network": []string{"tcp"}},
+	}
+}
+
+// setFinalRules gives a freedom outbound of a fragment the rules of `direct`: a hop
+// that ends a dialerProxy chain resolves its server's name itself, and xrayschema
+// refuses finalRules in a fragment because the node writes them (7.4). A fragment
+// that carried its own settings keeps them; only finalRules is set.
+func setFinalRules(o map[string]any, blocked []netip.Prefix) {
+	if p, _ := o["protocol"].(string); p != "freedom" {
+		return
+	}
+	st, _ := o["settings"].(map[string]any)
+	if st == nil {
+		st = map[string]any{}
+		o["settings"] = st
+	}
+	st["finalRules"] = finalRules(blocked)
 }
 
 // forceStrategy sets domainStrategy ForceIPv4 on every sockopt of an outbound at
@@ -258,8 +282,8 @@ func rewriteDialer(so map[string]any, id string, g int) error {
 }
 
 // addCalls are the three stdin texts of a live add: ado, adrules, adi.
-func addCalls(slot string, r runRec) (ado, adrules, adi []byte, err error) {
-	p, err := renderConfig(slot, r)
+func addCalls(b baseInput, r runRec) (ado, adrules, adi []byte, err error) {
+	p, err := renderConfig(b, r)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -310,22 +334,43 @@ func stringsOf(raw []byte) []string {
 // address that an admin pasted), longest values first so a short value inside a
 // long one does not leave the rest of it.
 func redact(text string, fragment []byte) string {
-	vals := stringsOf(fragment)
+	var vals []string
+	seen := map[string]bool{}
+	add := func(v string) {
+		if len(v) >= 3 && v != "<value>" && strings.TrimSpace(v) != "" && !seen[v] {
+			seen[v] = true
+			vals = append(vals, v)
+		}
+	}
+	for _, v := range stringsOf(fragment) {
+		// xrayctl turns a control character into a space before the text gets here, and
+		// Xray prints some values in Go's quoted form, so the value is also looked for
+		// in those two spellings (a tab or a quote inside a password is no reason for it
+		// to reach the panel).
+		q := strconv.Quote(v)
+		q = q[1 : len(q)-1]
+		for _, s := range []string{v, q} {
+			add(s)
+			add(mapControl(s))
+		}
+	}
 	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
 	for _, v := range vals {
-		if len(v) < 3 || v == "<value>" {
-			continue
-		}
 		text = strings.ReplaceAll(text, v, "<value>")
 	}
-	text = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, strings.ToValidUTF8(text, "?"))
+	text = mapControl(strings.ToValidUTF8(text, "?"))
 	if len(text) > 500 {
 		text = strings.ToValidUTF8(text[:500], "")
 	}
 	return text
+}
+
+// mapControl is what xrayctl does to the child's text: a control character is a space.
+func mapControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
 }

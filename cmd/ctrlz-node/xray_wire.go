@@ -31,18 +31,19 @@ func wireXray(cfg *agent.Config) {
 	}
 	const unbound = "127.0.0.10:5300" // the identified Unbound (SC 5.2a)
 	m := xray.New(xray.Options{
-		Layout:   xrayrun.DefaultLayout(),
-		StateDir: filepath.Join(cfg.Root, "xray"),
-		Ctl:      &xray.SockCtl{Path: xrayctl.DefaultSock},
-		Units:    xray.SystemdUnits{Runner: sysx.ExecRunner{}},
-		Prober:   xray.SocksProber{},
-		Guard:    guard,
-		Faults:   cfg.Faults,
-		Publish:  cfg.DNS.Publish,
-		Alert:    cfg.Alert,
-		Resolve:  xray.UnboundResolver(unbound),
-		Unbound:  unbound,
-		Timing:   xray.DefaultTiming(),
+		Layout:    xrayrun.DefaultLayout(),
+		StateDir:  filepath.Join(cfg.Root, "xray"),
+		Ctl:       &xray.SockCtl{Path: xrayctl.DefaultSock},
+		Units:     xray.SystemdUnits{Runner: sysx.ExecRunner{}},
+		Prober:    xray.SocksProber{},
+		Guard:     guard,
+		Faults:    cfg.Faults,
+		Publish:   cfg.DNS.Publish,
+		Alert:     cfg.Alert,
+		Resolve:   xray.UnboundResolver(unbound),
+		NodeAddrs: xrayNodeAddrs(cfg),
+		Unbound:   unbound,
+		Timing:    xray.DefaultTiming(),
 	})
 	cfg.Parts = append(cfg.Parts, m)
 }

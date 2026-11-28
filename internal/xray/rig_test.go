@@ -15,6 +15,7 @@ import (
 	"time"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
+	"github.com/Kup1ng/CtrlZ-Shared/xrayschema"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
@@ -86,6 +87,7 @@ type fakeSlot struct {
 	exit     int
 	starts   int
 	stops    int
+	window   bool // systemd's wait before the restart (SubState auto-restart)
 }
 
 type fakeUnits struct {
@@ -123,7 +125,7 @@ func (u *fakeUnits) Status(_ context.Context, slot string) (UnitStatus, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	s := u.slots[slot]
-	return UnitStatus{Active: s.active, PID: s.pid, Restarts: s.restarts, Result: s.result, ExitStatus: s.exit}, nil
+	return UnitStatus{Active: s.active, PID: s.pid, Restarts: s.restarts, Result: s.result, ExitStatus: s.exit, AutoRestart: s.window}, nil
 }
 
 // crash plays systemd: the process ended with this result and was started again.
@@ -133,6 +135,25 @@ func (u *fakeUnits) crash(slot, result string, exit int) {
 	u.pids++
 	s := u.slots[slot]
 	s.pid, s.restarts, s.result, s.exit, s.active = u.pids, s.restarts+1, result, exit, true
+}
+
+// crashWindow plays what systemd really shows: the process ended and the unit waits to
+// start it again, the result still visible, NRestarts not yet moved.
+func (u *fakeUnits) crashWindow(slot, result string, exit int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	s := u.slots[slot]
+	s.pid, s.result, s.exit, s.active, s.window = 0, result, exit, true, true
+}
+
+// finishRestart is the end of that wait: a new process, Result back to success and
+// ExecMainStatus cleared, as service_start and exec_status_start leave them.
+func (u *fakeUnits) finishRestart(slot string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.pids++
+	s := u.slots[slot]
+	s.pid, s.restarts, s.result, s.exit, s.active, s.window = u.pids, s.restarts+1, "success", 0, true, false
 }
 
 func (u *fakeUnits) get(slot string) fakeSlot {
@@ -148,10 +169,18 @@ type fakeProber struct {
 	failProbe map[string]bool
 	failGreet map[string]bool
 	probes    atomic.Int64
+	// onProbe may act on a probe, before it answers.
+	onProbe func(socks string)
 }
 
 func (p *fakeProber) Probe(_ context.Context, socks string, _ []string) (time.Duration, bool) {
 	p.probes.Add(1)
+	p.mu.Lock()
+	hook := p.onProbe
+	p.mu.Unlock()
+	if hook != nil {
+		hook(socks)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	host, _, _ := strings.Cut(socks, ":")
@@ -272,6 +301,12 @@ func newRig(t *testing.T, mod func(*Timing)) *rig {
 		Layout: r.layout, StateDir: filepath.Join(dir, "state"), Ctl: r.ctl, Units: r.units, Prober: r.pr,
 		Guard: r.guard, Faults: r.faults, Publish: r.pub.publish, Alert: r.alerts, Sockets: r.sockets,
 		Unbound: "127.0.0.10:5300", BootID: func() string { return "boot-1" }, Timing: tm,
+		Tables: func(v string) (xrayschema.Table, error) {
+			if v == "v26.11.10" { // a second release, with the allow list of the one this build knows
+				v = "v26.11.9"
+			}
+			return xrayschema.For(v)
+		},
 	}
 	r.m = New(r.opts)
 	return r
