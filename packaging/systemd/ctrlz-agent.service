@@ -1,0 +1,57 @@
+# The agent: the panel link, the store, the host side (p4-nodes 7.1, 7.3).
+#
+# What it may change on the host is exactly this unit's list, and nothing is added
+# by a package: CAP_NET_ADMIN for its own nftables table; start, stop and restart
+# of the Unbound units, ctrlz-dns and chrony through the polkit rule; writes only
+# below the three ReadWritePaths. It has no right to install anything (R16): no
+# polkit action but those units, no capability that reaches dpkg's files, and the
+# upgrade is a root one-shot (`sudo ctrlz-node upgrade`), not an agent act.
+[Unit]
+Description=Ctrl Z node agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ctrlz-agent
+Group=ctrlz
+ExecStart=/usr/local/bin/ctrlz-node agent
+Restart=always
+RestartSec=2s
+LimitCORE=0
+LimitNOFILE=65536
+
+# /run/ctrlz holds agent.sock (0660, group ctrlz). It survives an agent restart so
+# that dns, which holds a path to it, does not meet a missing directory.
+RuntimeDirectory=ctrlz
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ctrlz /etc/ctrlz/unbound /etc/ctrlz/chrony
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+# AF_NETLINK for nftables; AF_UNIX for agent.sock, the Unbound control sockets and D-Bus.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# No RestrictSUIDSGID: its seccomp filter refuses every chmod whose mode carries the
+# setgid bit, and the store (and each image it builds) chmods its group-shared
+# directories 2750 at every start (7.2). The agent would exit on its first chmod.
+# NoNewPrivileges and the one-capability bounding set still apply.
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+# Local additions to Ubuntu's AppArmor profile of /usr/sbin/unbound, which the
+# package's profile includes from /etc/apparmor.d/local/usr.sbin.unbound
+# (p4-nodes 7.1, 7.3). The profile confines every `unbound` binary, ours included,
+# to /etc/unbound and /run/unbound*, so without these lines the two node Unbound
+# units cannot read their configuration or write their pid file and control socket.
+# Exactly the paths of the two units, and nothing wider.
+#
+# internal/pkgcheck compares this list with the units' own directories. A host
+# whose Unbound package has no such profile ignores the file.
+/etc/ctrlz/unbound/identified.conf r,
+/etc/ctrlz/unbound/free.conf r,
+/run/ctrlz-unbound/ rw,
+/run/ctrlz-unbound/** rwk,
+/run/ctrlz-unbound-free/ rw,
+/run/ctrlz-unbound-free/** rwk,
+/var/lib/ctrlz-unbound/ rw,
+/var/lib/ctrlz-unbound/** rwk,
+/var/lib/ctrlz-unbound-free/ rw,
+/var/lib/ctrlz-unbound-free/** rwk,
+/usr/share/dns/root.key r,
+/usr/share/dns/root.hints r,
