@@ -1,0 +1,50 @@
+# One Xray slot (p4b-proxy 7.6): instances a and b, so a change that cannot be made
+# live goes to the idle slot and the active one is switched. Not enabled: the agent
+# starts the active slot, after its read-back of the nftables table says the chains
+# of 5.5 are in place. `xray-run` reads the slot's version, refuses one that is not in
+# xray.allow, removes the slot's old api.sock and replaces itself with the binary.
+[Unit]
+Description=Ctrl Z Xray slot %i
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ctrlz-xray
+Group=ctrlz-xray
+ExecStart=/usr/local/bin/ctrlz-node xray-run %i
+Restart=always
+RestartSec=2
+LimitCORE=0
+# The node's connection cap of 12 times 100 KB, and the socket memory of 12.
+LimitNOFILE=262144
+MemoryMax=5G
+CPUWeight=50
+OOMScoreAdjust=500
+Environment=GODEBUG=multipathtcp=0
+StandardOutput=null
+StandardError=null
+ReadWritePaths=/run/ctrlz-xray-%i
+InaccessiblePaths=/var/lib/ctrlz
+# /etc/ctrlz is an empty tmpfs but for the slot's two files and the allow file.
+TemporaryFileSystem=/etc/ctrlz:ro
+BindReadOnlyPaths=/etc/ctrlz/xray/%i.json /etc/ctrlz/xray/%i.version -/etc/ctrlz/versions/xray.allow
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
