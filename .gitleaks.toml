@@ -1,0 +1,15 @@
+# Extends the default rules with one exact exception: the rule, the path and the value it exists
+# for. The Node tree holds no other value that the rules report, so a test file here has no
+# exception at all: a canary that a new test plants needs a reviewed entry in this file, in
+# ci/gitleaks/ and in ci/publish.json (CI review round 7, ci-r7-1). Real secrets live in Docker
+# secrets, never in the tree.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The golden-vector catalog key: a fixed, public 16-byte test key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^shared/vectors/fixtures/base\.json$''']
+regexTarget = "secret"
+regexes = ['''^00112233445566778899aabbccddeeff$''']
