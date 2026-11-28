@@ -1,6 +1,7 @@
 package nft
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -154,6 +155,29 @@ func (g *Guard) readHash(ctx context.Context) (string, error) {
 // read before that says off for a table that never left the kernel, which would
 // stop slots that outlived the agent.
 func (g *Guard) Settled() <-chan struct{} { return g.settled }
+
+// IsSettled reports whether Settled has closed.
+func (g *Guard) IsSettled() bool {
+	select {
+	case <-g.settled:
+		return true
+	default:
+		return false
+	}
+}
+
+// HoldsProxyChains reports whether the kernel holds a table of ours with the proxy
+// chains, whatever this process has applied. The table outlives the agent, so after a
+// restart this is the only way to know that the uids of running slots are still
+// bound; the agent keeps such a table rather than replace it by one without them.
+func (g *Guard) HoldsProxyChains(ctx context.Context) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+	out, err := g.run.Run(ctx, nil, "nft", "-s", "list", "table", "inet", Table)
+	return err == nil && bytes.Contains(out, []byte("chain xray_out"))
+}
 
 func (g *Guard) settle() { g.settledOnce.Do(func() { close(g.settled) }) }
 

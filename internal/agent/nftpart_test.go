@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
@@ -17,12 +18,8 @@ import (
 
 func nftAgent(t *testing.T, lookup func(...string) ([]uint32, error)) (*Agent, *fake.Runner, *alert.Memory) {
 	t.Helper()
-	r := &fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
-		if len(c.Args) > 0 && c.Args[0] == "-s" {
-			return []byte("table inet ctrlz_agent"), nil
-		}
-		return nil, nil
-	}}
+	k := &fakeKernel{}
+	r := &fake.Runner{Reply: k.reply}
 	al := &alert.Memory{}
 	cfg := Config{
 		Runner: r, Alert: al, LookupUIDs: lookup,
@@ -286,5 +283,170 @@ func TestNftPartKeepsAGuardSetBeforeIt(t *testing.T) {
 	wireNftGuard(&cfg)
 	if cfg.NftGuard != own || len(cfg.Parts) != 1 || cfg.Parts[0].(*nftPart).g != own {
 		t.Fatal("the part runs another guard than the one set before it")
+	}
+}
+
+// fakeKernel is the part of nft the agent reads: the table last loaded, which
+// outlives an Agent value exactly as the real one outlives the process.
+type fakeKernel struct {
+	mu     sync.Mutex
+	table  string
+	refuse func(script string) bool
+}
+
+func (k *fakeKernel) reply(c fake.Call) ([]byte, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	switch {
+	case len(c.Args) == 2 && c.Args[0] == "-f":
+		if k.refuse != nil && k.refuse(string(c.Stdin)) {
+			return nil, errors.New("refused")
+		}
+		k.table = string(c.Stdin)
+	case len(c.Args) > 0 && c.Args[0] == "-s":
+		if k.table == "" {
+			return nil, errors.New("no such table")
+		}
+		return []byte("table inet ctrlz_agent\n" + k.table), nil
+	}
+	return nil, nil
+}
+
+// restarted is an agent process that starts over a kernel that already holds the table
+// of the one before it: its nftApplier has applied nothing.
+func restarted(t *testing.T, k *fakeKernel, lookup func(...string) ([]uint32, error)) (*Agent, *fake.Runner) {
+	t.Helper()
+	a, _, _ := nftAgent(t, lookup)
+	r := &fake.Runner{Reply: k.reply}
+	a.cfg.Runner = r
+	a.cfg.NftGuard = nft.NewGuard(r)
+	a.cfg.Faults = NewFaults()
+	f := a.cfg.Faults
+	a.cfg.NftGuard.OnFailure(func(failed bool) { f.Set(hubv1.NodeFault_NODE_FAULT_NFT_FAILED, failed) })
+	a.nftTable = nftApplier{g: a.cfg.NftGuard}
+	return a, r
+}
+
+// kernelWithChains is what a running node holds: the table of a full apply.
+func kernelWithChains(t *testing.T) *fakeKernel {
+	t.Helper()
+	a, r, _ := nftAgent(t, goodUIDs)
+	k := &fakeKernel{}
+	r.Reply = k.reply
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if !strings.Contains(k.table, "chain xray_out") {
+		t.Fatal("the helper kernel holds no proxy chains")
+	}
+	return k
+}
+
+// INT2-r1-1, INT2-r1-4: freshness comes from the kernel. A restarted agent whose proxy
+// part cannot be rendered must keep the table of the agent before it.
+func TestNftRestartedAgentKeepsChainsAgainstAnUnrenderablePart(t *testing.T) {
+	k := kernelWithChains(t)
+	before := k.table
+	a, r := restarted(t, k, goodUIDs)
+	a.cfg.Conf.ProxyBindIP = a.cfg.Conf.DNSBindIP
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if n := len(nftScripts(r)); n != 0 || k.table != before {
+		t.Errorf("the table was replaced (%d scripts)", n)
+	}
+	if a.cfg.NftGuard.Check() || !a.cfg.Faults.Has(hubv1.NodeFault_NODE_FAULT_NFT_FAILED) {
+		t.Error("the guard is on, or nft_failed is not raised")
+	}
+}
+
+// The same restart when nft refuses the proxy script: no fallback over the chains.
+func TestNftRestartedAgentKeepsChainsWhenNftRefusesTheScript(t *testing.T) {
+	k := kernelWithChains(t)
+	before := k.table
+	k.refuse = func(s string) bool { return strings.Contains(s, "chain xray_out") }
+	a, r := restarted(t, k, goodUIDs)
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	for _, s := range nftScripts(r) {
+		if !strings.Contains(s, "chain xray_out") {
+			t.Fatal("the table of P4 was applied over the running chains")
+		}
+	}
+	if k.table != before {
+		t.Error("the kernel table changed")
+	}
+	if a.cfg.NftGuard.Check() {
+		t.Error("the guard is on over a table that is not the wanted one")
+	}
+}
+
+// INT2-r1-3, INT2-r1-6: a pass that cannot build the proxy part (an account that did not
+// resolve) leaves the chains of a running node alone, with the guard off.
+func TestNftNoProxyPartKeepsTheRunningChains(t *testing.T) {
+	k := kernelWithChains(t)
+	before := k.table
+	a, r := restarted(t, k, func(...string) ([]uint32, error) { return nil, errors.New("unknown") })
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if n := len(nftScripts(r)); n != 0 || k.table != before {
+		t.Errorf("the table was replaced (%d scripts)", n)
+	}
+	if a.cfg.NftGuard.Check() {
+		t.Error("the guard is on")
+	}
+	// The next pass that has its accounts again puts the full table back and the guard on.
+	a.cfg.LookupUIDs = goodUIDs
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if !a.cfg.NftGuard.Check() || a.cfg.Faults.Has(hubv1.NodeFault_NODE_FAULT_NFT_FAILED) {
+		t.Error("the guard did not come back")
+	}
+}
+
+// INT2-r1-2, INT2-r1-5: the hub is a name that does not answer, and the agent restarts.
+// The addresses of the last answer come from disk, so the table is rendered and the
+// guard settles on, not rejected.
+func TestNftRestartWithAnUnresolvedHubUsesTheStoredAddresses(t *testing.T) {
+	k := kernelWithChains(t)
+	a, _ := restarted(t, k, goodUIDs)
+	a.cfg.Conf.Hub = "hub.invalid:443"
+	a.nftTable.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no such host") }
+	a.cfg.Root = "/var/lib/ctrlz"
+	a.cfg.Files = fake.NewFiles(nil) // panelFile needs Files to name a path
+	a.cfg.Files.(*fake.Files).Set(panelFile(a.cfg), "198.51.100.20\n")
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if !a.cfg.NftGuard.Check() || a.cfg.NftGuard.Failed() {
+		t.Error("the guard is not on with the stored addresses")
+	}
+}
+
+// With nothing stored and no answer, the first attempt does not settle the guard as
+// rejected; a later one does.
+func TestNftUnresolvedHubWithNothingStoredDoesNotSettleAtOnce(t *testing.T) {
+	k := kernelWithChains(t)
+	a, _ := restarted(t, k, goodUIDs)
+	a.cfg.Conf.Hub = "hub.invalid:443"
+	a.nftTable.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no such host") }
+	a.cfg.Root = "/var/lib/ctrlz"
+	a.cfg.Files = fake.NewFiles(nil)
+	ctx := context.Background()
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if a.cfg.NftGuard.IsSettled() {
+		t.Fatal("the guard settled on a hub that has not been resolved yet")
+	}
+	a.cfg.Conf.Hub = "198.51.100.20"
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if !a.cfg.NftGuard.IsSettled() || !a.cfg.NftGuard.Check() {
+		t.Error("the guard is not settled and on once the hub has an address")
+	}
+}
+
+// An answered lookup is written down, and read back by an applier that has none.
+func TestNftAnsweredLookupIsStored(t *testing.T) {
+	want := netip.MustParseAddr("198.51.100.20")
+	n := nftApplier{lookup: func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{want}, nil }}
+	cfg := Config{Root: "/var/lib/ctrlz", Files: fake.NewFiles(nil)}
+	cfg.Conf.Hub = "hub.example:443"
+	if got := n.resolvePanel(context.Background(), cfg); len(got) != 1 || got[0] != want {
+		t.Fatalf("answer %v", got)
+	}
+	var later nftApplier
+	later.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no such host") }
+	if got := later.resolvePanel(context.Background(), cfg); len(got) != 1 || got[0] != want {
+		t.Errorf("the stored address was not used: %v", got)
 	}
 }

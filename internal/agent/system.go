@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/hubconn"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nets"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nft"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/unbound"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store"
 )
@@ -77,6 +80,10 @@ func (a *Agent) systemLoop(ctx context.Context) {
 		return
 	}
 
+	// The table first: it needs no Unbound, and the Xray manager waits (bounded) on its
+	// first attempt, so a slow Unbound start must not eat that wait (INT2-r1-5). A hub
+	// name that cannot be resolved before Unbound runs is tried again right after it.
+	a.applyNft(ctx)
 	if v := startUnbound(ctx, a.cfg, a.al, a.unb, a.doNotQuery()); v != "" {
 		a.unbVersion.Store(&v)
 	}
@@ -198,6 +205,8 @@ type nftApplier struct {
 	// fails later must not render a table with no panel address, which would leave
 	// the guard on over the older table.
 	panel []netip.Addr
+	// lookup resolves the hub name; nil takes the system resolver (a test gives its own).
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	// g, when set, applies the table and keeps the read-back of 5.5 (nftpart.go).
 	g *nft.Guard
 }
@@ -208,49 +217,66 @@ func (n *nftApplier) apply(ctx context.Context, cfg Config, al alert.Alerter, dn
 
 // applyWith is apply with the proxy chains of p4b-proxy 5.5 (px nil: the table of P4).
 func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter, dnsIP netip.Addr, px *nft.ProxyParams) {
+	// kept says whether the kernel holds a table of ours with the proxy chains. It is read
+	// from the kernel and not from this process: the table outlives the agent (no
+	// ExecStop), so a restarted agent has applied nothing and still faces the chains
+	// that bind the uids of the slots that kept running (INT2-r1-1, INT2-r1-4). The
+	// answer cannot change under us: a refused script leaves the table as it was, and
+	// this loop is the only one that applies.
+	var keptKnown, keptVal bool
+	kept := func() bool {
+		if n.g == nil {
+			return false
+		}
+		if !keptKnown {
+			keptVal, keptKnown = n.g.HoldsProxyChains(ctx), true
+		}
+		return keptVal
+	}
+	if px == nil && kept() {
+		// The proxy part cannot be had this pass (no address, an account that did not
+		// resolve). That is no reason to take the chains away from uids that still run: the
+		// older table stays, the guard is off, so the manager stops the slots, and the
+		// next pass that has the part puts the full table back (INT2-r1-3, INT2-r1-6).
+		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the proxy chains cannot be built now; the older table stays"})
+		n.g.Reject()
+		return
+	}
 	p := nft.Params{DNSIP: dnsIP, PanelAddrs: cfg.Conf.Panel(), FreePortLo: unbound.FreePortLo, FreePortHi: unbound.FreePortHi, Proxy: px}
 	if len(p.PanelAddrs) == 0 {
 		// The hub is a name: resolve it once, here, because nftables needs addresses.
-		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", cfg.Conf.HubHost()); err == nil {
-			for _, ip := range ips {
-				p.PanelAddrs = append(p.PanelAddrs, ip.Unmap())
-			}
-		}
-		n.mu.Lock()
-		if len(p.PanelAddrs) > 0 {
-			n.panel = p.PanelAddrs
-		} else {
-			p.PanelAddrs = n.panel
-		}
-		n.mu.Unlock()
+		p.PanelAddrs = n.resolvePanel(ctx, cfg)
 	}
 	text, err := nft.Render(p)
-	// fresh: this process has applied no table yet. Only then is there no older table
-	// of ours in the kernel to stand, so only then is the table of P4 a fallback worth
-	// its cost. On a node that already runs the proxy chains it would delete xray_out,
-	// proxy_out, block_out and socks_guard, which bind the uids still running
-	// (B4-r2-3): there the older table stays and the guard is told it is not the wanted
-	// one.
-	n.mu.Lock()
-	fresh := n.last == ""
-	n.mu.Unlock()
 	fallback := false
-	if err != nil && px != nil && fresh {
+	if err != nil && px != nil && !kept() {
 		// When the proxy part is what cannot be rendered (an address equal to DNS_IP, an
-		// unusable uid), the table of P4 still goes in: the notrack and flood rules of
+		// unusable uid), the table of P4 still goes in, but only where the kernel holds no
+		// proxy chains: there is no older table to stand, and the notrack and flood rules of
 		// DNS_IP must not be lost with it (5.5). The guard stays off and nft_failed is
-		// raised. n.last then holds the P4 text, so the next pass is not fresh and does
-		// not apply it again (B4-r2-1, B4-r2-4).
+		// raised. Where the chains exist, the older table stays (B4-r2-3).
 		p4 := p
 		p4.Proxy = nil
 		if t4, err4 := nft.Render(p4); err4 == nil {
-			p, text, err, fallback = p4, t4, nil, true
 			al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the proxy chains could not be rendered"})
+			n.mu.Lock()
+			done := n.last == t4
+			n.mu.Unlock()
+			if done && n.g != nil {
+				// Already in the kernel from an earlier pass: no reload, no clear and raise
+				// of nft_failed (B4-r2-1, B4-r2-4).
+				n.g.Reject()
+				return
+			}
+			p, text, err, fallback = p4, t4, nil, true
 		}
 	}
 	if err != nil {
 		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the nftables table could not be rendered"})
-		if n.g != nil {
+		// A hub name with no address yet, on a guard that has not made its first attempt,
+		// must not settle it as rejected: the manager would stop slots whose table is still
+		// intact in the kernel, for a lookup the next pass may answer (INT2-r1-2).
+		if n.g != nil && (len(p.PanelAddrs) > 0 || n.g.IsSettled()) {
 			n.g.Reject()
 		}
 		return
@@ -265,9 +291,9 @@ func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter
 		return
 	}
 	err = n.applyTable(ctx, cfg, p, fallback)
-	if err != nil && p.Proxy != nil && fresh && n.g != nil {
-		// The script rendered but nft refused it, and no older table exists: the DNS_IP
-		// rules must not wait for chains that have never run on this kernel
+	if err != nil && p.Proxy != nil && n.g != nil && !kept() {
+		// The script rendered but nft refused it, and no older table with chains exists:
+		// the DNS_IP rules must not wait for chains that have never run on this kernel
 		// (B4-r2-2). nft applies a script whole or not at all, so nothing is half
 		// there; the fallback goes in with the guard off and the next pass tries the
 		// full table again.
@@ -289,6 +315,71 @@ func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter
 	n.mu.Lock()
 	n.last = text
 	n.mu.Unlock()
+}
+
+// panelFile is where the hub's addresses of the last answered lookup are kept. The
+// table is rendered from addresses, and a restarted agent whose host resolver cannot
+// answer yet (it may be the Unbound that was just started) would otherwise render
+// none and settle the guard as rejected, which stops slots that run on an intact
+// table (INT2-r1-2, INT2-r1-5). Not a secret: the hub's addresses are in agent.conf
+// or in DNS.
+func panelFile(cfg Config) string {
+	if cfg.Root == "" || cfg.Files == nil {
+		return ""
+	}
+	return filepath.Join(cfg.Root, store.DirConfig, "panel-addrs")
+}
+
+// resolvePanel looks the hub name up. An answer is remembered in memory and on disk;
+// when the lookup fails, the last answer stands, read from disk when this process has
+// none.
+func (n *nftApplier) resolvePanel(ctx context.Context, cfg Config) []netip.Addr {
+	var got []netip.Addr
+	lookup := n.lookup
+	if lookup == nil {
+		lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		}
+	}
+	if ips, err := lookup(ctx, cfg.Conf.HubHost()); err == nil {
+		for _, ip := range ips {
+			got = append(got, ip.Unmap())
+		}
+	}
+	path := panelFile(cfg)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(got) == 0 {
+		if len(n.panel) == 0 && path != "" {
+			n.panel = readPanelFile(cfg.Files, path)
+		}
+		return n.panel
+	}
+	changed := !slices.Equal(got, n.panel)
+	n.panel = got
+	if changed && path != "" {
+		var b strings.Builder
+		for _, ip := range got {
+			b.WriteString(ip.String() + "\n")
+		}
+		// A write that fails costs only the restart case above: the table still goes in.
+		_ = cfg.Files.WriteFile(path, []byte(b.String()), 0o640)
+	}
+	return got
+}
+
+func readPanelFile(f sysx.Files, path string) []netip.Addr {
+	raw, err := f.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, l := range strings.Fields(string(raw)) {
+		if ip, err := netip.ParseAddr(l); err == nil && len(out) < 32 {
+			out = append(out, ip.Unmap())
+		}
+	}
+	return out
 }
 
 // applyTable applies p through the guard when there is one. rejected keeps the guard

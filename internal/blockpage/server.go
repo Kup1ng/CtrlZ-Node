@@ -184,7 +184,8 @@ func acceptLoop(name string, ln net.Listener, check sock.PeerCheck, handle func(
 
 // listenUnix binds a socket at path, group-owned and 0660. A stale socket file is
 // removed; anything else at the path is an error. The group is set right after the
-// bind, and until then the peer check is the only guard, which is why it exists.
+// bind, and the mode is opened last; the peer check is the guard in between, which is why
+// it exists.
 func listenUnix(path, group string) (net.Listener, error) {
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&fs.ModeSocket == 0 {
@@ -197,10 +198,6 @@ func listenUnix(path, group string) (net.Listener, error) {
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, errors.New("listen failed")
-	}
-	if err := os.Chmod(path, 0o660); err != nil {
-		ln.Close()
-		return nil, errors.New("chmod failed")
 	}
 	if group != "" {
 		g, err := user.LookupGroup(group)
@@ -216,6 +213,13 @@ func listenUnix(path, group string) (net.Listener, error) {
 			ln.Close()
 			return nil, fmt.Errorf("the group of the socket cannot be set to %q", group)
 		}
+	}
+	// Mode last: the directory is setgid, so the socket is born in another group (the one
+	// of ctrlz-link) and must be in its own before it is opened to a group at all (B4-r1-9,
+	// INT2-r1-7). Until here the umask's mode, which gives the group no write, stands.
+	if err := os.Chmod(path, 0o660); err != nil {
+		ln.Close()
+		return nil, errors.New("chmod failed")
 	}
 	return ln, nil
 }
