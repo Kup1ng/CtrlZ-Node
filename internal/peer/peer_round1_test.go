@@ -399,3 +399,44 @@ func TestForwardStreamOfANodeThatIsNotThePairPeerEndsAtItsStart(t *testing.T) {
 	}
 	b.dns.none(t, sock.TypeGrantIn, 50*time.Millisecond)
 }
+
+// addrConn is a connection that only has a remote address, for calling admit.
+type addrConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.addr }
+func (c addrConn) Close() error         { return nil }
+
+// INT2-r2-1: a connection admitted from the table that the pair has just left must not
+// be inserted after the recheck of the new table has run. The admit goroutine reads the
+// old table, waits on the connection lock, and the table moves while it waits.
+func TestAdmitAfterTheTableMovedDoesNotKeepTheFormerPeerConnection(t *testing.T) {
+	p := newPKI(t)
+	nodes := mkNodes(t, p, 3)
+	b := startRig(t, p, newDir(), nodes[1], mkTable(5, nodes, nil, [2]int{0, 1}))
+	ac := addrConn{addr: &net.TCPAddr{IP: nodes[0].ip.AsSlice(), Port: 40000}}
+
+	b.p.cmu.Lock()
+	got := make(chan *peerConn, 1)
+	go func() { got <- b.p.admit(ac) }()
+	time.Sleep(100 * time.Millisecond) // admit has read the old table and waits for the lock
+	b.env.table.Store(mkTable(6, nodes, nil, [2]int{1, 2}))
+	b.p.cmu.Unlock()
+
+	select {
+	case pc := <-got:
+		if pc != nil {
+			t.Fatal("a connection of the former peer was admitted under the old table after the move")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("admit did not return")
+	}
+	b.p.cmu.Lock()
+	n := len(b.p.conns)
+	b.p.cmu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d connections are counted", n)
+	}
+}

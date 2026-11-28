@@ -39,6 +39,9 @@ type Timing struct {
 	ResolveEvery   time.Duration // 60 s
 	NoSearch       time.Duration // 24 h
 	LocationDown   time.Duration // 10 min
+	// GuardSettle bounds the wait for the guard's first apply at the start of Run
+	// (30 s). Zero does not wait: the guard is read at once.
+	GuardSettle time.Duration
 }
 
 // DefaultTiming is the production timing.
@@ -48,7 +51,7 @@ func DefaultTiming() Timing {
 		ProbeEvery: 30 * time.Second, HangEvery: 10 * time.Second, QuietHour: time.Hour,
 		SwitchWait: 60 * time.Second, StartWait: 20 * time.Second, CandidateEvery: 5 * time.Second,
 		SocketEvery: 5 * time.Second, ResolveEvery: time.Minute, NoSearch: 24 * time.Hour,
-		LocationDown: 10 * time.Minute,
+		LocationDown: 10 * time.Minute, GuardSettle: 30 * time.Second,
 	}
 }
 
@@ -331,6 +334,9 @@ type watchState struct {
 func (m *Manager) Run(ctx context.Context) {
 	m.loadState()
 	m.lastQuiet = m.opt.Now()
+	if !m.awaitGuard(ctx) {
+		return
+	}
 	m.guardOn = m.guard()
 	m.guardNow.Store(m.guardOn)
 	if m.opt.Sockets == nil {
@@ -360,6 +366,28 @@ func (m *Manager) Run(ctx context.Context) {
 			m.tick(ctx)
 		}
 	}
+}
+
+// awaitGuard waits, bounded, until the agent has applied its table once. The guard
+// of a restarted agent knows no table before that, and recover would read "off" and
+// stop slots that outlived the agent, though the kernel holds the table they were
+// promised (INT2-r2-2). When the bound ends the wait, the guard is read as it is and
+// the slots stop: no table was shown, so none is trusted. It reports false when ctx
+// ended during the wait.
+func (m *Manager) awaitGuard(ctx context.Context) bool {
+	s, ok := m.opt.Guard.(interface{ Settled() <-chan struct{} })
+	if !ok || m.t.GuardSettle <= 0 {
+		return true
+	}
+	tm := time.NewTimer(m.t.GuardSettle)
+	defer tm.Stop()
+	select {
+	case <-s.Settled():
+	case <-tm.C:
+	case <-ctx.Done():
+		return false
+	}
+	return true
 }
 
 // guard reads the nftables guard now. A nil Guard is a guard that is off: the

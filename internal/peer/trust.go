@@ -125,12 +125,20 @@ func (p *Peer) admit(c net.Conn) *peerConn {
 	if !ok {
 		return nil
 	}
-	n := p.view().byAddr[ip.Unmap()]
+	ip = ip.Unmap()
+	n := p.view().byAddr[ip]
 	if n == nil {
 		return nil
 	}
 	p.cmu.Lock()
 	defer p.cmu.Unlock()
+	// The table is read again under the lock that recheck takes its snapshot under. A
+	// table applied after the read above is then either seen here, or applied after
+	// this insert and so seen by that recheck: no admitted connection escapes the
+	// judgement of the table that replaced the one it was admitted under (INT2-r2-1).
+	if m := p.view().byAddr[ip]; m == nil || m.id != n.id {
+		return nil
+	}
 	if p.perNod[n.id] >= MaxConnsPerNode {
 		return nil
 	}

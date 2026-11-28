@@ -46,11 +46,18 @@ type Guard struct {
 	// send keeps only the latest value, so a reader that is slow sees the present
 	// and never a queue of old flips.
 	changes chan bool
+
+	// settled closes after the first apply attempt of this process, whatever its
+	// result, or the first Reject. Until then the guard knows no table, so Check says
+	// off even when the kernel still holds the intact table of the agent that ran
+	// before (INT2-r2-2).
+	settled     chan struct{}
+	settledOnce sync.Once
 }
 
 // NewGuard returns a guard that runs nft through r.
 func NewGuard(r sysx.Runner) *Guard {
-	return &Guard{run: r, changes: make(chan bool, 1)}
+	return &Guard{run: r, changes: make(chan bool, 1), settled: make(chan struct{})}
 }
 
 // readTimeout bounds one read-back; the unit has no other bound on a stuck nft.
@@ -75,6 +82,7 @@ func (g *Guard) Apply(ctx context.Context, p Params) error { return g.apply(ctx,
 func (g *Guard) ApplyRejected(ctx context.Context, p Params) error { return g.apply(ctx, p, true) }
 
 func (g *Guard) apply(ctx context.Context, p Params, rejected bool) error {
+	defer g.settle()
 	g.mu.Lock()
 	prev := g.failed
 	w := p
@@ -117,6 +125,7 @@ func (g *Guard) applyLocked(ctx context.Context, p Params) error {
 // raised, as for an apply that nft refused (5.5). The next successful Apply ends it;
 // Heal keeps the older table in place meanwhile but does not turn the guard on.
 func (g *Guard) Reject() {
+	defer g.settle()
 	g.mu.Lock()
 	prev := g.failed
 	g.rejected, g.failed = true, true
@@ -138,6 +147,15 @@ func (g *Guard) readHash(ctx context.Context) (string, error) {
 	sum := sha256.Sum256(out)
 	return hex.EncodeToString(sum[:]), nil
 }
+
+// Settled is closed once the agent has made its first attempt to apply a table, or
+// has said it cannot render one. The Xray manager waits on it (bounded) before it
+// reads the guard at its start: a restarted agent has applied nothing yet, and a guard
+// read before that says off for a table that never left the kernel, which would
+// stop slots that outlived the agent.
+func (g *Guard) Settled() <-chan struct{} { return g.settled }
+
+func (g *Guard) settle() { g.settledOnce.Do(func() { close(g.settled) }) }
 
 // Check reads the table back now and reports whether it is the one applied, with
 // the proxy chains in it. It never applies.

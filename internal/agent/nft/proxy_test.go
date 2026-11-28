@@ -336,3 +336,37 @@ func TestHealLeavesATableOfP4Alone(t *testing.T) {
 		t.Fatalf("the tampered table was applied %d times in all", n)
 	}
 }
+
+// INT2-r2-2: Settled closes at the first apply attempt, whatever its result, and at
+// the first Reject, so the manager can wait for it after an agent restart.
+func TestGuardSettlesAtTheFirstApplyAttempt(t *testing.T) {
+	ctx := context.Background()
+	g, _, _ := newGuard()
+	select {
+	case <-g.Settled():
+		t.Fatal("settled before any apply")
+	default:
+	}
+	if err := g.Apply(ctx, proxyParams()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-g.Settled():
+	default:
+		t.Fatal("not settled after an apply")
+	}
+	g2 := NewGuard(&fake.Runner{Reply: func(fake.Call) ([]byte, error) { return nil, errors.New("nft refused") }})
+	_ = g2.Apply(ctx, proxyParams())
+	select {
+	case <-g2.Settled():
+	default:
+		t.Fatal("a failed apply did not settle: the manager would wait out its bound")
+	}
+	g3, _, _ := newGuard()
+	g3.Reject()
+	select {
+	case <-g3.Settled():
+	default:
+		t.Fatal("Reject did not settle")
+	}
+}
