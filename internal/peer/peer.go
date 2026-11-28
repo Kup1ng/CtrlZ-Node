@@ -50,11 +50,6 @@ const (
 	// MaxUnanswered is the forwards that wait for an answer, each way (and for each
 	// sender on the receiving side).
 	MaxUnanswered = 256
-	// SeqSlack is how far above the highest head this node has heard of a sender may claim
-	// its config_seq and still count as "ahead of us". A peer that is truly ahead has
-	// applied entries the hub announced, so its number is near our head; a number far past
-	// it is a lie meant to switch off the Endpoint-and-pair check of a receiver (4.5).
-	SeqSlack = 16
 
 	defaultTick     = time.Second
 	defaultAckWait  = 8 * time.Second  // receiver: how long dns may take to answer a grant_in
@@ -77,9 +72,6 @@ type Env interface {
 	EndpointPair(endpoint []byte) (pairID []byte, known bool)
 	// AppliedSeq is the node's applied config_seq.
 	AppliedSeq() uint64
-	// HeadSeq is the highest log head the hub has announced to this node (never below
-	// AppliedSeq). It bounds what a peer may claim as its own config_seq.
-	HeadSeq() uint64
 	// HubNow is the hub's clock in Unix seconds, the clock a Grant's expires_at is in.
 	HubNow() int64
 	// BindIP is dns_bind_ip: the address the listener binds and the client dials from.

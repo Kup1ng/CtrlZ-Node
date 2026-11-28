@@ -181,8 +181,7 @@ func (c serverCreds) ServerHandshake(raw net.Conn) (net.Conn, credentials.AuthIn
 			if err != nil {
 				return err
 			}
-			pc.setLeaf(spkiOf(leaf))
-			return nil
+			return c.p.bindLeaf(pc, spkiOf(leaf))
 		},
 	}
 	conn, info, err := credentials.NewTLS(cfg).ServerHandshake(raw)
@@ -191,6 +190,19 @@ func (c serverCreds) ServerHandshake(raw net.Conn) (net.Conn, credentials.AuthIn
 		return nil, nil, errConn
 	}
 	return conn, info, nil
+}
+
+// bindLeaf records the key a connection was verified with, then judges it once more
+// under the table of now. The order matters: recheck (run when a new table is seen) only
+// looks at connections whose key is recorded, so a table applied between the check in
+// verifyPeer and the record would otherwise pass both. Recorded first, a table applied
+// after this line is seen by recheck, and one applied before it is seen by the read here.
+func (p *Peer) bindLeaf(pc *peerConn, spki [32]byte) error {
+	pc.setLeaf(spki)
+	if !p.view().trusts(pc.node, spki) {
+		return errTrust
+	}
+	return nil
 }
 
 // recheck ends every connection whose key the table v no longer trusts: a revoked

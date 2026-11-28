@@ -78,8 +78,5 @@ func endpointPairIn(ap *store.Applied, endpoint []byte) (pairID []byte, known bo
 
 func (e peerEnv) AppliedSeq() uint64 { return e.a.app.AppliedSeq() }
 
-// HeadSeq is the highest head the hub has announced, never below what is applied.
-func (e peerEnv) HeadSeq() uint64 { return max(e.a.highHead.Load(), e.a.app.AppliedSeq()) }
-
 func (e peerEnv) HubNow() int64      { return e.a.hubNow() }
 func (e peerEnv) BindIP() netip.Addr { return e.a.dnsIP() }

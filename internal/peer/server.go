@@ -32,6 +32,10 @@ type service struct {
 // inStream is the answer side of one Forward stream.
 type inStream struct {
 	node zone.NodeID
+	// spki is the key the connection was verified with. The table is judged against it at
+	// every forward, as the client side does with outConn, so a peer key that the applied
+	// table has replaced stops at its next message and not at the next tick.
+	spki [32]byte
 	out  chan *peerv1.GrantAck
 	n    atomic.Int32 // forwards handed to dns and not yet answered
 }
@@ -51,20 +55,24 @@ func (s *inStream) ack(gid []byte, ok bool) {
 	}
 }
 
-func nodeOfStream(ctx context.Context) (zone.NodeID, bool) {
+// nodeOfStream is the node id and the key the stream's connection showed. Both were
+// verified in the handshake; they are read back here to be judged again under the table
+// of the moment.
+func nodeOfStream(ctx context.Context) (zone.NodeID, [32]byte, bool) {
 	pr, ok := grpcpeer.FromContext(ctx)
 	if !ok {
-		return zone.NodeID{}, false
+		return zone.NodeID{}, [32]byte{}, false
 	}
 	ti, ok := pr.AuthInfo.(credentials.TLSInfo)
 	if !ok || len(ti.State.PeerCertificates) == 0 {
-		return zone.NodeID{}, false
+		return zone.NodeID{}, [32]byte{}, false
 	}
-	raw, ok := enroll.ParseNodeID(ti.State.PeerCertificates[0].Subject.CommonName)
+	leaf := ti.State.PeerCertificates[0]
+	raw, ok := enroll.ParseNodeID(leaf.Subject.CommonName)
 	if !ok || len(raw) != 16 {
-		return zone.NodeID{}, false
+		return zone.NodeID{}, [32]byte{}, false
 	}
-	return zone.NodeID(raw), true
+	return zone.NodeID(raw), spkiOf(leaf), true
 }
 
 // Forward takes the peer's Grants. Each is judged here in the order of 4.5 (the shape,
@@ -72,17 +80,21 @@ func nodeOfStream(ctx context.Context) (zone.NodeID, bool) {
 // A forward that fails a check is answered refused and writes nothing.
 func (sv *service) Forward(stream grpc.BidiStreamingServer[peerv1.GrantForward, peerv1.GrantAck]) error {
 	p := sv.p
-	node, ok := nodeOfStream(stream.Context())
+	node, spki, ok := nodeOfStream(stream.Context())
 	if !ok {
 		return status.Error(codes.PermissionDenied, "no peer identity")
 	}
 	// Only the pair peer forwards: any other live node of the table may finish a handshake
 	// (the address check admits every live node), but its stream ends here, before one of
 	// its messages is read, so it costs no decoding, no check and no ack.
-	if pl := p.view().peerLive(); pl == nil || pl.id != node {
+	v0 := p.view()
+	if pl := v0.peerLive(); pl == nil || pl.id != node {
 		return status.Error(codes.PermissionDenied, "not the pair peer")
 	}
-	st := &inStream{node: node, out: make(chan *peerv1.GrantAck, queueLen)}
+	if !v0.trusts(node, spki) {
+		return status.Error(codes.PermissionDenied, "key not in the applied table")
+	}
+	st := &inStream{node: node, spki: spki, out: make(chan *peerv1.GrantAck, queueLen)}
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	defer p.endStream(st)
@@ -140,14 +152,19 @@ func (p *Peer) takeForward(st *inStream, g *peerv1.GrantForward) error {
 		refuse()
 		return nil
 	}
-	behind := g.SenderConfigSeq > e.AppliedSeq()
-	if behind && g.SenderConfigSeq > max(e.HeadSeq(), e.AppliedSeq())+SeqSlack {
-		// A number past every head the hub has announced is no honest "ahead of you": it
-		// would skip the Endpoint-and-pair check and fill dns's held list. Refused as a
-		// forward that fails the check it tried to skip.
-		refuse()
-		return nil
+	// The key the connection was verified with is still the one the table holds for the
+	// peer. The stream ends, as the client side drops a connection: a replaced key is not a
+	// forward to answer.
+	if !v.trusts(st.node, st.spki) {
+		return status.Error(codes.PermissionDenied, "key not in the applied table")
 	}
+	// sender_config_seq is the sender's own claim and proves nothing: a lying peer can
+	// always claim "ahead of you" and so skip the Endpoint-and-pair check here. No bound
+	// is put on it, because any bound either leaves the liar a number inside it or refuses
+	// an honest peer whose receiver has not heard the hub's latest head. The real gate for
+	// a forward that claims to be ahead is dns's hold-and-judge (4.5 Sequence: 60 s, at
+	// most 1024 refused), which judges the pair itself once its image reaches that seq.
+	behind := g.SenderConfigSeq > e.AppliedSeq()
 	if !behind {
 		pairID, known := e.EndpointPair(g.EndpointId)
 		if !known || !v.inOurPair(pairID) {

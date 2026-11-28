@@ -195,47 +195,85 @@ func TestReceiverRateOf500ForwardsAPerSecond(t *testing.T) {
 	}
 }
 
-// A sender cannot skip the Endpoint-and-pair check by claiming a config_seq the hub never
-// announced: up to the highest head plus the slack it counts as ahead, past it it is
-// refused (B6p-r1-5).
-func TestReceiverRefusesAForgedSenderConfigSeq(t *testing.T) {
-	_, _, _, a, b := pairOfTwo(t) // B is at 100 and has heard of no head above that
+// sender_config_seq is the sender's own claim, so the receiver puts no bound on it: a
+// bound would be empty for a liar and would refuse an honest peer whose receiver has not
+// heard the hub's latest head (B6p-r2-2). A forward that claims to be ahead goes to dns,
+// whose hold-and-judge is the gate for its pair; one that is not ahead is judged here.
+func TestReceiverPassesAnyAheadSenderConfigSeqToDNS(t *testing.T) {
+	_, _, _, a, b := pairOfTwo(t) // B is applied at 100
 	cl := rawClient(t, a, b)
 	other := func(seq uint64, i int) *peerv1.GrantForward {
 		g := fwdID(i)
-		g.EndpointId = gidOf(9) // an Endpoint of the other pair: only "ahead of us" lets it through
+		g.EndpointId = gidOf(9) // an Endpoint of the other pair
 		g.SenderConfigSeq = seq
 		return g
 	}
-	for i, tc := range []struct {
-		seq  uint64
-		pass bool
-	}{
-		{100 + SeqSlack, true},
-		{100 + SeqSlack + 1, false},
-		{math.MaxUint64, false},
-	} {
-		g := other(tc.seq, i+1)
+	// An honest peer 30 entries ahead of a receiver that missed the hub's notices.
+	for i, seq := range []uint64{130, math.MaxUint64} {
+		g := other(seq, i+1)
 		if err := cl.st.Send(g); err != nil {
 			t.Fatal(err)
 		}
-		if tc.pass {
-			b.dns.next(t, sock.TypeGrantIn)
-			b.dns.deliver(&sock.Msg{Type: sock.TypeGrantRes, GrantRes: &sock.GrantRes{GrantID: g.GrantId, Accepted: false}})
-			ackOf(t, cl)
-			continue
-		}
-		if ackOf(t, cl).Accepted {
-			t.Fatalf("seq %d was taken", tc.seq)
-		}
-		b.dns.none(t, sock.TypeGrantIn, 50*time.Millisecond)
+		b.dns.next(t, sock.TypeGrantIn)
+		b.dns.deliver(&sock.Msg{Type: sock.TypeGrantRes, GrantRes: &sock.GrantRes{GrantID: g.GrantId, Accepted: false}})
+		ackOf(t, cl)
 	}
-	// A head the hub announced makes the larger number honest.
-	b.env.head.Store(5000)
-	if err := cl.st.Send(other(5000, 10)); err != nil {
+	// Not ahead: the Endpoint of another pair is refused here, before dns.
+	if err := cl.st.Send(other(100, 10)); err != nil {
 		t.Fatal(err)
 	}
-	b.dns.next(t, sock.TypeGrantIn)
+	if ackOf(t, cl).Accepted {
+		t.Fatal("an Endpoint of another pair was taken at the receiver's own seq")
+	}
+	b.dns.none(t, sock.TypeGrantIn, 50*time.Millisecond)
+}
+
+// A stream is judged against the key its connection showed at every forward, not once a
+// tick: the loop of Run never ticks here (an hour), and a table that replaces the peer's
+// key must stop the open stream at its next message (B6p-r2-1, r2-3).
+func TestReceiverEndsAStreamWhoseKeyTheTableHasReplaced(t *testing.T) {
+	_, nodes, _, a, b := pairOfTwo(t, func(c *Config) { c.Tick = time.Hour })
+	cl := rawClient(t, a, b)
+	g := fwdID(1)
+	if err := cl.st.Send(g); err != nil {
+		t.Fatal(err)
+	}
+	b.dns.next(t, sock.TypeGrantIn) // the stream works under the old table
+	b.dns.deliver(&sock.Msg{Type: sock.TypeGrantRes, GrantRes: &sock.GrantRes{GrantID: g.GrantId, Accepted: true}})
+	ackOf(t, cl)
+
+	pt := mkTable(6, nodes, nil, [2]int{0, 1}, [2]int{2, 3})
+	pt.Nodes[0].SpkiSha256 = make([]byte, 32) // A re-enrolled: the key it holds is no longer the table's
+	pt.Nodes[0].SpkiSha256[0] = 0x22
+	b.env.table.Store(pt)
+
+	if err := cl.st.Send(fwdID(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.st.Recv(); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("the stream of a replaced key: %v", err)
+	}
+	b.dns.none(t, sock.TypeGrantIn, 100*time.Millisecond)
+}
+
+// A connection whose key the table replaced between the TLS check and the record of the
+// key is refused when it is recorded (B6p-r2-1).
+func TestBindLeafJudgesTheKeyUnderTheCurrentTable(t *testing.T) {
+	_, nodes, _, _, b := pairOfTwo(t, func(c *Config) { c.Tick = time.Hour })
+	pc := &peerConn{node: nodes[0].id, p: b.p}
+	old := nodes[0].spki()
+	if err := b.p.bindLeaf(pc, old); err != nil {
+		t.Fatalf("the key of the table: %v", err)
+	}
+	pt := mkTable(6, nodes, nil, [2]int{0, 1}, [2]int{2, 3})
+	pt.Nodes[0].SpkiSha256 = make([]byte, 32)
+	b.env.table.Store(pt)
+	if err := b.p.bindLeaf(pc, old); err != errTrust {
+		t.Fatalf("a key the table replaced: %v", err)
+	}
+	if _, has := pc.leaf(); !has {
+		t.Fatal("the key was not recorded before it was judged, so recheck would skip the connection")
+	}
 }
 
 // A bind that fails leaves the old listener open and is tried again no sooner than 5 s

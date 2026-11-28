@@ -121,7 +121,6 @@ type fakeEnv struct {
 	mu    sync.Mutex
 	eps   map[string][]byte // endpoint id -> pair id ("" for the global pair)
 	seq   atomic.Uint64
-	head  atomic.Uint64 // the highest head the hub announced; HeadSeq never answers below seq
 	bind  atomic.Pointer[netip.Addr]
 }
 
@@ -140,7 +139,6 @@ func (e *fakeEnv) EndpointPair(id []byte) ([]byte, bool) {
 	return p, ok
 }
 func (e *fakeEnv) AppliedSeq() uint64 { return e.seq.Load() }
-func (e *fakeEnv) HeadSeq() uint64    { return max(e.head.Load(), e.seq.Load()) }
 func (e *fakeEnv) HubNow() int64      { return hubNow }
 func (e *fakeEnv) BindIP() netip.Addr { return *e.bind.Load() }
 func (e *fakeEnv) endpoint(id []byte, pair []byte) {
@@ -398,8 +396,7 @@ func TestBehindReceiverPassesUnknownEndpointToDNS(t *testing.T) {
 	_, _, _, a, b := pairOfTwo(t)
 	a.env.endpoint(gidOf(66), nil)
 	g := fwd(6, 66)
-	g.SenderConfigSeq = 500 // B is at 100 and the hub has announced 500 to it
-	b.env.head.Store(500)
+	g.SenderConfigSeq = 500 // B is at 100
 	a.dns.deliver(out(t, g))
 	b.dns.next(t, sock.TypeGrantIn)
 }
