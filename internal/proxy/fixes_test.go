@@ -377,11 +377,11 @@ func TestEndDuringALookupReportsClosedAndIgnoresTheLateVerdict(t *testing.T) {
 func TestConfigOfAnOldLinkIsDropped(t *testing.T) {
 	r := newRig(t, nil)
 	r.handshake(testConfig())
-	before := r.p.config()
+	before := r.p.sweepConfig()
 	old := *testConfig()
 	old.MainNode = 1
 	r.p.applyConfig(newLink(nil), &old)
-	if r.p.config() != before {
+	if r.p.sweepConfig() != before {
 		t.Fatal("the config of another link was applied")
 	}
 }

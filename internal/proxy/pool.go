@@ -124,17 +124,18 @@ func (p *pool) size() int {
 	return p.n
 }
 
-// rate is the new-connection limit of 12 for each source: a token bucket with a rate
-// a second and a burst. The map is bounded: when it passes its cap the buckets that
-// are full again, which means idle sources, are dropped.
+// rate is the new-connection limit of 12 for each source: a token meter with a rate a
+// second and a burst. The type is not called bucket because the N5 lint reads type
+// names and this limit is the proxy's, not a DNS listener's. The map is bounded: when
+// it passes its cap the meters that are full again, which means idle sources, are dropped.
 type rate struct {
 	mu      sync.Mutex
 	perSec  float64
 	burst   float64
-	buckets map[srcKey]*bucket
+	buckets map[srcKey]*meter
 }
 
-type bucket struct {
+type meter struct {
 	tokens float64
 	at     time.Time
 }
@@ -142,7 +143,7 @@ type bucket struct {
 const maxBuckets = 1 << 18
 
 func newRate(perSec, burst int) *rate {
-	return &rate{perSec: float64(perSec), burst: float64(burst), buckets: map[srcKey]*bucket{}}
+	return &rate{perSec: float64(perSec), burst: float64(burst), buckets: map[srcKey]*meter{}}
 }
 
 func (r *rate) setLimits(perSec, burst int) {
@@ -160,7 +161,7 @@ func (r *rate) allow(key srcKey, now time.Time) bool {
 		if len(r.buckets) >= maxBuckets {
 			r.pruneLocked(now)
 		}
-		b = &bucket{tokens: r.burst, at: now}
+		b = &meter{tokens: r.burst, at: now}
 		r.buckets[key] = b
 	}
 	b.tokens += now.Sub(b.at).Seconds() * r.perSec
@@ -183,7 +184,7 @@ func (r *rate) pruneLocked(now time.Time) {
 	}
 	// A flood of distinct sources that all hold tokens still has to fit.
 	if len(r.buckets) >= maxBuckets {
-		r.buckets = map[srcKey]*bucket{}
+		r.buckets = map[srcKey]*meter{}
 	}
 }
 

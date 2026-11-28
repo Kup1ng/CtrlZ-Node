@@ -151,3 +151,37 @@ func TestNftUnrenderableTableTurnsTheGuardOff(t *testing.T) {
 		t.Error("the fault stays")
 	}
 }
+
+// B4-r1-2: a proxy part that cannot be rendered does not take the table of P4 with it.
+// On a node with no table yet, the notrack rules of DNS_IP are still applied while the
+// guard stays off and nft_failed is raised.
+func TestNftUnrenderableProxyPartStillAppliesTheDNSTable(t *testing.T) {
+	a, r, al := nftAgent(t, goodUIDs)
+	a.cfg.Conf.ProxyBindIP = a.cfg.Conf.DNSBindIP
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	var script string
+	for _, c := range r.Calls() {
+		if c.Name == "nft" && len(c.Args) == 2 && c.Args[0] == "-f" {
+			script = string(c.Stdin)
+		}
+	}
+	if !strings.Contains(script, "notrack") || !strings.Contains(script, "203.0.114.9") {
+		t.Fatalf("the table of P4 was not applied: %q", script)
+	}
+	if strings.Contains(script, "chain xray_out") {
+		t.Error("the proxy chains were applied")
+	}
+	if a.cfg.NftGuard.Check() {
+		t.Error("the guard is on without the proxy chains")
+	}
+	if !a.cfg.Faults.Has(hubv1.NodeFault_NODE_FAULT_NFT_FAILED) {
+		t.Error("the fault nft_failed is not set")
+	}
+	found := false
+	for _, c := range al.Codes() {
+		found = found || c == alert.NftFailed
+	}
+	if !found {
+		t.Error("no alert")
+	}
+}

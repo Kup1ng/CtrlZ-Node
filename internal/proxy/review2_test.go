@@ -164,3 +164,66 @@ func TestNoBindAfterTheLinkWentDown(t *testing.T) {
 		t.Fatalf("listeners opened with no link: %d binds", binds.Load())
 	}
 }
+
+// B4-r1-3: the idle end, the age cap and the memory trim go on while the link to dns
+// is down, on the limits of the last config (5.1 keeps open connections, 5.4 bounds
+// them). Before the fix the sweeper read the config that the link end clears.
+func TestSweepGoesOnWhileTheLinkIsDown(t *testing.T) {
+	sys := &fakeSys{moved: map[net.Conn]uint64{}, waiting: map[net.Conn]int{}, mem: map[string]uint64{}}
+	p, lk := unitProxy(t, Options{
+		Sys: sys, MemUnit: "unit",
+		Listen: func(string) (net.Listener, error) { return net.Listen("tcp", "127.0.0.1:0") },
+	})
+	t.Cleanup(p.closeListeners)
+	cfg := testConfig()
+	cfg.IdleS, cfg.MaxAgeS, cfg.MemUnit = 1, 3600, 100
+	p.applyConfig(lk, cfg)
+
+	mk := func(id uint64) *conn {
+		cn := unitConn(p, id)
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		cn.serve = a
+		cn.kind, cn.opened, cn.lastMove = sock.VerdictProxy, time.Now(), time.Now()
+		sys.moved[cn.c], sys.moved[a] = 5, 5
+		return cn
+	}
+	idle, old := mk(1), mk(2)
+	old.opened = time.Now().Add(-2 * time.Hour)
+
+	// The session cleanup of the link end.
+	p.mu.Lock()
+	p.lk, p.cfg = nil, nil
+	p.mu.Unlock()
+
+	now := time.Now()
+	p.samplePass(now)
+	if !old.isDead() {
+		t.Error("the age cap did not run with the link down")
+	}
+	// Nothing moved for longer than IdleS: every connection that is left goes idle.
+	stalledDelta := func(cn *conn, d uint64) {
+		cn.sampMu.Lock()
+		cn.delta = d
+		cn.sampMu.Unlock()
+	}
+	p.samplePass(now.Add(2 * time.Second))
+	if !idle.isDead() {
+		t.Error("the idle end did not run with the link down")
+	}
+
+	// Memory: a fresh pair, one with bytes waiting.
+	cn := mk(3)
+	stalledDelta(cn, 1)
+	sys.waiting[cn.c] = 1
+	sys.mem["unit"] = 50
+	p.memCheck()
+	if cn.isDead() {
+		t.Fatal("trimmed while under the value")
+	}
+	sys.mem["unit"] = 500
+	p.memCheck()
+	if !cn.isDead() {
+		t.Error("the memory trim did not run with the link down")
+	}
+}

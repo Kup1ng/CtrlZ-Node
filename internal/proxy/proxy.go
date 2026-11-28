@@ -100,6 +100,11 @@ type Proxy struct {
 	conns map[uint64]*conn
 	lk    *link
 	cfg   *sock.ProxyConfig
+	// sweep holds the limits of the last config that the sweeper reads. Unlike cfg it
+	// survives the end of the link: open connections go on while dns is away (5.1), so
+	// the idle end, the age cap and the memory trim of 5.4 must go on with them, or a
+	// restart loop of dns leaves stalled readers to fill memory until the unit is killed.
+	sweep *sweepLimits
 	// closed notices wait here for the flusher (at most 100 ms, 2.1).
 	closedIDs     []uint64
 	closedPending []sock.Pending
@@ -305,14 +310,28 @@ func (p *Proxy) applyConfig(l *link, c *sock.ProxyConfig) {
 		return
 	}
 	p.cfg = &cp
+	p.sweep = &sweepLimits{
+		idle:     time.Duration(cp.IdleS) * time.Second,
+		maxAge:   time.Duration(cp.MaxAgeS) * time.Second,
+		memUnit:  cp.MemUnit,
+		memSlots: cp.MemSlots,
+	}
 	p.mu.Unlock()
 	p.ensureListening()
 }
 
-func (p *Proxy) config() *sock.ProxyConfig {
+// sweepLimits are the values of 12 that only the sweeper uses.
+type sweepLimits struct {
+	idle, maxAge      time.Duration
+	memUnit, memSlots uint64
+}
+
+// sweepConfig is the limits of the last config, whether or not one is held now. It is
+// nil only before the first config of this process, when no connection exists either.
+func (p *Proxy) sweepConfig() *sweepLimits {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.cfg
+	return p.sweep
 }
 
 // ensureListening opens the listeners when the link is up and a config is held,

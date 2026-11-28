@@ -65,12 +65,11 @@ func (cn *conn) far() net.Conn {
 
 // samplePass reads the byte counters once for every connection.
 func (p *Proxy) samplePass(now time.Time) {
-	cfg := p.config()
-	if cfg == nil || p.o.Sys == nil {
+	sw := p.sweepConfig()
+	if sw == nil || p.o.Sys == nil {
 		return
 	}
-	idle := time.Duration(cfg.IdleS) * time.Second
-	maxAge := time.Duration(cfg.MaxAgeS) * time.Second
+	idle, maxAge := sw.idle, sw.maxAge
 	for _, cn := range p.snapshot() {
 		if now.Sub(cn.opened) >= maxAge {
 			p.count(rAge)
@@ -112,13 +111,13 @@ func (p *Proxy) samplePass(now time.Time) {
 // the fewest bytes in the last 10 s, up to 500 a pass. A peer that stops reading
 // fills the buffers, so stalled readers go first and no reader gets a unit killed.
 func (p *Proxy) memCheck() {
-	cfg := p.config()
-	if cfg == nil || p.o.Sys == nil {
+	sw := p.sweepConfig()
+	if sw == nil || p.o.Sys == nil {
 		return
 	}
 	over := false
 	if p.o.MemUnit != "" {
-		if v, err := p.o.Sys.SockMem(p.o.MemUnit); err == nil && v > cfg.MemUnit {
+		if v, err := p.o.Sys.SockMem(p.o.MemUnit); err == nil && v > sw.memUnit {
 			over = true
 		}
 	}
@@ -128,7 +127,7 @@ func (p *Proxy) memCheck() {
 			slots += v
 		}
 	}
-	if slots > cfg.MemSlots {
+	if slots > sw.memSlots {
 		over = true
 	}
 	if over {

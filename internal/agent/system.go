@@ -225,6 +225,22 @@ func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter
 		n.mu.Unlock()
 	}
 	text, err := nft.Render(p)
+	if err != nil && px != nil {
+		// When the proxy part is what cannot be rendered (an address equal to DNS_IP, an
+		// unusable uid), the table of P4 still goes in: the notrack and flood rules of
+		// DNS_IP must not be lost with it (5.5). The guard is told after the apply, so
+		// it stays off and nft_failed is raised; an unknown account or a missing address
+		// is handled the same way by proxyNft returning nil.
+		p4 := p
+		p4.Proxy = nil
+		if t4, err4 := nft.Render(p4); err4 == nil {
+			p, text, err = p4, t4, nil
+			al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the proxy chains could not be rendered"})
+			if n.g != nil {
+				defer n.g.Reject()
+			}
+		}
+	}
 	if err != nil {
 		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the nftables table could not be rendered"})
 		if n.g != nil {
