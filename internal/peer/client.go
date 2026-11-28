@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -26,7 +27,10 @@ type outConn struct {
 	st     peerv1.PeerNode_ForwardClient
 	cancel context.CancelFunc
 	node   zone.NodeID
-	spki   [32]byte // the key the peer showed, for the recheck of a new table
+	// spki is the key the peer showed, for the recheck of a new table. The handshake writes
+	// it on gRPC's transport goroutine, also on a reconnect gRPC makes by itself, while the
+	// sender reads it, so it is atomic. Nil means no key was verified: never trusted.
+	spki atomic.Pointer[[32]byte]
 }
 
 // outPend is a forward sent and not yet answered.
@@ -109,7 +113,7 @@ func (p *Peer) sendOne(ctx context.Context, g *peerv1.GrantForward) {
 		p.sent(g.GrantId, sock.GrantUnsent)
 		return
 	}
-	oc := p.connection(ctx, peer)
+	oc := p.connection(ctx, v, peer)
 	if oc == nil {
 		p.sent(g.GrantId, sock.GrantUnsent)
 		return
@@ -137,12 +141,20 @@ func (p *Peer) sendOne(ctx context.Context, g *peerv1.GrantForward) {
 // connection returns the open stream to peer, or opens one. After a failure the next
 // attempt waits 1 s, doubling to 30 s, and a forward that finds the wait still running
 // is unsent at once: the queue must not stand behind a dial that cannot work.
-func (p *Peer) connection(ctx context.Context, peer *node) *outConn {
+func (p *Peer) connection(ctx context.Context, v *view, peer *node) *outConn {
 	p.omu.Lock()
-	if oc := p.cur; oc != nil {
-		p.omu.Unlock()
-		return oc
+	cur := p.cur
+	p.omu.Unlock()
+	if cur != nil {
+		if outTrusted(cur, v) {
+			return cur
+		}
+		// The table moved on before the loop of Run looked at it: this connection is to a
+		// node or a key that v no longer trusts. It is closed here and a fresh one is dialled.
+		p.stat.Revoked.Add(1)
+		p.dropOut(cur)
 	}
+	p.omu.Lock()
 	if p.cfg.Now().Before(p.retryAt) {
 		p.omu.Unlock()
 		return nil
@@ -152,8 +164,8 @@ func (p *Peer) connection(ctx context.Context, peer *node) *outConn {
 	oc, err := p.dial(ctx, peer)
 
 	p.omu.Lock()
-	defer p.omu.Unlock()
 	if err != nil {
+		defer p.omu.Unlock()
 		if p.backoff == 0 {
 			p.backoff = time.Second
 		} else {
@@ -164,7 +176,16 @@ func (p *Peer) connection(ctx context.Context, peer *node) *outConn {
 	}
 	p.backoff, p.retryAt = 0, time.Time{}
 	p.cur = oc
+	p.omu.Unlock()
 	go p.readAcks(oc)
+	// A table applied while the dial ran was judged by Run's loop with no connection to
+	// look at. Judge this one once more, now that it is the current one, so that from here
+	// on every later table finds it.
+	if !outTrusted(oc, p.view()) {
+		p.stat.Revoked.Add(1)
+		p.dropOut(oc)
+		return nil
+	}
 	return oc
 }
 
@@ -192,7 +213,8 @@ func (p *Peer) dial(ctx context.Context, peer *node) (*outConn, error) {
 			if err != nil {
 				return err
 			}
-			oc.spki = spkiOf(leaf)
+			s := spkiOf(leaf)
+			oc.spki.Store(&s)
 			return nil
 		},
 	})
@@ -291,10 +313,24 @@ func (p *Peer) recheckOut(v *view) {
 	if oc == nil {
 		return
 	}
-	if peer := v.peerLive(); peer == nil || peer.id != oc.node || !v.trusts(oc.node, oc.spki) {
+	if !outTrusted(oc, v) {
 		p.stat.Revoked.Add(1)
 		p.dropOut(oc)
 	}
+}
+
+// outTrusted says whether the table v still allows speaking over oc: its node is the
+// live pair peer and the key it showed is the one the table holds for it. Every use of
+// the connection asks this of the view it is deciding under, and not only the loop of
+// Run once a tick, so a forward never goes to a node or a key that the applied table
+// has already dropped.
+func outTrusted(oc *outConn, v *view) bool {
+	peer := v.peerLive()
+	if peer == nil || peer.id != oc.node {
+		return false
+	}
+	k := oc.spki.Load()
+	return k != nil && v.trusts(oc.node, *k)
 }
 
 // sweepOut reports a forward that the peer has not answered in time as unsent. The

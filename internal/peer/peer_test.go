@@ -121,6 +121,7 @@ type fakeEnv struct {
 	mu    sync.Mutex
 	eps   map[string][]byte // endpoint id -> pair id ("" for the global pair)
 	seq   atomic.Uint64
+	head  atomic.Uint64 // the highest head the hub announced; HeadSeq never answers below seq
 	bind  atomic.Pointer[netip.Addr]
 }
 
@@ -139,6 +140,7 @@ func (e *fakeEnv) EndpointPair(id []byte) ([]byte, bool) {
 	return p, ok
 }
 func (e *fakeEnv) AppliedSeq() uint64 { return e.seq.Load() }
+func (e *fakeEnv) HeadSeq() uint64    { return max(e.head.Load(), e.seq.Load()) }
 func (e *fakeEnv) HubNow() int64      { return hubNow }
 func (e *fakeEnv) BindIP() netip.Addr { return *e.bind.Load() }
 func (e *fakeEnv) endpoint(id []byte, pair []byte) {
@@ -396,14 +398,16 @@ func TestBehindReceiverPassesUnknownEndpointToDNS(t *testing.T) {
 	_, _, _, a, b := pairOfTwo(t)
 	a.env.endpoint(gidOf(66), nil)
 	g := fwd(6, 66)
-	g.SenderConfigSeq = 500 // B is at 100
+	g.SenderConfigSeq = 500 // B is at 100 and the hub has announced 500 to it
+	b.env.head.Store(500)
 	a.dns.deliver(out(t, g))
 	b.dns.next(t, sock.TypeGrantIn)
 }
 
 func TestSenderThatIsNotThePairPeerIsRefused(t *testing.T) {
 	// A's table says (A, B); B's says B pairs with C. A is a live node of B's table, so
-	// the TLS check passes, and the forward fails the sender check.
+	// the TLS check passes, and B ends A's stream at its start: A's forward is unsent
+	// (it never gets an answer) and nothing reaches B's dns.
 	p := newPKI(t)
 	nodes := mkNodes(t, p, 3)
 	dir := newDir()
@@ -412,7 +416,7 @@ func TestSenderThatIsNotThePairPeerIsRefused(t *testing.T) {
 	a.env.endpoint(gidOf(1), nil)
 	b.env.endpoint(gidOf(1), nil)
 	a.dns.deliver(out(t, fwd(7, 1)))
-	if r := a.dns.next(t, sock.TypeGrantSent).GrantSent.Result; r != sock.GrantRefused {
+	if r := a.dns.next(t, sock.TypeGrantSent).GrantSent.Result; r != sock.GrantUnsent {
 		t.Fatalf("got %s", r)
 	}
 	b.dns.none(t, sock.TypeGrantIn, 100*time.Millisecond)

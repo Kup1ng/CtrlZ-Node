@@ -57,16 +57,29 @@ func (e peerEnv) EndpointPair(endpoint []byte) (pairID []byte, known bool) {
 	if len(endpoint) != 16 {
 		return nil, false
 	}
-	var id [16]byte
-	copy(id[:], endpoint)
-	e.a.app.Inspect(func(ap *store.Applied) {
-		if rec := ap.Q.Endpoints[id]; rec != nil {
-			pairID, known = rec.PairId, true
-		}
-	})
+	e.a.app.Inspect(func(ap *store.Applied) { pairID, known = endpointPairIn(ap, endpoint) })
 	return pairID, known
 }
 
+// endpointPairIn reads one Endpoint's pair_id from an applied state. An empty pair_id is
+// returned as is: the peer part reads it as "the global pair" (the same reading as the
+// zone answerer's), and an Endpoint the state does not hold is unknown, never global.
+func endpointPairIn(ap *store.Applied, endpoint []byte) (pairID []byte, known bool) {
+	if len(endpoint) != 16 {
+		return nil, false
+	}
+	var id [16]byte
+	copy(id[:], endpoint)
+	if rec := ap.Q.Endpoints[id]; rec != nil {
+		return rec.PairId, true
+	}
+	return nil, false
+}
+
 func (e peerEnv) AppliedSeq() uint64 { return e.a.app.AppliedSeq() }
+
+// HeadSeq is the highest head the hub has announced, never below what is applied.
+func (e peerEnv) HeadSeq() uint64 { return max(e.a.highHead.Load(), e.a.app.AppliedSeq()) }
+
 func (e peerEnv) HubNow() int64      { return e.a.hubNow() }
 func (e peerEnv) BindIP() netip.Addr { return e.a.dnsIP() }

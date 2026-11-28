@@ -50,6 +50,11 @@ const (
 	// MaxUnanswered is the forwards that wait for an answer, each way (and for each
 	// sender on the receiving side).
 	MaxUnanswered = 256
+	// SeqSlack is how far above the highest head this node has heard of a sender may claim
+	// its config_seq and still count as "ahead of us". A peer that is truly ahead has
+	// applied entries the hub announced, so its number is near our head; a number far past
+	// it is a lie meant to switch off the Endpoint-and-pair check of a receiver (4.5).
+	SeqSlack = 16
 
 	defaultTick     = time.Second
 	defaultAckWait  = 8 * time.Second  // receiver: how long dns may take to answer a grant_in
@@ -72,6 +77,9 @@ type Env interface {
 	EndpointPair(endpoint []byte) (pairID []byte, known bool)
 	// AppliedSeq is the node's applied config_seq.
 	AppliedSeq() uint64
+	// HeadSeq is the highest log head the hub has announced to this node (never below
+	// AppliedSeq). It bounds what a peer may claim as its own config_seq.
+	HeadSeq() uint64
 	// HubNow is the hub's clock in Unix seconds, the clock a Grant's expires_at is in.
 	HubNow() int64
 	// BindIP is dns_bind_ip: the address the listener binds and the client dials from.
@@ -124,14 +132,14 @@ type Peer struct {
 
 	imu    sync.Mutex
 	pendIn map[string]*inPend
-	rateIn map[zone.NodeID]*bucket
+	rateIn map[zone.NodeID]*meter
 
 	// The client.
 	outq    chan *peerv1.GrantForward
 	omu     sync.Mutex
 	cur     *outConn
 	pendOut map[string]*outPend
-	rateOut bucket
+	rateOut meter
 	retryAt time.Time
 	backoff time.Duration
 
@@ -179,9 +187,9 @@ func New(cfg Config) *Peer {
 	}
 	p := &Peer{cfg: cfg, wake: make(chan struct{}, 1),
 		conns: map[*peerConn]struct{}{}, perNod: map[zone.NodeID]int{},
-		pendIn: map[string]*inPend{}, rateIn: map[zone.NodeID]*bucket{},
+		pendIn: map[string]*inPend{}, rateIn: map[zone.NodeID]*meter{},
 		outq: make(chan *peerv1.GrantForward, queueLen), pendOut: map[string]*outPend{},
-		rateOut: bucket{rate: Rate, burst: Rate}}
+		rateOut: meter{rate: Rate, burst: Rate}}
 	if cfg.DNS != nil {
 		cfg.DNS.Subscribe(p.onDNS)
 	}
@@ -326,8 +334,10 @@ func (p *Peer) reconcileListener(ctx context.Context) {
 	}
 }
 
-// bucket is a token bucket for the rate of 12.
-type bucket struct {
+// meter paces the forwards of one direction at the fixed rate of 4.5 (D31). It is the
+// pair plane's own and not a DNS listener limit, so it is not in internal/dns/limits and
+// its type is not named like one (the N5 lint reads names, p4-nodes 11.2).
+type meter struct {
 	mu     sync.Mutex
 	rate   float64
 	burst  float64
@@ -336,7 +346,7 @@ type bucket struct {
 	init   bool
 }
 
-func (b *bucket) allow(now time.Time) bool {
+func (b *meter) allow(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.init {

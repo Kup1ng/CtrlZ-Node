@@ -76,6 +76,12 @@ func (sv *service) Forward(stream grpc.BidiStreamingServer[peerv1.GrantForward, 
 	if !ok {
 		return status.Error(codes.PermissionDenied, "no peer identity")
 	}
+	// Only the pair peer forwards: any other live node of the table may finish a handshake
+	// (the address check admits every live node), but its stream ends here, before one of
+	// its messages is read, so it costs no decoding, no check and no ack.
+	if pl := p.view().peerLive(); pl == nil || pl.id != node {
+		return status.Error(codes.PermissionDenied, "not the pair peer")
+	}
 	st := &inStream{node: node, out: make(chan *peerv1.GrantAck, queueLen)}
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
@@ -135,6 +141,13 @@ func (p *Peer) takeForward(st *inStream, g *peerv1.GrantForward) error {
 		return nil
 	}
 	behind := g.SenderConfigSeq > e.AppliedSeq()
+	if behind && g.SenderConfigSeq > max(e.HeadSeq(), e.AppliedSeq())+SeqSlack {
+		// A number past every head the hub has announced is no honest "ahead of you": it
+		// would skip the Endpoint-and-pair check and fill dns's held list. Refused as a
+		// forward that fails the check it tried to skip.
+		refuse()
+		return nil
+	}
 	if !behind {
 		pairID, known := e.EndpointPair(g.EndpointId)
 		if !known || !v.inOurPair(pairID) {
@@ -177,12 +190,12 @@ func (p *Peer) takeForward(st *inStream, g *peerv1.GrantForward) error {
 	return nil
 }
 
-func (p *Peer) rateFor(n zone.NodeID) *bucket {
+func (p *Peer) rateFor(n zone.NodeID) *meter {
 	p.imu.Lock()
 	defer p.imu.Unlock()
 	b := p.rateIn[n]
 	if b == nil {
-		b = &bucket{rate: Rate, burst: Rate}
+		b = &meter{rate: Rate, burst: Rate}
 		p.rateIn[n] = b
 	}
 	return b
