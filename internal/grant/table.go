@@ -79,11 +79,16 @@ type PutResult struct {
 	Offer bool
 	// Holder is the stored holder after the write (Ok only).
 	Holder Holder
+	// Out is the outcome the entry holds after the write (Ok only). A holder that
+	// joined a live outcome gets the live one here, not its own decision, and that
+	// is what a forward to the peer must carry (4.2: two outcomes meet on a pair
+	// only when two forwards cross).
+	Out Outcome
 }
 
 const nShards = 64
 
-type bucket struct {
+type widenSet struct {
 	ents map[*entry]struct{} // entries with at least one widenable holder
 	sum  map[sumKey]int32
 }
@@ -95,8 +100,8 @@ type sumKey struct {
 
 type nameSet struct {
 	bySrc map[netip.Addr]*entry
-	by24  map[[3]byte]*bucket
-	byASN map[uint32]*bucket
+	by24  map[[3]byte]*widenSet
+	byASN map[uint32]*widenSet
 }
 
 type entry struct {
@@ -201,15 +206,24 @@ type Table struct {
 	waits    map[waitKey][]chan struct{}
 	waitSrc  map[netip.Addr]int
 	waitNode int
+	// nwait mirrors waitNode for signal, so a Put with nobody waiting (the usual
+	// case) takes no process-wide lock.
+	nwait atomic.Int64
 
 	fullAt  atomic.Int64 // Unix second of the last node_cap refusal
 	sweepAt atomic.Uint32
 
+	// Counters are read-mostly maps of atomics, so the hot path of a deciding query
+	// bumps one without a process-wide lock. cmu guards only the creation of a new
+	// width row.
+	counts sync.Map // string -> *atomic.Uint64
 	cmu    sync.Mutex
-	counts map[string]uint64
-	widths map[uint32]*[6]uint64
-	last   string
+	widths sync.Map // uint32 -> *widthRow
+	nWidth int
+	last   atomic.Pointer[string]
 }
+
+type widthRow [6]atomic.Uint64
 
 type waitKey struct {
 	name string
@@ -222,8 +236,7 @@ func NewTable(lim Limits, now func() time.Time) *Table {
 		now = time.Now
 	}
 	t := &Table{lim: lim, now: now, node: newPool(lim.NodeHolders), nodeFw: newPool(lim.NodeForwarded),
-		eps: map[[16]byte]*epCount{}, srcN: map[any]int{}, waits: map[waitKey][]chan struct{}{}, waitSrc: map[netip.Addr]int{},
-		counts: map[string]uint64{}, widths: map[uint32]*[6]uint64{}}
+		eps: map[[16]byte]*epCount{}, srcN: map[any]int{}, waits: map[waitKey][]chan struct{}{}, waitSrc: map[netip.Addr]int{}}
 	for i := range t.shards {
 		t.shards[i].names = map[string]*nameSet{}
 	}
@@ -238,9 +251,12 @@ func (t *Table) shard(name []byte) *shard {
 
 // Count adds to a named counter (a reason, never a value).
 func (t *Table) Count(name string) {
-	t.cmu.Lock()
-	t.counts[name]++
-	t.cmu.Unlock()
+	if v, ok := t.counts.Load(name); ok {
+		v.(*atomic.Uint64).Add(1)
+		return
+	}
+	v, _ := t.counts.LoadOrStore(name, new(atomic.Uint64))
+	v.(*atomic.Uint64).Add(1)
 }
 
 // Full reports whether a node_cap refusal happened in the last 60 s (proxy_state.full).
@@ -261,7 +277,7 @@ func (t *Table) Holders() int {
 func (sh *shard) set(name string, create bool) *nameSet {
 	ns := sh.names[name]
 	if ns == nil && create {
-		ns = &nameSet{bySrc: map[netip.Addr]*entry{}, by24: map[[3]byte]*bucket{}, byASN: map[uint32]*bucket{}}
+		ns = &nameSet{bySrc: map[netip.Addr]*entry{}, by24: map[[3]byte]*widenSet{}, byASN: map[uint32]*widenSet{}}
 		sh.names[name] = ns
 	}
 	return ns
@@ -291,7 +307,7 @@ func (e *entry) reindex(d int32) {
 	if !wide {
 		return
 	}
-	touch := func(b *bucket) {
+	touch := func(b *widenSet) {
 		if d > 0 {
 			b.ents[e] = struct{}{}
 		} else {
@@ -311,7 +327,7 @@ func (e *entry) reindex(d int32) {
 	if p, ok := prefix24(e.src); ok {
 		b := e.ns.by24[p]
 		if b == nil && d > 0 {
-			b = &bucket{ents: map[*entry]struct{}{}, sum: map[sumKey]int32{}}
+			b = &widenSet{ents: map[*entry]struct{}{}, sum: map[sumKey]int32{}}
 			e.ns.by24[p] = b
 		}
 		if b != nil {
@@ -324,7 +340,7 @@ func (e *entry) reindex(d int32) {
 	if e.asn != 0 {
 		b := e.ns.byASN[e.asn]
 		if b == nil && d > 0 {
-			b = &bucket{ents: map[*entry]struct{}{}, sum: map[sumKey]int32{}}
+			b = &widenSet{ents: map[*entry]struct{}{}, sum: map[sumKey]int32{}}
 			e.ns.byASN[e.asn] = b
 		}
 		if b != nil {
@@ -453,14 +469,26 @@ func (e *entry) find(id holderID) int {
 // addHolder applies the caps of 4.2 step 4 and appends. The entry is unindexed by
 // the caller. It returns "" or a reason.
 func (t *Table) addHolder(e *entry, h Holder, p *PutReq) string {
+	// 4.1: holders of at most 64 Endpoints, 8 of one Endpoint. The cap counts
+	// distinct Endpoints, so many accounts behind one carrier address do not fill an
+	// entry with the 8 holders of the first few.
 	n := 0
 	for i := range e.holders {
 		if e.holders[i].Endpoint == h.Endpoint {
 			n++
 		}
 	}
-	if len(e.holders) >= MaxHolders || n >= MaxPerEndpoint {
+	if n >= MaxPerEndpoint {
 		return ReasonCollision
+	}
+	if n == 0 && len(e.holders) >= MaxEndpoints { // fewer holders than that cannot be 64 Endpoints
+		seen := make(map[[16]byte]struct{}, MaxEndpoints)
+		for i := range e.holders {
+			seen[e.holders[i].Endpoint] = struct{}{}
+		}
+		if len(seen) >= MaxEndpoints {
+			return ReasonCollision
+		}
 	}
 	capE := p.EndpointCap
 	if capE <= 0 {
@@ -548,7 +576,7 @@ func (t *Table) Put(p *PutReq) PutResult {
 			res := PutResult{Verdict: Validate}
 			if e != nil {
 				if i := e.find(id); i >= 0 && e.out == p.Out && e.holders[i].Expires-now >= MaxProxyTTL {
-					res = PutResult{Verdict: Ok, Alone: e.holders[i].Alone, Holder: e.holders[i]}
+					res = PutResult{Verdict: Ok, Alone: e.holders[i].Alone, Holder: e.holders[i], Out: e.out}
 				}
 			}
 			sh.mu.Unlock()
@@ -606,14 +634,20 @@ func (t *Table) Put(p *PutReq) PutResult {
 		// Another client or Endpoint holds the entry: join when this holder's own
 		// decision allows the live outcome. The test reruns the evaluator, so it runs
 		// with the lock released and is judged again against the live outcome.
-		if !joinKnown || joinFor != e.out {
+		//
+		// A Branded page is the page of one account (SC 10.3: a device trusts the pages
+		// of its own account), and the connection of such an entry is served with the
+		// newest holder's Endpoint and key. So a kind 2 entry is joined by holders of
+		// its account only: another account's device is refused and stays blocked.
+		crossAccount := e.out.Kind == KindBlockPage && !e.sameAccount(p.Holder.Account)
+		if !crossAccount && (!joinKnown || joinFor != e.out) {
 			live := e.out
 			sh.mu.Unlock()
 			joinOK = p.Joins != nil && p.Joins(live)
 			joinKnown, joinFor = true, live
 			continue
 		}
-		if joinOK {
+		if joinOK && !crossAccount {
 			e.unindex()
 			if i >= 0 {
 				refresh(&e.holders[i], stamped)
@@ -658,7 +692,7 @@ func (t *Table) Put(p *PutReq) PutResult {
 func (t *Table) written(sh *shard, e *entry, id holderID, now int64, p *PutReq) PutResult {
 	i := e.find(id)
 	h := &e.holders[i]
-	res := PutResult{Verdict: Ok, Alone: h.Alone}
+	res := PutResult{Verdict: Ok, Alone: h.Alone, Out: e.out}
 	if !h.forwarded() && now >= h.OfferAt {
 		res.Offer = true
 		h.OfferAt = now + int64(UnsentRetry/time.Second)
@@ -675,15 +709,16 @@ func name2(b []byte) string { return string(b) }
 
 func (t *Table) refused(reason string) PutResult {
 	t.Count("refused_" + reason)
-	t.cmu.Lock()
-	t.last = reason
-	t.cmu.Unlock()
+	t.last.Store(&reason)
 	return PutResult{Verdict: Refused, Reason: reason}
 }
 
 // ---- waits (4.3 step 3)
 
 func (t *Table) signal(name string, src netip.Addr) {
+	if t.nwait.Load() == 0 {
+		return // nobody waits: a Put takes no process-wide lock
+	}
 	t.wmu.Lock()
 	k := waitKey{name, src}
 	chs := t.waits[k]
@@ -697,7 +732,12 @@ func (t *Table) signal(name string, src netip.Addr) {
 // Wait waits up to d for a Put of exactly (name, src) and reports whether one came.
 // A source has at most WaitPerSource waits and the node WaitNode; over either it
 // returns false at once.
-func (t *Table) Wait(ctx context.Context, name []byte, src netip.Addr, d time.Duration) bool {
+//
+// ready, when not nil, is called once the wait is registered and ends the wait with
+// true when it returns true. The caller's lookup missed before the wait began, so a
+// Put that landed between that miss and the registration signalled nobody: the
+// caller looks again here, after the registration, and no Put can fall in the gap.
+func (t *Table) Wait(ctx context.Context, name []byte, src netip.Addr, d time.Duration, ready func() bool) bool {
 	t.wmu.Lock()
 	if t.waitSrc[src] >= t.lim.WaitPerSource || t.waitNode >= t.lim.WaitNode {
 		t.wmu.Unlock()
@@ -709,9 +749,11 @@ func (t *Table) Wait(ctx context.Context, name []byte, src netip.Addr, d time.Du
 	t.waits[k] = append(t.waits[k], c)
 	t.waitSrc[src]++
 	t.waitNode++
+	t.nwait.Add(1)
 	t.wmu.Unlock()
 	defer func() {
 		t.wmu.Lock()
+		t.nwait.Add(-1)
 		if t.waitSrc[src]--; t.waitSrc[src] <= 0 {
 			delete(t.waitSrc, src)
 		}
@@ -732,6 +774,9 @@ func (t *Table) Wait(ctx context.Context, name []byte, src netip.Addr, d time.Du
 		}
 		t.wmu.Unlock()
 	}()
+	if ready != nil && ready() {
+		return true
+	}
 	tm := time.NewTimer(d)
 	defer tm.Stop()
 	select {
@@ -783,23 +828,48 @@ func hitOf(e *entry, via Width, widenOnly bool) Hit {
 	return h
 }
 
-// Lookup is 4.3 steps 1 and 2. The wait of step 3 is the caller's (Wait, then
-// Lookup again), so a lookup that waits counts once.
+// Tally is what a probe says the width counters should show (4.3). A caller that
+// waits and probes again records only the last one, so a connection counts once.
+type Tally struct {
+	n   uint8
+	idx [3]uint8
+}
+
+func (y *Tally) add(i int) { y.idx[y.n] = uint8(i); y.n++ }
+
+// Record adds a tally to the counters of the client's ASN.
+func (t *Table) Record(asn uint32, y Tally) {
+	for i := uint8(0); i < y.n; i++ {
+		t.widthCount(asn, int(y.idx[i]))
+	}
+}
+
+// Lookup is 4.3 steps 1 and 2, counted at once.
 func (t *Table) Lookup(src netip.Addr, asn uint32, name []byte, width Width) (Hit, bool) {
+	h, y, ok := t.Probe(src, asn, name, width)
+	t.Record(asn, y)
+	return h, ok
+}
+
+// Probe is Lookup with its counting left to the caller (Record). The wait of step 3
+// is the caller's (Wait, which probes once more after registering), so a lookup that
+// waits counts once, as what it finally found.
+func (t *Table) Probe(src netip.Addr, asn uint32, name []byte, width Width) (Hit, Tally, bool) {
+	var y Tally
 	sh := t.shard(name)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	now := t.now().Unix()
 	if e := t.live(sh, string(name), src, now); e != nil {
-		t.widthCount(asn, 5)
-		return hitOf(e, WidthExact, false), true
+		y.add(5)
+		return hitOf(e, WidthExact, false), y, true
 	}
 	ns := sh.names[string(name)]
 	if ns == nil {
-		t.widthCount(asn, 4)
-		return Hit{}, false
+		y.add(4)
+		return Hit{}, y, false
 	}
-	var p24, car *bucket
+	var p24, car *widenSet
 	if p, ok := prefix24(src); ok {
 		p24 = ns.by24[p]
 	}
@@ -809,7 +879,7 @@ func (t *Table) Lookup(src netip.Addr, asn uint32, name []byte, width Width) (Hi
 	// What each width would have said, counted per client ASN (4.3).
 	counted := false
 	for _, w := range []struct {
-		b    *bucket
+		b    *widenSet
 		base int
 	}{{p24, 0}, {car, 2}} {
 		if w.b == nil {
@@ -817,15 +887,15 @@ func (t *Table) Lookup(src netip.Addr, asn uint32, name []byte, width Width) (Hi
 		}
 		counted = true
 		if len(w.b.sum) == 1 {
-			t.widthCount(asn, w.base)
+			y.add(w.base)
 		} else {
-			t.widthCount(asn, w.base+1)
+			y.add(w.base + 1)
 		}
 	}
 	if !counted {
-		t.widthCount(asn, 4)
+		y.add(4)
 	}
-	var b *bucket
+	var b *widenSet
 	via := WidthExact
 	switch width {
 	case WidthPrefix24:
@@ -834,7 +904,7 @@ func (t *Table) Lookup(src netip.Addr, asn uint32, name []byte, width Width) (Hi
 		b, via = car, WidthCarrier
 	}
 	if b == nil || len(b.sum) != 1 {
-		return Hit{}, false // the match holds only when one Endpoint and one outcome share it
+		return Hit{}, y, false // the match holds only when one Endpoint and one outcome share it
 	}
 	for e := range b.ents {
 		t.expire(sh, e, now)
@@ -845,32 +915,35 @@ func (t *Table) Lookup(src netip.Addr, asn uint32, name []byte, width Width) (Hi
 		if len(h.Holders) == 0 {
 			continue
 		}
-		return h, true
+		return h, y, true
 	}
-	return Hit{}, false
+	return Hit{}, y, false
 }
 
 // widthCount indexes: 0 prefix24_unique, 1 prefix24_shared, 2 carrier_unique,
 // 3 carrier_shared, 4 miss, 5 exact.
 func (t *Table) widthCount(asn uint32, i int) {
+	if v, ok := t.widths.Load(asn); ok {
+		v.(*widthRow)[i].Add(1)
+		return
+	}
 	t.cmu.Lock()
-	c := t.widths[asn]
-	if c == nil {
+	v, ok := t.widths.Load(asn)
+	if !ok {
 		// A node sees a few hundred operators; the cap keeps a spoofed flood of
 		// sources from growing the map, and the stats message holds 4096 counters.
-		if len(t.widths) >= 600 {
-			c = t.widths[0]
-			if c == nil {
-				c = new([6]uint64)
-				t.widths[0] = c
-			}
-		} else {
-			c = new([6]uint64)
-			t.widths[asn] = c
+		if t.nWidth >= 600 {
+			asn = 0
+			v, ok = t.widths.Load(asn)
+		}
+		if !ok {
+			v = new(widthRow)
+			t.widths.Store(asn, v)
+			t.nWidth++
 		}
 	}
-	c[i]++
 	t.cmu.Unlock()
+	v.(*widthRow)[i].Add(1)
 }
 
 // Live reports the live outcome of (name, src), for the `more` test of 4.6.
@@ -1003,20 +1076,24 @@ func (t *Table) Sent(name []byte, src netip.Addr, ep, client [16]byte, result st
 // and the width counters of 4.3 (a, <asn>, <width>). Names hold no value of a
 // query.
 func (t *Table) Stats() (named map[string]uint64, last string) {
-	t.cmu.Lock()
-	defer t.cmu.Unlock()
-	named = make(map[string]uint64, len(t.counts)+len(t.widths)*6)
-	for k, v := range t.counts {
-		named[k] = v
-	}
-	for asn, c := range t.widths {
+	named = map[string]uint64{}
+	t.counts.Range(func(k, v any) bool {
+		named[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	t.widths.Range(func(k, v any) bool {
+		c := v.(*widthRow)
 		for i, w := range [...]string{"prefix24_unique", "prefix24_shared", "carrier_unique", "carrier_shared", "miss", "exact"} {
-			if c[i] != 0 {
-				named["a"+itoa(asn)+"_"+w] = c[i]
+			if n := c[i].Load(); n != 0 {
+				named["a"+itoa(k.(uint32))+"_"+w] = n
 			}
 		}
+		return true
+	})
+	if l := t.last.Load(); l != nil {
+		last = *l
 	}
-	return named, t.last
+	return named, last
 }
 
 func itoa(n uint32) string {
@@ -1051,4 +1128,14 @@ func (t *Table) Drop(name []byte, src netip.Addr, ep, client, origin [16]byte) {
 	t.dropAt(e, i)
 	e.index()
 	t.retire(sh, e)
+}
+
+// sameAccount reports whether every holder of the entry is of the account.
+func (e *entry) sameAccount(acct [16]byte) bool {
+	for i := range e.holders {
+		if e.holders[i].Account != acct {
+			return false
+		}
+	}
+	return true
 }

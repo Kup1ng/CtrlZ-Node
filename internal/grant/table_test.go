@@ -307,7 +307,7 @@ func TestWait(t *testing.T) {
 	c := newClock()
 	tb := tbl(c)
 	done := make(chan bool, 1)
-	go func() { done <- tb.Wait(context.Background(), nameX, srcA, 2*time.Second) }()
+	go func() { done <- tb.Wait(context.Background(), nameX, srcA, 2*time.Second, nil) }()
 	time.Sleep(50 * time.Millisecond)
 	put(tb, 1, outL1, false)
 	select {
@@ -319,11 +319,11 @@ func TestWait(t *testing.T) {
 		t.Fatal("hung")
 	}
 	start := time.Now()
-	if tb.Wait(context.Background(), []byte("\x01z\x00"), srcA, 30*time.Millisecond) || time.Since(start) < 25*time.Millisecond {
+	if tb.Wait(context.Background(), []byte("\x01z\x00"), srcA, 30*time.Millisecond, nil) || time.Since(start) < 25*time.Millisecond {
 		t.Fatal("a wait with no Put must time out")
 	}
 	tb.lim.WaitPerSource = 0
-	if tb.Wait(context.Background(), nameX, srcA, time.Second) {
+	if tb.Wait(context.Background(), nameX, srcA, time.Second, nil) {
 		t.Fatal("over the per-source waits it must return at once")
 	}
 }
@@ -382,5 +382,126 @@ func TestForwardedHolderUsesItsOwnRoom(t *testing.T) {
 	if r := tb.Put(&PutReq{Name: nameX, Source: srcA, Out: outL1, Validated: true, EndpointCap: 20, Privileged: true,
 		Holder: Holder{Endpoint: ep(1), Account: ep(1)}}); r.Verdict != Ok {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// A Put that lands between the caller's miss and the registration of its wait is
+// found by the ready probe the wait runs after registering (4.3 step 3), so the
+// connection is not closed for a Grant that exists.
+func TestWaitReadyClosesTheGap(t *testing.T) {
+	c := newClock()
+	tb := tbl(c)
+	start := time.Now()
+	ok := tb.Wait(context.Background(), nameX, srcA, 5*time.Second, func() bool {
+		put(tb, 1, outL1, false) // lands after the registration but signals before the select
+		_, found := tb.Lookup(srcA, 0, nameX, WidthExact)
+		return found
+	})
+	if !ok || time.Since(start) > time.Second {
+		t.Fatal("the probe after the registration must end the wait")
+	}
+	// And the signal path still wakes a waiter whose probe finds nothing.
+	done := make(chan bool, 1)
+	n2 := []byte("\x01q\x00")
+	go func() {
+		done <- tb.Wait(context.Background(), n2, srcA, 2*time.Second, func() bool { return false })
+	}()
+	time.Sleep(50 * time.Millisecond)
+	tb.Put(&PutReq{Name: n2, Source: srcA, Out: outL1, Validated: true,
+		Holder: Holder{Endpoint: ep(1), Account: ep(1)}})
+	if !<-done {
+		t.Fatal("the Put must wake the waiter")
+	}
+}
+
+// A connection that waits counts once, as what it finally found (Probe + Record).
+func TestProbeCountsOnce(t *testing.T) {
+	c := newClock()
+	tb := tbl(c)
+	_, y, ok := tb.Probe(srcA, 64500, nameX, WidthExact)
+	if ok {
+		t.Fatal("empty table")
+	}
+	put(tb, 1, outL1, false)
+	_, y2, ok := tb.Probe(srcA, 64500, nameX, WidthExact)
+	if !ok {
+		t.Fatal("must hit")
+	}
+	_ = y
+	tb.Record(64500, y2)
+	named, _ := tb.Stats()
+	if named["a64500_exact"] != 1 || named["a64500_miss"] != 0 {
+		t.Fatalf("counted twice or wrong: %v", named)
+	}
+}
+
+// 4.1: an entry holds 64 Endpoints with 8 holders each; the 65th Endpoint and the
+// 9th holder of one Endpoint are `collision`.
+func TestEntryHoldsSixtyFourEndpointsOfEight(t *testing.T) {
+	c := newClock()
+	lim := DefaultLimits()
+	lim.DefaultEndpointCap = 100000
+	tb := NewTable(lim, c.now)
+	mk := func(e, client byte) PutResult {
+		return tb.Put(&PutReq{Name: nameX, Source: srcA, Out: outL1, Validated: true, Privileged: true, Joins: yes,
+			Holder: Holder{Endpoint: ep(e), Client: ep(client), Account: ep(e)}})
+	}
+	for e := byte(1); e <= 64; e++ {
+		for cl := byte(1); cl <= 8; cl++ {
+			if r := mk(e, cl); r.Verdict != Ok {
+				t.Fatalf("endpoint %d client %d: %+v", e, cl, r)
+			}
+		}
+	}
+	if r := mk(65, 1); r.Reason != ReasonCollision {
+		t.Fatalf("the 65th Endpoint must collide: %+v", r)
+	}
+	if r := mk(1, 9); r.Reason != ReasonCollision {
+		t.Fatalf("the 9th holder of one Endpoint must collide: %+v", r)
+	}
+}
+
+// Two tenants, one carrier-NAT source, one Branded page hash: the second account
+// does not join the first one's entry, so the connection of the entry never carries
+// the other tenant's Endpoint and key (SC 10.3). The same account still joins.
+func TestBlockPageEntryIsOfOneAccount(t *testing.T) {
+	c := newClock()
+	tb := tbl(c)
+	page := Outcome{Kind: KindBlockPage}
+	mk := func(e, acct byte) PutResult {
+		return tb.Put(&PutReq{Name: nameX, Source: srcA, Out: page, Validated: true, Privileged: true, Joins: yes,
+			Holder: Holder{Endpoint: ep(e), Account: ep(acct)}})
+	}
+	if r := mk(1, 1); r.Verdict != Ok {
+		t.Fatalf("A decides: %+v", r)
+	}
+	if r := mk(2, 2); r.Verdict != Refused || r.Reason != ReasonCollision {
+		t.Fatalf("another account must not join a kind 2 entry: %+v", r)
+	}
+	if r := mk(3, 1); r.Verdict != Ok {
+		t.Fatalf("a second Endpoint of the same account joins: %+v", r)
+	}
+	h, _ := tb.Lookup(srcA, 0, nameX, WidthExact)
+	if h.Accounts != 1 || len(h.Holders) != 2 {
+		t.Fatalf("the entry must hold one account: %+v", h)
+	}
+	// A kind 1 entry is still shared across accounts.
+	n2 := []byte("\x01r\x00")
+	for _, a := range []byte{1, 2} {
+		r := tb.Put(&PutReq{Name: n2, Source: srcA, Out: outL1, Validated: true, Privileged: true, Joins: yes,
+			Holder: Holder{Endpoint: ep(a), Account: ep(a)}})
+		if r.Verdict != Ok {
+			t.Fatalf("kind 1 joins across accounts: %+v", r)
+		}
+	}
+}
+
+// A holder that joins gets the live outcome back, which is what a forward carries.
+func TestPutResultCarriesTheStoredOutcome(t *testing.T) {
+	c := newClock()
+	tb := tbl(c)
+	put(tb, 1, outL1, false)
+	if r := put(tb, 2, outL2, true); r.Verdict != Ok || r.Out != outL1 {
+		t.Fatalf("a joiner must see the live outcome: %+v", r)
 	}
 }

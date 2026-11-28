@@ -29,10 +29,15 @@ type fake struct {
 	down    chan struct{}
 	cfgOK   bool
 	srv     *Server
+	// slowCtx is the context of the lookup of "slow.test", which waits for its end;
+	// staleAtUp is what a LinkUp saw of it.
+	slowCtx   chan context.Context
+	lastSlow  context.Context
+	staleAtUp []bool
 }
 
 func newFake() *fake {
-	return &fake{up: make(chan uint64, 4), down: make(chan struct{}, 4), cfgOK: true}
+	return &fake{up: make(chan uint64, 4), down: make(chan struct{}, 4), cfgOK: true, slowCtx: make(chan context.Context, 4)}
 }
 
 func (f *fake) ProxyConfig() (sock.ProxyConfig, bool) {
@@ -43,6 +48,7 @@ func (f *fake) ProxyConfig() (sock.ProxyConfig, bool) {
 }
 func (f *fake) LinkUp(run uint64, items []grant.OpenItem) {
 	f.mu.Lock()
+	f.staleAtUp = append(f.staleAtUp, f.lastSlow != nil && f.lastSlow.Err() != nil)
 	f.items = items
 	f.mu.Unlock()
 	f.up <- run
@@ -54,7 +60,15 @@ func (f *fake) Source(src netip.Addr) bool {
 	f.mu.Unlock()
 	return true
 }
-func (f *fake) Lookup(_ context.Context, _ uint64, src netip.Addr, name []byte, port uint16) *sock.LinkVerdict {
+func (f *fake) Lookup(ctx context.Context, _ uint64, src netip.Addr, name []byte, port uint16) *sock.LinkVerdict {
+	if string(name) == "\x04slow\x04test\x00" {
+		f.mu.Lock()
+		f.lastSlow = ctx
+		f.mu.Unlock()
+		f.slowCtx <- ctx
+		<-ctx.Done()
+		return &sock.LinkVerdict{Kind: sock.VerdictBlock, Endpoint: bytes.Repeat([]byte{1}, 16), Account: bytes.Repeat([]byte{2}, 16), Tag: []byte("late")}
+	}
 	f.mu.Lock()
 	f.looks = append(f.looks, string(name))
 	f.mu.Unlock()
@@ -349,5 +363,47 @@ func TestNewProxyReplacesTheOld(t *testing.T) {
 	}
 	if !<-sent {
 		t.Fatal("end")
+	}
+}
+
+// The lookups of a replaced proxy session are cancelled before the new session's
+// table is rebuilt, and its frames no longer reach the Backend: a late admit or a
+// stale closed must not touch the rebuilt table (ids restart with each proxy run).
+func TestReplacedSessionIsCutOffBeforeTheRebuild(t *testing.T) {
+	f := newFake()
+	srv, ln := newServer(t, f)
+	d1, p1 := sockfake.LinkPair()
+	ln.c <- d1.Conn
+	_ = p1.Send(&sock.LinkMsg{Type: sock.TLinkHello, Hello: &sock.LinkHello{Run: 1}})
+	_ = p1.Send(&sock.LinkMsg{Type: sock.TLinkOpen, Open: &sock.LinkOpen{Last: true}})
+	<-f.up
+	if m, err := p1.Recv(); err != nil || m.Type != sock.TLinkConfig {
+		t.Fatalf("%+v %v", m, err)
+	}
+	_ = p1.Send(&sock.LinkMsg{Type: sock.TLinkLookup, Lookup: &sock.LinkLookup{ID: 9, Source: netip.MustParseAddr("192.0.2.1").AsSlice(), Name: []byte("\x04slow\x04test\x00"), Port: 443}})
+	var oldCtx context.Context
+	select {
+	case oldCtx = <-f.slowCtx:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lookup did not start")
+	}
+	srv.mu.Lock()
+	oldSession := srv.cur
+	srv.mu.Unlock()
+
+	d2, p2 := sockfake.LinkPair()
+	ln.c <- d2.Conn
+	_ = p2.Send(&sock.LinkMsg{Type: sock.TLinkHello, Hello: &sock.LinkHello{Run: 2}})
+	_ = p2.Send(&sock.LinkMsg{Type: sock.TLinkOpen, Open: &sock.LinkOpen{Last: true}})
+	<-f.up
+	f.mu.Lock()
+	stale := append([]bool(nil), f.staleAtUp...)
+	f.mu.Unlock()
+	if len(stale) != 2 || !stale[1] || oldCtx.Err() == nil {
+		t.Fatalf("the old session's lookup must be cancelled before the new LinkUp: %v", stale)
+	}
+	ran := false
+	if srv.current(oldSession, func() { ran = true }) || ran {
+		t.Fatal("a frame of the replaced session reached the Backend")
 	}
 }

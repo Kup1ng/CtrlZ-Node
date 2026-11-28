@@ -12,6 +12,7 @@ import (
 	commonv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/common/v1"
 	"github.com/Kup1ng/CtrlZ-Shared/identity"
 	"github.com/Kup1ng/CtrlZ-Shared/names"
+	"github.com/Kup1ng/CtrlZ-Shared/netclass"
 	sharedpolicy "github.com/Kup1ng/CtrlZ-Shared/policy"
 	"github.com/Kup1ng/CtrlZ-Shared/sysnames"
 
@@ -45,7 +46,11 @@ type Config struct {
 	// lookup (policy.Resolver.CachedA). Optional: nil means the cache is not asked,
 	// and the Grant is written (the nftables guard remains the mandatory control).
 	CachedA func(names.Name, sharedpolicy.ResolveParams) ([]netip.Addr, bool)
-	Now     func() time.Time
+	// GateClass says why the last lookup of a name failed when the Sanity Gate refused
+	// it (policy.Resolver.GateClass). The verdict of a proxied connection reads it: a
+	// refusal of a class other than injected gives none (p4b-proxy 5.3). Optional.
+	GateClass func(names.Name) (netclass.Class, bool)
+	Now       func() time.Time
 }
 
 // Handler is the query path of SC 5.2, steps 2 to 10. It is a listen.Handler. The

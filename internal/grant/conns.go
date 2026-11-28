@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,8 +63,9 @@ type hold struct {
 }
 
 type openedAt struct {
-	at   int64
-	acct [16]byte
+	at     int64
+	acct   [16]byte // the account, or for a shared connection the source
+	shared bool
 }
 
 // Conns is the connection table. It is safe for concurrent use.
@@ -90,6 +92,11 @@ type Conns struct {
 	blockEp   map[[16]byte]int
 
 	holds []hold
+
+	// gen counts the rebuilds of the table. A verdict carries the generation it
+	// began under: one that began under the previous proxy session must charge
+	// nothing into the table the next session's open list built (AdmitAt).
+	gen uint64
 }
 
 // NewConns makes the table. count receives refusal reasons (names, never values).
@@ -109,10 +116,39 @@ func NewConns(lim Limits, now func() time.Time, count func(string)) *Conns {
 
 // SetExits tells the table which exit each SOCKS address leaves through (the
 // `locations` list). An address it does not know is its own exit.
+//
+// A connection rebuilt before the first list came is charged to the key of its own
+// address ("x:"+socks); when the list arrives it moves to its real exit's pool, so a
+// restart of dns does not leave those connections outside the 20,000 of their exit.
 func (c *Conns) SetExits(exitOf map[string]string) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.exitOf = exitOf
-	c.mu.Unlock()
+	for _, cn := range c.byID {
+		if !cn.charged || cn.pl.kind != KindRedirect || !strings.HasPrefix(cn.pl.exit, "x:") {
+			continue
+		}
+		if k, ok := exitOf[cn.Socks]; ok && k != cn.pl.exit {
+			c.moveExit(cn, k)
+		}
+	}
+}
+
+// moveExit changes the exit pool a charged kind 1 connection counts in. The
+// connection keeps its place everywhere else.
+func (c *Conns) moveExit(cn *Conn, to string) {
+	old, nw := c.exitPool(cn.pl.exit), c.exitPool(to)
+	if cn.pl.shared {
+		old.subShared(src16(cn.pl.src))
+		nw.forceShared(src16(cn.pl.src))
+	} else {
+		old.sub(cn.pl.acct)
+		nw.force(cn.pl.acct)
+	}
+	if old.total == 0 && len(old.by) == 0 {
+		delete(c.exits, cn.pl.exit)
+	}
+	cn.pl.exit = to
 }
 
 func (c *Conns) exitKey(socks string) string {
@@ -147,7 +183,11 @@ func (c *Conns) tickLocked(now time.Time) {
 	cut := now.Unix() - 30
 	i := 0
 	for i < len(c.openedQ) && c.openedQ[i].at <= cut {
-		c.opened.sub(c.openedQ[i].acct)
+		if q := c.openedQ[i]; q.shared {
+			c.opened.subShared(q.acct)
+		} else {
+			c.opened.sub(q.acct)
+		}
 		i++
 	}
 	c.openedQ = c.openedQ[i:]
@@ -222,6 +262,13 @@ func (c *Conns) acquire(pl *place, force bool, now time.Time) string {
 			c.node.subShared(s16)
 			return "exit_open"
 		}
+		// 5.4: the connections of kind 1 opened lately have a shared part too.
+		if !c.opened.addShared(s16) {
+			c.node.subShared(s16)
+			ex.subShared(s16)
+			return "opened_rate"
+		}
+		c.openedQ = append(c.openedQ, openedAt{now.Unix(), s16, true})
 	} else {
 		if !c.node.add(pl.acct) {
 			return "node_open"
@@ -236,7 +283,7 @@ func (c *Conns) acquire(pl *place, force bool, now time.Time) string {
 			return "opened_rate"
 		}
 		if !force {
-			c.openedQ = append(c.openedQ, openedAt{now.Unix(), pl.acct})
+			c.openedQ = append(c.openedQ, openedAt{now.Unix(), pl.acct, false})
 		}
 	}
 	c.entryOpen[pl.entry]++
@@ -311,8 +358,31 @@ func (c *Conns) entryCap(h Hit) int { return c.lim.EntryPerEndpoint * min(max(h.
 // room is returned by index, so the verdict lists only those). It returns the
 // counter name of the refusal, or "" and the connection.
 func (c *Conns) Admit(id uint64, src netip.Addr, h Hit, exits []string, socks string) (*Conn, []int, string) {
+	return c.AdmitAt(c.Gen(), id, src, h, exits, socks)
+}
+
+// Gen is the generation of the table: it changes at every Rebuild. A verdict reads
+// it before it does anything else and admits with AdmitAt, so a lookup that the old
+// proxy session began cannot charge, or replace the record of, a connection of the
+// new session (ids restart with each proxy run).
+func (c *Conns) Gen() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.gen
+}
+
+// StaleGen is the reason AdmitAt gives for a lookup of a superseded session.
+const StaleGen = "stale_session"
+
+// AdmitAt is Admit for a verdict that began under generation gen; it charges nothing
+// when the table was rebuilt since.
+func (c *Conns) AdmitAt(gen, id uint64, src netip.Addr, h Hit, exits []string, socks string) (*Conn, []int, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gen != c.gen {
+		c.cnt(StaleGen)
+		return nil, nil, StaleGen
+	}
 	now := c.now()
 	c.tickLocked(now)
 	pl := placeOf(src, h)
@@ -386,16 +456,7 @@ func (c *Conns) Moved(id uint64, socks string, left bool, startMS uint32) {
 		return
 	}
 	// Same node and account shares, another exit's pool.
-	old := c.exitPool(cn.pl.exit)
-	nw := c.exitPool(newExit)
-	if cn.pl.shared {
-		old.subShared(src16(cn.pl.src))
-		nw.forceShared(src16(cn.pl.src))
-	} else {
-		old.sub(cn.pl.acct)
-		nw.force(cn.pl.acct)
-	}
-	cn.pl.exit = newExit
+	c.moveExit(cn, newExit)
 }
 
 // Pending is a connection that closed with no byte from its current target.
@@ -452,6 +513,7 @@ func (c *Conns) Rebuild(items []OpenItem) {
 		c.release(&h.pl, false)
 	}
 	c.holds = nil
+	c.gen++
 	c.byID = make(map[uint64]*Conn, len(items))
 	now := c.now()
 	for _, it := range items {

@@ -224,8 +224,7 @@ func (g *Grants) decideForward(f *peerv1.GrantForward, sender [16]byte, short bo
 	src, _ := netip.AddrFromSlice(pfx[:len(pfx)-1])
 	src = src.Unmap()
 	applied := sv.img.Seq()
-	if rec.AdminState != commonv1.AdminState_ADMIN_STATE_ENABLED ||
-		h.rev.acts(policyv1.RevocationKind_REVOCATION_KIND_ENDPOINT, st.id, applied, now) {
+	if rec.AdminState != commonv1.AdminState_ADMIN_STATE_ENABLED || g.grantsRevoked(sv, st.id) {
 		return false
 	}
 	var claim [16]byte

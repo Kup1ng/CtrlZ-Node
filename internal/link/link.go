@@ -70,6 +70,13 @@ type Server struct {
 
 	mu  sync.Mutex
 	cur *session
+
+	// gate keeps the frames of a replaced session out of the Backend. A frame is
+	// handed to the Backend under the read side with a check that its session is
+	// still current; the replacement and the Backend's LinkUp (the rebuild) run under
+	// the write side. So no late moved, closed or state of the old proxy lands in the
+	// table the new proxy's open list built (ids restart with each proxy run).
+	gate sync.RWMutex
 }
 
 // New makes a Server.
@@ -91,6 +98,15 @@ type session struct {
 	wmu  sync.Mutex
 	done chan struct{}
 	once sync.Once
+	// ctx ends with the session, at once when another proxy replaces it, so the
+	// lookups the old session still has in flight stop and are not answered.
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func newSession(c net.Conn) *session {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &session{c: c, done: make(chan struct{}), ctx: ctx, cancel: cancel}
 }
 
 const writeTimeout = 5 * time.Second
@@ -113,6 +129,7 @@ func (s *session) send(m *sock.LinkMsg) error {
 
 func (s *session) close() {
 	s.once.Do(func() {
+		s.cancel()
 		close(s.done)
 		_ = s.c.Close()
 	})
@@ -178,7 +195,7 @@ func (s *Server) handle(c net.Conn) {
 		_ = c.Close()
 		return
 	}
-	ss := &session{c: c, done: make(chan struct{})}
+	ss := newSession(c)
 	defer ss.close()
 	if who == sock.WhoRoot {
 		s.serveRoot(ss)
@@ -225,13 +242,7 @@ func (s *Server) serveProxy(ss *session) {
 	// The new proxy replaces the old one before the table is rebuilt: the old one's
 	// connections are gone with it, and its `closed` frames must not reach the new
 	// table.
-	s.mu.Lock()
-	old := s.cur
-	s.cur = ss
-	s.mu.Unlock()
-	if old != nil {
-		old.close()
-	}
+	installed := s.install(ss, run, items)
 	defer func() {
 		s.mu.Lock()
 		last := s.cur == ss
@@ -243,21 +254,55 @@ func (s *Server) serveProxy(ss *session) {
 			s.cfg.Backend.LinkDown()
 		}
 	}()
-
-	open := make([]grant.OpenItem, 0, len(items))
-	for _, it := range items {
-		a, ok := netip.AddrFromSlice(it.Source)
-		if !ok {
-			return
-		}
-		open = append(open, grant.OpenItem{ID: it.ID, Source: a.Unmap(), Socks: it.Socks, Tag: it.Tag})
+	if !installed {
+		return
 	}
-	s.cfg.Backend.LinkUp(run, open)
 
 	// config goes out once dns has a bind address; until then the proxy listens on
 	// nothing, which is the safe state (5.1).
 	go s.sendConfig(ss)
 	s.loop(ss)
+}
+
+// install makes ss the current session and hands the Backend its open list. The old
+// session is closed first, which cancels its lookups, and nothing of it reaches the
+// Backend once the write side of the gate is released. It reports false when the
+// list holds an address that does not read; the session is then current and the
+// caller ends it.
+func (s *Server) install(ss *session, run uint64, items []sock.OpenItem) bool {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	s.mu.Lock()
+	old := s.cur
+	s.cur = ss
+	s.mu.Unlock()
+	if old != nil {
+		old.close()
+	}
+	open := make([]grant.OpenItem, 0, len(items))
+	for _, it := range items {
+		a, ok := netip.AddrFromSlice(it.Source)
+		if !ok {
+			return false
+		}
+		open = append(open, grant.OpenItem{ID: it.ID, Source: a.Unmap(), Socks: it.Socks, Tag: it.Tag})
+	}
+	s.cfg.Backend.LinkUp(run, open)
+	return true
+}
+
+// current runs f with the gate held for reading when ss is still the current
+// session, and says whether it ran.
+func (s *Server) current(ss *session, f func()) bool {
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	s.mu.Lock()
+	ok := s.cur == ss
+	s.mu.Unlock()
+	if ok {
+		f()
+	}
+	return ok
 }
 
 func (s *Server) sendConfig(ss *session) {
@@ -288,8 +333,7 @@ func (s *Server) Reconfigure() {
 }
 
 func (s *Server) loop(ss *session) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := ss.ctx
 	sem := make(chan struct{}, s.cfg.MaxLookups)
 	b := s.cfg.Backend
 	for {
@@ -326,6 +370,9 @@ func (s *Server) loop(ss *session) {
 			go func() {
 				defer func() { <-sem }()
 				v := b.Lookup(ctx, l.ID, a.Unmap(), l.Name, l.Port)
+				if ctx.Err() != nil {
+					return // the session was replaced or closed: nobody reads this verdict
+				}
 				if v == nil {
 					v = &sock.LinkVerdict{Kind: sock.VerdictNone}
 				}
@@ -333,11 +380,17 @@ func (s *Server) loop(ss *session) {
 				_ = ss.send(&sock.LinkMsg{Type: sock.TLinkVerdict, Verdict: v})
 			}()
 		case sock.TLinkMoved:
-			b.Moved(m.Moved)
+			if !s.current(ss, func() { b.Moved(m.Moved) }) {
+				return
+			}
 		case sock.TLinkClosed:
-			b.Closed(m.Closed)
+			if !s.current(ss, func() { b.Closed(m.Closed) }) {
+				return
+			}
 		case sock.TLinkState:
-			b.State(m.State)
+			if !s.current(ss, func() { b.State(m.State) }) {
+				return
+			}
 		case sock.TLinkOpen, sock.TLinkHello:
 			return // the list comes once, right after hello
 		}

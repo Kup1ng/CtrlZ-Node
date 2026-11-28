@@ -68,10 +68,13 @@ type Grants struct {
 
 	passMu   sync.Mutex
 	lastPass atomic.Int64
-	kick     chan struct{}
+	// kick asks for a pass of the image (at most once in 5 s, 4.6); kickNow is for a
+	// revocation, which ends Grants when dns gets it.
+	kick    chan struct{}
+	kickNow chan struct{}
 
 	mu       sync.Mutex
-	noA      map[string]time.Time
+	noA      map[string]noAMark
 	aWaits   map[[16]byte]int
 	refused  map[string]uint64
 	waiting  []waitFwd
@@ -88,8 +91,8 @@ func newGrants(h *Handler, o ProxyOptions) *Grants {
 	if o.Limits == (grant.Limits{}) {
 		o.Limits = grant.DefaultLimits()
 	}
-	g := &Grants{h: h, o: o, lim: o.Limits, start: h.now(), kick: make(chan struct{}, 1),
-		noA: map[string]time.Time{}, aWaits: map[[16]byte]int{}, refused: map[string]uint64{},
+	g := &Grants{h: h, o: o, lim: o.Limits, start: h.now(), kick: make(chan struct{}, 1), kickNow: make(chan struct{}, 1),
+		noA: map[string]noAMark{}, aWaits: map[[16]byte]int{}, refused: map[string]uint64{},
 		warm: make(chan struct{}, 64), fsem: make(chan struct{}, 256)}
 	g.table = grant.NewTable(o.Limits, h.now)
 	g.conns = grant.NewConns(o.Limits, h.now, g.table.Count)
@@ -234,6 +237,10 @@ func (g *Grants) put(ctx context.Context, c *putCall) grant.PutResult {
 	src := c.req.Source.Addr().Unmap()
 	f := c.final
 	out := outcomeOf(f)
+	if g.grantsRevoked(c.sv, c.id.st.id) {
+		g.table.Count("refused_" + ReasonRevoked)
+		return grant.PutResult{Verdict: grant.Refused, Reason: ReasonRevoked}
+	}
 	if out.Kind == grant.KindRedirect {
 		dial := c.qn
 		if out.Dial != "" {
@@ -263,9 +270,23 @@ func (g *Grants) put(ctx context.Context, c *putCall) grant.PutResult {
 		g.warmA(dialOrName(c.qn, out))
 	}
 	if res.Offer {
-		g.offer(c.sv, st, src, &c.qn, out, &res.Holder)
+		// The stored outcome, not this query's own decision: a holder that joined a live
+		// outcome must not hand the peer another one (4.2).
+		g.offer(c.sv, st, src, &c.qn, res.Out, &res.Holder)
 	}
 	return res
+}
+
+// ReasonRevoked is the refusal of a Put for an Endpoint whose Grants a revocation
+// ends while it is in force (4.6): no holder is written that the next pass would
+// remove, so the proxy cannot admit a connection on it in between.
+const ReasonRevoked = "revoked"
+
+// grantsRevoked says an Endpoint or grants_by_endpoint revocation is in force.
+func (g *Grants) grantsRevoked(sv *Serving, ep [16]byte) bool {
+	applied, now := sv.img.Seq(), g.h.now()
+	return g.h.rev.acts(policyv1.RevocationKind_REVOCATION_KIND_ENDPOINT, ep, applied, now) ||
+		g.h.rev.acts(policyv1.RevocationKind_REVOCATION_KIND_GRANTS_BY_ENDPOINT, ep, applied, now)
 }
 
 func dialOrName(qn names.Name, o grant.Outcome) names.Name {
@@ -336,32 +357,45 @@ func none() *sock.LinkVerdict { return &sock.LinkVerdict{Kind: sock.VerdictNone}
 
 // Lookup is the verdict of one connection (4.3, 5.3).
 func (g *Grants) Lookup(ctx context.Context, id uint64, src netip.Addr, wire []byte, port uint16) *sock.LinkVerdict {
+	// The generation is read before anything else and ctx is checked after it: a
+	// lookup of a proxy session that has been replaced either sees its ctx cancelled
+	// or carries the old generation, and in both cases charges nothing into the table
+	// the new session's open list built (grant.Conns.AdmitAt).
+	gen := g.conns.Gen()
 	width := g.facts().Width
 	asn := g.asn(src)
-	hit, ok := g.table.Lookup(src, asn, wire, width)
+	probe := func() (hit grant.Hit, y grant.Tally, ok bool) { return g.table.Probe(src, asn, wire, width) }
+	hit, y, ok := probe()
 	if !ok {
 		// A Put may be a moment behind the proxy's lookup: the device asked DNS and
-		// connected at once. Wait for that exact key, then look once more.
-		if !g.table.Wait(ctx, wire, src, putWait) {
-			g.table.Count("lookup_none")
-			return none()
-		}
-		if hit, ok = g.table.Lookup(src, asn, wire, width); !ok {
-			g.table.Count("lookup_none")
-			return none()
+		// connected at once. Wait for that exact key; the wait looks once more after it
+		// is registered, so a Put that landed since the miss is not lost, and again when
+		// it is signalled.
+		signalled := g.table.Wait(ctx, wire, src, putWait, func() bool {
+			hit, y, ok = probe()
+			return ok
+		})
+		if signalled && !ok {
+			hit, y, ok = probe()
 		}
 	}
-	if len(hit.Holders) == 0 {
+	// Counted once, as what the connection finally found (4.3).
+	g.table.Record(asn, y)
+	if !ok {
+		g.table.Count("lookup_none")
+		return none()
+	}
+	if len(hit.Holders) == 0 || ctx.Err() != nil {
 		return none()
 	}
 	if hit.Out.Kind == grant.KindBlockPage {
-		return g.blockVerdict(id, src, hit)
+		return g.blockVerdict(gen, id, src, hit)
 	}
-	return g.proxyVerdict(ctx, id, src, wire, port, hit)
+	return g.proxyVerdict(ctx, gen, id, src, wire, port, hit)
 }
 
-func (g *Grants) blockVerdict(id uint64, src netip.Addr, hit grant.Hit) *sock.LinkVerdict {
-	cn, _, why := g.conns.Admit(id, src, hit, nil, "")
+func (g *Grants) blockVerdict(gen, id uint64, src netip.Addr, hit grant.Hit) *sock.LinkVerdict {
+	cn, _, why := g.conns.AdmitAt(gen, id, src, hit, nil, "")
 	if why != "" {
 		return none()
 	}
@@ -377,7 +411,7 @@ func (g *Grants) blockVerdict(id uint64, src netip.Addr, hit grant.Hit) *sock.Li
 
 type target struct{ socks, host, exit string }
 
-func (g *Grants) proxyVerdict(ctx context.Context, id uint64, src netip.Addr, wire []byte, port uint16, hit grant.Hit) *sock.LinkVerdict {
+func (g *Grants) proxyVerdict(ctx context.Context, gen, id uint64, src netip.Addr, wire []byte, port uint16, hit grant.Hit) *sock.LinkVerdict {
 	name, err := names.FromCanonicalWire(wire)
 	if err != nil {
 		return none()
@@ -399,7 +433,16 @@ func (g *Grants) proxyVerdict(ctx context.Context, id uint64, src netip.Addr, wi
 		return none()
 	}
 	nh := hit.Holders[0]
-	addrs, answered := g.dialAddrs(ctx, dial, nh.Endpoint)
+	addrs, answered, gated := g.dialAddrs(ctx, dial, nh.Endpoint)
+	if ctx.Err() != nil {
+		return none() // the session of this lookup ended while it waited
+	}
+	if gated {
+		// The Sanity Gate refused the answer for a class other than injected (private,
+		// loopback, CGNAT): the name must not be dialled, by address or by name (R9, 5.3).
+		g.table.Count("unsafe")
+		return none()
+	}
 	if answered && badAddrs(addrs) {
 		g.table.Count("unsafe")
 		return none()
@@ -437,7 +480,7 @@ func (g *Grants) proxyVerdict(ctx context.Context, id uint64, src netip.Addr, wi
 	for i := range cands {
 		exits[i] = cands[i].exit
 	}
-	cn, rooms, why := g.conns.Admit(id, src, hit, exits, cands[0].socks)
+	cn, rooms, why := g.conns.AdmitAt(gen, id, src, hit, exits, cands[0].socks)
 	if why != "" {
 		return none()
 	}
@@ -455,22 +498,29 @@ func (g *Grants) proxyVerdict(ctx context.Context, id uint64, src netip.Addr, wi
 // 300 ms for a lookup through the identified resolver. A name with no answer in that
 // time goes to the location, and is asked again in 60 s at the earliest. A waits of
 // one Endpoint are at most 64 (12).
-func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) ([]netip.Addr, bool) {
+//
+// gated says the Sanity Gate refused the answer for a class other than injected, now
+// or at the lookup 60 s ago that the name is remembered for: the verdict is none (5.3).
+func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) (addrs []netip.Addr, answered, gated bool) {
 	p := sharedpolicy.ResolveParams{}
 	if g.h.cfg.CachedA != nil {
 		if a, ok := g.h.cfg.CachedA(dial, p); ok {
-			return a, true
+			return a, true, false
 		}
 	}
 	if g.h.cfg.Resolver == nil {
-		return nil, false
+		return nil, false, false
 	}
 	key := string(dial.Wire())
 	now := g.h.now()
 	g.mu.Lock()
-	if t, bad := g.noA[key]; bad && now.Sub(t) < aRetry || g.aWaits[ep] >= aWaitsEp {
+	if m, bad := g.noA[key]; bad && now.Sub(m.at) < aRetry {
 		g.mu.Unlock()
-		return nil, false
+		return nil, false, m.gated
+	}
+	if g.aWaits[ep] >= aWaitsEp {
+		g.mu.Unlock()
+		return nil, false, false
 	}
 	g.aWaits[ep]++
 	g.mu.Unlock()
@@ -481,8 +531,14 @@ func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) ([
 	if g.aWaits[ep]--; g.aWaits[ep] <= 0 {
 		delete(g.aWaits, ep)
 	}
-	var addrs []netip.Addr
+	if ctx.Err() != nil {
+		// The caller went away, which says nothing of the name: no mark, no answer.
+		g.mu.Unlock()
+		return nil, false, false
+	}
+	failed := true
 	if err == nil && ans != nil && !ans.Failed {
+		failed = false
 		for i := range ans.Answer {
 			if a, ok := ans.Answer[i].Addr(); ok {
 				addrs = append(addrs, a)
@@ -490,13 +546,24 @@ func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) ([
 		}
 	}
 	if len(addrs) == 0 {
-		if len(g.noA) >= maxNoA {
-			g.noA = map[string]time.Time{}
+		if failed && g.h.cfg.GateClass != nil {
+			if c, ok := g.h.cfg.GateClass(dial); ok && c != netclass.Injected {
+				gated = true
+			}
 		}
-		g.noA[key] = now
+		if len(g.noA) >= maxNoA {
+			g.noA = map[string]noAMark{}
+		}
+		g.noA[key] = noAMark{at: now, gated: gated}
 	}
 	g.mu.Unlock()
-	return addrs, len(addrs) > 0
+	return addrs, len(addrs) > 0, gated
+}
+
+// noAMark is the 60 s memory of a name that had no A at its last lookup.
+type noAMark struct {
+	at    time.Time
+	gated bool // the Sanity Gate refused it, for a class other than injected
 }
 
 // ---- the link's other messages
@@ -524,10 +591,14 @@ func (g *Grants) Closed(c *sock.LinkClosed) {
 func (g *Grants) State(s *sock.LinkState) {
 	g.listening.Store(s.Listening)
 	g.pxOpen.Store(s.Open)
-	g.mu.Lock()
+	// A frame lists every refusal the proxy has counted since its start, so it replaces
+	// the last one: a proxy that sends new names in each frame cannot grow this map.
+	m := make(map[string]uint64, len(s.Refused))
 	for _, r := range s.Refused {
-		g.refused[r.Reason] = r.Count
+		m[r.Reason] = r.Count
 	}
+	g.mu.Lock()
+	g.refused = m
 	g.mu.Unlock()
 }
 
@@ -625,10 +696,26 @@ func (g *Grants) endStale() {
 
 // ---- ends (4.6)
 
-// Revalidate asks for a pass at once (a revocation, a catalog change, an image).
+// passEvery is the least time between two passes that no revocation asked for (4.6:
+// every served image, at most once in 5 s). A pass walks every holder under the shard
+// locks that Put needs, so a burst of images must not repeat the sweep.
+const passEvery = 5 * time.Second
+
+// Revalidate asks for a pass for a served image or a catalog change. It runs at once
+// when the last pass is older than 5 s; otherwise the periodic pass of Run, at most
+// 5 s after the last, covers it.
 func (g *Grants) Revalidate() {
 	select {
 	case g.kick <- struct{}{}:
+	default:
+	}
+}
+
+// RevalidateNow asks for a pass at once, for a revocation: it ends Grants when dns
+// gets it, and while it is in force (4.6).
+func (g *Grants) RevalidateNow() {
+	select {
+	case g.kickNow <- struct{}{}:
 	default:
 	}
 }
@@ -643,8 +730,12 @@ func (g *Grants) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-g.kick:
+		case <-g.kickNow:
 			g.pass()
+		case <-g.kick:
+			if g.h.now().Sub(time.Unix(g.lastPass.Load(), 0)) >= passEvery {
+				g.pass()
+			}
 		case <-t.C:
 		}
 		g.sendForwards()
@@ -803,17 +894,10 @@ func (g *Grants) fillSelf(s *sharedpolicy.SelfAddrs, sv *Serving, rec *policyv1.
 	f := g.facts()
 	s.ProxyDown = !g.Listening()
 	s.PeerProxyIP, s.PeerProxyUsable = netip.Addr{}, false
-	pt := sv.img.PairTable()
-	nodes := map[[16]byte]*policyv1.NodeEntry{}
-	for _, n := range pt.GetNodes() {
-		if len(n.NodeId) == 16 {
-			nodes[[16]byte(n.NodeId)] = n
-		}
-	}
-	if me := nodes[f.Self]; me != nil {
+	if me := sv.nodes[f.Self]; me != nil {
 		s.ProxyBlocked = me.ProxyBlocked
 	}
-	p := pairOf(pt, rec.PairId)
+	p := pairOf(sv.img.PairTable(), rec.PairId)
 	if p == nil || len(p.Primary) != 16 || len(p.Fallback) != 16 {
 		return
 	}
@@ -826,7 +910,7 @@ func (g *Grants) fillSelf(s *sharedpolicy.SelfAddrs, sv *Serving, rec *policyv1.
 	default:
 		return
 	}
-	pe := nodes[peer]
+	pe := sv.nodes[peer]
 	if pe == nil {
 		return
 	}

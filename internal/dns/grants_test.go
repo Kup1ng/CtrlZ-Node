@@ -113,7 +113,8 @@ func redirectProfile(t testing.TB, loc uint16) ([]byte, [32]byte) {
 		return blob.RuleSpec{ID: [16]byte{id}, Pattern: p, Action: blob.ActRedirect, Target: &blob.TargetSpec{Kind: blob.TargetLocation, Location: loc}}
 	}
 	d, err := blob.Build(&blob.Spec{Default: blob.ActBypass, Rules: []blob.RuleSpec{
-		mk("pub.example.com", 1), mk("pub2.example.com", 2), mk("ir.example.com", 3), mk("pub3.example.com", 4)}})
+		mk("pub.example.com", 1), mk("pub2.example.com", 2), mk("ir.example.com", 3), mk("pub3.example.com", 4),
+		mk("private.example.com", 5), mk("inject.example.com", 6), mk("loop.example.com", 7)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,12 +434,13 @@ func TestGrantsBrandedBlocks(t *testing.T) {
 		t.Fatalf("a Branded block answers with the proxy addresses: %v", got)
 	}
 	wantA(t, "another page", w.dot(epB2, "brand.example.com", dns.TypeA), "0.0.0.0")
-	w.advance(time.Second) // the newest deciding query is the one that is charged
-	if got := aAddrs(w.dot(epB3, "brand.example.com", dns.TypeA).Msg); len(got) != 2 {
-		t.Fatalf("the same page joins: %v", got)
-	}
+	w.advance(time.Second)
+	// The same page hash but another account: a Branded page is of one account (SC
+	// 10.3), so B3 does not join B1's entry. It is refused and stays blocked, and the
+	// connection of the entry never carries B3's Endpoint or key.
+	wantA(t, "another account, same page", w.dot(epB3, "brand.example.com", dns.TypeA), "0.0.0.0")
 	v := g.look(1, "brand.example.com")
-	if v.Kind != sock.VerdictBlock || !bytes.Equal(v.Endpoint, bytes.Repeat([]byte{epB3}, 16)) || len(v.Account) != 16 || len(v.PageHash) != 0 {
+	if v.Kind != sock.VerdictBlock || !bytes.Equal(v.Endpoint, bytes.Repeat([]byte{epB1}, 16)) || !bytes.Equal(v.Account, bytes.Repeat([]byte{epB1}, 16)) || len(v.PageHash) != 0 {
 		t.Fatalf("right after the start the page is ours: %+v", v)
 	}
 	w.advance(time.Hour + time.Minute)
@@ -480,5 +482,130 @@ func TestGrantsForwardAheadOfTheImage(t *testing.T) {
 	g.mu.Unlock()
 	if waiting != 1 {
 		t.Fatalf("an offer ahead of the image was decided again: %d", waiting)
+	}
+}
+
+// 5.3: the Sanity Gate refused the A of the host to dial for a class other than
+// injected (private, loopback): none, so the exit is never asked to resolve it. An
+// injected answer is a filtered name and still goes to the exit by name.
+func TestGrantsVerdictGateRefusal(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	w.h.cfg.GateClass = w.res.GateClass
+	for i, name := range []string{"private.example.com", "loop.example.com"} {
+		w.dot(epP1, name, dns.TypeA)
+		if g.Table().Holders() == 0 {
+			t.Fatalf("%s: no Grant was written, so the verdict cannot be tested", name)
+		}
+		if v := g.look(uint64(10+i), name); v.Kind != sock.VerdictNone {
+			t.Fatalf("%s: a Gate refusal must give none: %+v", name, v)
+		}
+		// Still none for the 60 s the name is remembered, with no new lookup.
+		hits := w.back.hitCount(name, dns.TypeA)
+		if v := g.look(uint64(20+i), name); v.Kind != sock.VerdictNone || w.back.hitCount(name, dns.TypeA) != hits {
+			t.Fatalf("%s: the refusal is remembered: %+v", name, v)
+		}
+	}
+	w.dot(epP1, "inject.example.com", dns.TypeA)
+	if v := g.look(30, "inject.example.com"); v.Kind != sock.VerdictProxy || v.Targets[0].Host != "inject.example.com" {
+		t.Fatalf("an injected answer is a filtered name and goes to the exit by name: %+v", v)
+	}
+}
+
+// A lookup of a replaced proxy session charges nothing into the rebuilt table, and a
+// caller that went away marks no name as having no A.
+func TestGrantsLookupOfAReplacedSession(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	w.dot(epP1, "pub.example.com", dns.TypeA)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if v := g.Lookup(ctx, 1, srcLocal, wn("pub.example.com"), 443); v.Kind != sock.VerdictNone {
+		t.Fatalf("a cancelled lookup must answer none: %+v", v)
+	}
+	if g.Conns().NodeOpen() != 0 {
+		t.Fatal("a cancelled lookup charged a place")
+	}
+	g.mu.Lock()
+	marks := len(g.noA)
+	g.mu.Unlock()
+	if marks != 0 {
+		t.Fatal("a cancelled lookup marked a name as having no A")
+	}
+	// The generation changes under a lookup that began before the rebuild.
+	gen := g.Conns().Gen()
+	g.LinkUp(2, nil)
+	hit, ok := g.Table().Lookup(srcLocal, 64500, wn("pub.example.com"), grant.WidthExact)
+	if !ok {
+		t.Fatal("setup")
+	}
+	if _, _, why := g.Conns().AdmitAt(gen, 3, srcLocal, hit, []string{"exit0005"}, "127.0.0.20:20001"); why != grant.StaleGen {
+		t.Fatalf("an old generation must not admit: %q", why)
+	}
+}
+
+// A refusal list that changes names with each frame does not grow the map.
+func TestGrantsStateReplacesRefusals(t *testing.T) {
+	_, g, _ := newProxyWorld(t)
+	for i := 0; i < 50; i++ {
+		g.State(&sock.LinkState{Refused: []sock.Refusal{{Reason: "r" + itoa(i), Count: 1}}})
+	}
+	g.mu.Lock()
+	n := len(g.refused)
+	g.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d refusal names kept", n)
+	}
+}
+
+// A grants_by_endpoint revocation in force refuses a Put and a forward, and a Grant
+// the Endpoint holds ends with the next pass (4.6).
+func TestGrantsByEndpointRevocationRefusesNewHolders(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	id := [16]byte(bytes.Repeat([]byte{epP1}, 16))
+	w.h.Revocations().Set([]Revocation{{Kind: policyv1.RevocationKind_REVOCATION_KIND_GRANTS_BY_ENDPOINT, RevSeq: 99,
+		ExpiresAt: w.now().Add(time.Hour), IDs: [][16]byte{id}}})
+	w.dot(epP1, "pub.example.com", dns.TypeA)
+	if n := g.Table().Holders(); n != 0 {
+		t.Fatalf("a holder was written while grants_by_endpoint was in force: %d", n)
+	}
+	w.dot(epP2, "pub.example.com", dns.TypeA)
+	if n := g.Table().Holders(); n != 1 {
+		t.Fatalf("another Endpoint is not affected: %d", n)
+	}
+}
+
+// 4.6: a served image is judged at most once in 5 s, a revocation at once.
+func TestGrantsPassIsThrottledExceptForRevocations(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go g.Run(ctx)
+	g.pass()
+	first := g.lastPass.Load()
+	waitFor := func(what string, cond func() bool) bool {
+		for i := 0; i < 100; i++ {
+			if cond() {
+				return true
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false
+	}
+	w.advance(time.Second)
+	for i := 0; i < 5; i++ {
+		g.Revalidate() // a burst of images
+	}
+	time.Sleep(200 * time.Millisecond)
+	if g.lastPass.Load() != first {
+		t.Fatal("an image within 5 s of the last pass was judged again")
+	}
+	g.RevalidateNow()
+	if !waitFor("a revocation", func() bool { return g.lastPass.Load() != first }) {
+		t.Fatal("a revocation must be judged at once")
+	}
+	second := g.lastPass.Load()
+	w.advance(6 * time.Second)
+	g.Revalidate()
+	if !waitFor("an image after 5 s", func() bool { return g.lastPass.Load() != second }) {
+		t.Fatal("an image more than 5 s after the last pass must be judged")
 	}
 }

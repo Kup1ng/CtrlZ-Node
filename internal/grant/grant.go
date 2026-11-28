@@ -136,8 +136,9 @@ const (
 	// HolderLife is the absolute lifetime of a holder, set again by each deciding
 	// query of a validated source.
 	HolderLife = 4 * time.Hour
-	// MaxHolders and MaxPerEndpoint bound an entry.
-	MaxHolders     = 64
+	// MaxEndpoints and MaxPerEndpoint bound an entry: holders of at most 64 Endpoints,
+	// 8 of one.
+	MaxEndpoints   = 64
 	MaxPerEndpoint = 8
 	// MaxProxyTTL is shared policy.MaxProxyTTL, in seconds: the longest an answer
 	// that carries PROXY_IPs may be cached. Copied here so the package stays free of

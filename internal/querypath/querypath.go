@@ -173,7 +173,7 @@ func New(env *dnsrole.Env, sink *dnsrole.Sink, opt Options) (*Join, error) {
 	}
 	h, err := dns.New(dns.Config{
 		Proxy: px, Resolver: res, Reporter: rep, Profiles: policy.NewProfiles(opt.Profiles),
-		NeverProxied: opt.NeverProxied, Geo: opt.GeoView, Now: j.now, CachedA: res.CachedA,
+		NeverProxied: opt.NeverProxied, Geo: opt.GeoView, Now: j.now, CachedA: res.CachedA, GateClass: res.GateClass,
 		Self: j.self, Free: free,
 	})
 	if err != nil {
@@ -323,7 +323,7 @@ func (j *Join) syncRevocations() {
 	}
 	j.Handler.Revocations().Set(out)
 	if g := j.Handler.Grants(); g != nil {
-		g.Revalidate() // a revocation ends Grants when dns gets it (4.6)
+		g.RevalidateNow() // a revocation ends Grants when dns gets it (4.6)
 	}
 }
 

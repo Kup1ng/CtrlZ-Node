@@ -258,3 +258,70 @@ func TestFwdQueueServesAccountsInTurn(t *testing.T) {
 		t.Fatalf("%d expired", len(got))
 	}
 }
+
+// A shared kind 1 connection counts in the shared part of the opened-lately window
+// (5.4) and ages out of it with the others.
+func TestSharedConnectionsCountInOpenedWindow(t *testing.T) {
+	c := newClock()
+	cs, counts := newConns(c, func(l *Limits) { l.OpenedLast30s = 16 })
+	shared := hit(nameX, srcA, outL1, holder(1, 10), holder(2, 9))
+	n := 0
+	for i := uint64(1); i <= 40; i++ {
+		if _, _, why := cs.Admit(i, srcA, shared, []string{"e1"}, "127.0.0.20:20001"); why == "" {
+			n++
+		}
+	}
+	if n == 40 || counts["opened_rate"] == 0 {
+		t.Fatalf("the window never limited shared connections: %d admitted, %v", n, counts)
+	}
+	c.advance(31 * time.Second)
+	cs.Tick()
+	if _, _, why := cs.Admit(100, srcA, shared, []string{"e1"}, "127.0.0.20:20001"); why != "" {
+		t.Fatalf("the window must age: %s", why)
+	}
+}
+
+// A connection rebuilt before the agent's list reached dns moves to its real exit
+// when the list comes.
+func TestSetExitsRekeysRebuiltConnections(t *testing.T) {
+	c := newClock()
+	cs, _ := newConns(c, nil)
+	cn := &Conn{Name: string(nameX), EntrySrc: srcA, Out: outL1, Holders: []Holder{holder(1, 1)}}
+	cn.Holders = append([]Holder(nil), cn.Holders...)
+	tag := (&Conn{Name: string(nameX), EntrySrc: srcA, Out: outL1, Holders: cn.Holders, pl: place{ep: ep(1), acct: ep(1), kind: KindRedirect}}).Tag(1024)
+	cs.Rebuild([]OpenItem{{ID: 1, Source: srcA, Socks: "127.0.0.20:20001", Tag: tag}})
+	if cs.ExitOpen("x:127.0.0.20:20001") != 1 {
+		t.Fatal("setup: the rebuilt connection must be charged to its own address key")
+	}
+	cs.SetExits(map[string]string{"127.0.0.20:20001": "e1"})
+	if cs.ExitOpen("e1") != 1 || cs.ExitOpen("x:127.0.0.20:20001") != 0 {
+		t.Fatalf("the connection must count in the real exit: e1=%d x=%d", cs.ExitOpen("e1"), cs.ExitOpen("x:127.0.0.20:20001"))
+	}
+	cs.Closed([]uint64{1}, nil)
+	if cs.ExitOpen("e1") != 0 || cs.NodeOpen() != 0 {
+		t.Fatal("close must give the place back from the new exit")
+	}
+}
+
+// A verdict that began before a rebuild charges nothing and replaces nothing.
+func TestAdmitAtRefusesAStaleGeneration(t *testing.T) {
+	c := newClock()
+	cs, _ := newConns(c, nil)
+	gen := cs.Gen()
+	live := hit(nameX, srcA, outL1, holder(1, 10))
+	if _, _, why := cs.AdmitAt(gen, 7, srcA, live, []string{"e1"}, "127.0.0.20:20001"); why != "" {
+		t.Fatal(why)
+	}
+	tag := (&Conn{Name: string(nameX), EntrySrc: srcA, Out: outL1, Holders: live.Holders, pl: place{ep: ep(1), acct: ep(1), kind: KindRedirect}}).Tag(1024)
+	cs.Rebuild([]OpenItem{{ID: 7, Source: srcA, Socks: "127.0.0.20:20001", Tag: tag}})
+	before := cs.NodeOpen()
+	if _, _, why := cs.AdmitAt(gen, 7, srcA, live, []string{"e1"}, "127.0.0.20:20001"); why != StaleGen {
+		t.Fatalf("a lookup of the old session must be refused: %q", why)
+	}
+	if cs.NodeOpen() != before {
+		t.Fatal("a stale verdict charged the rebuilt table")
+	}
+	if _, _, why := cs.AdmitAt(cs.Gen(), 8, srcA, live, []string{"e1"}, "127.0.0.20:20001"); why != "" {
+		t.Fatalf("a lookup of the new session must admit: %s", why)
+	}
+}

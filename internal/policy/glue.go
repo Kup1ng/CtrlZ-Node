@@ -11,12 +11,14 @@ package policy
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 
 	"github.com/Kup1ng/CtrlZ-Shared/names"
+	"github.com/Kup1ng/CtrlZ-Shared/netclass"
 	sharedpolicy "github.com/Kup1ng/CtrlZ-Shared/policy"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/cache"
@@ -60,6 +62,46 @@ type Resolver struct {
 	SrcPayload uint16
 
 	failed atomic.Uint64
+
+	gmu   sync.Mutex
+	gated map[string]gateMark
+}
+
+type gateMark struct {
+	class netclass.Class
+	at    time.Time
+}
+
+const (
+	gateMarkLife = 2 * time.Minute
+	maxGateMarks = 4096
+)
+
+// noteGate remembers that the Sanity Gate refused the answer for a name, and which
+// class it was. A refused answer is a failed lookup and is not cached, so this is
+// the only trace of why it failed, for the one caller that must tell an injected
+// answer (a filtered name, which goes to the exit by name) from a private or
+// loopback one (a name that must not be dialled at all, p4b-proxy 5.3). The class
+// holds no address, and the table is bounded.
+func (r *Resolver) noteGate(n names.Name, c netclass.Class) {
+	r.gmu.Lock()
+	defer r.gmu.Unlock()
+	if r.gated == nil || len(r.gated) >= maxGateMarks {
+		r.gated = make(map[string]gateMark, 64)
+	}
+	r.gated[string(n.Wire())] = gateMark{class: c, at: time.Now()}
+}
+
+// GateClass reports the class of the last Sanity Gate refusal for a name, within
+// two minutes of it. ok is false when the Gate has not refused the name lately.
+func (r *Resolver) GateClass(n names.Name) (netclass.Class, bool) {
+	r.gmu.Lock()
+	defer r.gmu.Unlock()
+	m, ok := r.gated[string(n.Wire())]
+	if !ok || time.Since(m.at) > gateMarkLife {
+		return 0, false
+	}
+	return m.class, true
 }
 
 // Lookup implements the shared policy.Resolver. It reads through the cache, and
@@ -127,6 +169,7 @@ func (r *Resolver) fetch(n names.Name, qtype uint16, p sharedpolicy.ResolveParam
 		if r.Rejected != nil {
 			r.Rejected()
 		}
+		r.noteGate(n, v.Class)
 		return failedAnswer(n)
 	}
 	_ = r.Cache.PutGen(r.Segment, key, n, a, gen)

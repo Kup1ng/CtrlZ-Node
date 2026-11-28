@@ -139,6 +139,10 @@ type Serving struct {
 	// nodeIPs are the dns_ip of every node of the applied PairTable, for the hop
 	// guard of SC 5.2a (b).
 	nodeIPs map[netip.Addr]bool
+	// nodes are the entries of the applied PairTable by node id, built once per image
+	// so a query that needs its own entry and its peer's does not scan or copy the
+	// table (Grants.fillSelf runs for every routed query).
+	nodes map[[16]byte]*policyv1.NodeEntry
 }
 
 // NewServing builds a Serving over img. old, when not nil, hands its claims'
@@ -153,7 +157,11 @@ func NewServing(img Image, profiles *policy.Profiles, old *Serving) *Serving {
 		s.loader = profiles.Bind(img.ProfilePath)
 	}
 	s.nodeIPs = map[netip.Addr]bool{}
+	s.nodes = map[[16]byte]*policyv1.NodeEntry{}
 	for _, n := range img.PairTable().GetNodes() {
+		if len(n.GetNodeId()) == 16 {
+			s.nodes[[16]byte(n.NodeId)] = n
+		}
 		if a, ok := netip.AddrFromSlice(n.GetDnsIp()); ok {
 			s.nodeIPs[a.Unmap()] = true
 		}
