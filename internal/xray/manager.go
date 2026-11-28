@@ -546,6 +546,12 @@ func (m *Manager) stallVerdict(version, op string, stdin []byte, err error) erro
 		delete(m.stalls, key) // an answer of any other kind ends the run of stalls
 		return err
 	}
+	if version != m.version {
+		// A candidate release that stalls on every input is a broken release, not a set of bad
+		// fragments: the rebuild counts it (noteBroken) and blocks the upgrade, and no config
+		// is refused for it (B5 r2-3).
+		return err
+	}
 	if len(m.stalls) >= maxStallsKept {
 		m.stalls = map[[32]byte]int{}
 	}
@@ -554,7 +560,7 @@ func (m *Manager) stallVerdict(version, op string, stdin []byte, err error) erro
 		return err
 	}
 	delete(m.stalls, key)
-	return &CtlError{Exit: 1, Text: "the Xray binary timed out or was killed three times in a row on this fragment"}
+	return &CtlError{Exit: 1, Stalled: true, Text: "the Xray binary timed out or was killed three times in a row on this fragment"}
 }
 
 // errText is a short text for an error of the ctl, with the pasted values taken

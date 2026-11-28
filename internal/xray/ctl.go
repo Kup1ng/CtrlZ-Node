@@ -25,6 +25,10 @@ type Ctl interface {
 type CtlError struct {
 	Exit int32
 	Text string
+	// Stalled marks a refusal that the agent made itself from repeated timeouts or kills
+	// (stallVerdict): the binary never said it. It refuses the config, but it must not cost
+	// a good file, since a node-wide stall looks the same (B5 r2-2).
+	Stalled bool
 }
 
 func (e *CtlError) Error() string {

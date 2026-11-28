@@ -42,6 +42,9 @@ type rebuildReq struct {
 	version string
 	remote  string // for rbStuck
 	tries   int
+	// stalls counts the tests of a candidate release that timed out or were killed across all
+	// the tries of this request: the second says the release itself hangs (B5 r2-3).
+	stalls int
 	// longWaits counts the rounds of failures of the node itself (ctl, files, units) that an
 	// upgrade waited out; a bounded number of them ends in a blocked upgrade, the one signal
 	// the owner gets (7.7 step 5, B5 r1-8).
@@ -391,8 +394,23 @@ func (m *Manager) renderForRebuild(ctx context.Context, rb *rebuildReq, version 
 // noteBroken remembers that a rebuild of another release found its binary unable to run:
 // the new release is at fault, not the control socket (B5 r1-5).
 func (m *Manager) noteBroken(version string, err error) {
-	if version != m.version && binaryMissing(err) {
+	if version == m.version {
+		return
+	}
+	if binaryMissing(err) {
 		m.rbBroken = true
+		return
+	}
+	// A new release whose binary hangs or dies on a signal for a second test is broken
+	// itself: one stall can be a busy node, two are not (B5 r2-3).
+	if stalled(err) {
+		if m.rb == nil {
+			return
+		}
+		m.rb.stalls++
+		if m.rb.stalls >= 2 {
+			m.rbBroken = true
+		}
 	}
 }
 

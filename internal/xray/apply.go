@@ -942,7 +942,13 @@ func (m *Manager) testRestored(ctx context.Context, r runRec, hash string) resto
 		m.retryIn(m.retryDelay())
 		return restoreNoVerdict
 	}
-	m.deleteGood(r.ID)
+	var ce *CtlError
+	if !(asCtl(err, &ce) && ce.Stalled) {
+		// Only the binary's own refusal proves the release cannot run the fragment. Stalls
+		// that the agent turned into a refusal may be the node's, and the good file is all
+		// there is to restore from (B5 r2-2).
+		m.deleteGood(r.ID)
+	}
 	m.setStatus(r.ID, kRefused, errText(err, r.Frag), hash)
 	return restoreRefused
 }
@@ -976,6 +982,11 @@ func (m *Manager) retestRestored(ctx context.Context) {
 		if c == nil || !ok || g.Hash != hash || m.running(id) != nil {
 			// Removed, edited into another fragment that reconcile judges, or already put
 			// back by another path: nothing is owed any more.
+			if c == nil {
+				// Removed: the good file holds the credentials, and after a restart no status
+				// or running entry reaches it any more (B5 r2-1).
+				m.deleteGood(id)
+			}
 			delete(m.st.Restore, id)
 			_ = m.saveState()
 			continue
