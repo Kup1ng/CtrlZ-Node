@@ -192,12 +192,15 @@ type Manager struct {
 	searchOut   []searchRec
 	noSearchTil time.Time
 	startFails  []time.Time
-	rewrites    int
-	hangFails   int
-	lastHang    time.Time
-	downFault   bool
-	downEndsB   bool
-	downStartB  bool
+	// untested are configs that run a fragment restored from good/ whose -test got no
+	// answer from the ctl (id to hash): tested again at the next reconcile (B5 r2-1).
+	untested   map[string]string
+	rewrites   int
+	hangFails  int
+	lastHang   time.Time
+	downFault  bool
+	downEndsB  bool
+	downStartB bool
 
 	// rebuilds, 7.5 step 5 and 7.7
 	rb          *rebuildReq
@@ -235,7 +238,7 @@ func New(o Options) *Manager {
 	return &Manager{
 		opt: o, t: t, wake: make(chan struct{}, 1), probeCh: make(chan probeResult, 256),
 		wanted: map[string]*cfgRec{}, status: map[string]*cfgStatus{}, hl: map[string]*health{},
-		nextPr: map[string]time.Time{}, probing: map[string]bool{}, probeSm: make(chan struct{}, 8),
+		nextPr: map[string]time.Time{}, probing: map[string]bool{}, untested: map[string]string{}, probeSm: make(chan struct{}, 8),
 		noHealthy: map[uint32]time.Time{}, alerted: map[uint32]bool{},
 		stuck:   newStuckState(),
 		guardEv: make(chan struct{}, 1),

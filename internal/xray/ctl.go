@@ -64,3 +64,12 @@ func (s *SockCtl) Do(ctx context.Context, r sock.CtlRun) error {
 	}
 	return nil
 }
+
+// binaryRefused is a judgment of the Xray binary: it ran and exited with its own non-zero
+// status. xrayctl answers exit -1 for a timeout, a binary that did not run, a release the
+// allow file does not name and a cancelled call, and none of those says anything about the
+// fragment, so they are no verdict and nothing may be refused or deleted on them (B5 r2-4).
+func binaryRefused(err error) bool {
+	var ce *CtlError
+	return asCtl(err, &ce) && ce.Exit > 0
+}

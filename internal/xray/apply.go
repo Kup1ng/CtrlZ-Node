@@ -43,6 +43,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 		return // both slots are down; syncGuard starts them again and reconciles
 	}
 	m.ensureActive(ctx)
+	m.retestRestored(ctx)
 	// st.BaseSig is the base the running process was rendered from, kept in state.json
 	// because the slots outlive the agent: a node address that changed while the agent
 	// was down is a change of the base like any other (7.5 step 5). A signature is asked
@@ -290,7 +291,7 @@ func (m *Manager) applyOne(ctx context.Context, c *cfgRec) {
 		return
 	}
 	if err := m.testConfig(ctx, m.version, cfg); err != nil {
-		if _, isExit := err.(*CtlError); !isExit {
+		if !binaryRefused(err) {
 			// ctrlz-xrayctl is not answering: nothing was judged about the fragment, so it
 			// is tried again soon and not left for the admin to edit.
 			m.pendingAgain(c)
@@ -393,8 +394,7 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 		// until it changes, and rebuild (step 5).
 		m.removeHandlers(ctx, slot, ver, rec)
 		m.st.Trial = nil
-		var ce *CtlError
-		if !asCtl(err, &ce) {
+		if !binaryRefused(err) {
 			// ctl.sock did not answer: that says nothing about this fragment.
 			_ = m.saveState()
 			m.pendingAgain(c)
@@ -506,7 +506,11 @@ func (m *Manager) removeHandlers(ctx context.Context, slot, version string, r ru
 // rewritten without it, its good file and mark are deleted, its address leaves the
 // list and its handlers are removed from the active slot and from a draining one.
 // A stateful config is removed by the rebuild instead.
-func (m *Manager) removeConfig(ctx context.Context, id string) {
+func (m *Manager) removeConfig(ctx context.Context, id string) { m.removeConfigKeeping(ctx, id, false) }
+
+// removeConfigKeeping is removeConfig that can leave the good file, for a removal that
+// judged nothing about the fragment (an agent with no table for the release, B5 r2-7).
+func (m *Manager) removeConfigKeeping(ctx context.Context, id string, keepGood bool) {
 	r := m.running(id)
 	if r == nil {
 		return
@@ -518,7 +522,10 @@ func (m *Manager) removeConfig(ctx context.Context, id string) {
 	delete(m.status, id)
 	delete(m.hl, id)
 	delete(m.nextPr, id)
-	m.deleteGood(id)
+	delete(m.untested, id)
+	if !keepGood {
+		m.deleteGood(id)
+	}
 	if rec.Stateful {
 		// `rmo` would leave its device or session up (finding 4); the rebuild leaves it
 		// behind with the old slot. A wireguard device must not outlive the switch.
@@ -758,14 +765,23 @@ func (m *Manager) putBack(ctx context.Context) bool {
 			if refusal == "" {
 				// The restored fragment is tested by the binary that will run it: a good file
 				// can be older than the release now installed (B5 r1-2).
-				if m.testRestored(ctx, rr, wantedHash) {
+				switch m.testRestored(ctx, rr, wantedHash) {
+				case restoreOK:
 					next = append(next, rr)
+					m.setStatus(r.ID, kLastGood, why, wantedHash)
+				case restoreNoVerdict:
+					// The ctl did not judge it: the good fragment stays in the slot, which is
+					// what the third end promises, and is tested again until the ctl answers
+					// (B5 r2-1). Leaving the config out would strand it, as reconcile never
+					// applies a crash-marked hash.
+					next = append(next, rr)
+					m.untested[r.ID] = rr.Hash
 					m.setStatus(r.ID, kLastGood, why, wantedHash)
 				}
 				continue
 			}
 			why = refusal
-			m.deleteGood(r.ID)
+			m.dropRefusedGood(r.ID, refusal)
 		}
 		m.setStatus(r.ID, kRefused, why, wantedHash)
 	}
@@ -875,12 +891,15 @@ func (m *Manager) onStartFail(ctx context.Context) {
 		}
 		rr, refusal := m.restoreGood(r, g)
 		if refusal != "" {
-			m.deleteGood(r.ID)
+			m.dropRefusedGood(r.ID, refusal)
 			m.setStatus(r.ID, kRefused, refusal, r.Hash)
 			continue
 		}
-		if !m.testRestored(ctx, rr, r.Hash) {
+		switch m.testRestored(ctx, rr, r.Hash) {
+		case restoreRefused:
 			continue
+		case restoreNoVerdict:
+			m.untested[r.ID] = rr.Hash
 		}
 		next = append(next, rr)
 	}
@@ -888,28 +907,78 @@ func (m *Manager) onStartFail(ctx context.Context) {
 	m.rewriteAndRestart(ctx)
 }
 
+// restoreVerdict is what the -test of a restored fragment said.
+type restoreVerdict int
+
+const (
+	restoreOK        restoreVerdict = iota
+	restoreRefused                  // the binary refused it: the good file is gone, status set
+	restoreNoVerdict                // the ctl did not judge it: nothing changed
+)
+
 // testRestored runs `-test` on a fragment restored from good/ alone, as every other path
-// that puts a fragment into a slot file does. A refusal by the binary leaves the config
-// out with the test's text and drops the good file, which that release cannot run; a ctl
-// that does not answer judged nothing, so the config stays pending and is tried again.
-func (m *Manager) testRestored(ctx context.Context, r runRec, hash string) bool {
+// that puts a fragment into a slot file does. A refusal by the binary (its own exit status,
+// above 0) leaves the config out with the test's text and drops the good file, which that
+// release cannot run. A ctl that does not answer, or answers a timeout or a release it does
+// not allow, judged nothing: the good file stays and the caller keeps the fragment and asks
+// again soon (B5 r2-4).
+func (m *Manager) testRestored(ctx context.Context, r runRec, hash string) restoreVerdict {
 	cfg, err := slotConfig(m.base(m.st.Slot), []runRec{r})
 	if err != nil {
 		m.setStatus(r.ID, kRefused, "the fragment could not be rendered", hash)
-		return false
+		return restoreRefused
 	}
 	err = m.testConfig(ctx, m.version, cfg)
 	if err == nil {
-		return true
+		return restoreOK
 	}
-	if _, isExit := err.(*CtlError); !isExit {
-		m.setStatus(r.ID, kPending, "", hash)
+	if !binaryRefused(err) {
 		m.retryIn(m.retryDelay())
-		return false
+		return restoreNoVerdict
 	}
 	m.deleteGood(r.ID)
 	m.setStatus(r.ID, kRefused, errText(err, r.Frag), hash)
-	return false
+	return restoreRefused
+}
+
+// retestRestored asks again for the fragments that run from good/ with no verdict yet. A
+// binary that refuses one now takes the config out, keeping its crash mark and the text.
+func (m *Manager) retestRestored(ctx context.Context) {
+	for id, hash := range m.untested {
+		r := m.running(id)
+		if r == nil || r.Hash != hash {
+			delete(m.untested, id)
+			continue
+		}
+		wanted := hash
+		if c := m.wanted[id]; c != nil {
+			wanted = c.hash
+		}
+		switch m.testRestored(ctx, *r, wanted) {
+		case restoreOK:
+			delete(m.untested, id)
+		case restoreRefused:
+			delete(m.untested, id)
+			mark, st := m.st.Crashed[id], m.status[id]
+			m.removeConfig(ctx, id)
+			if mark != "" {
+				m.st.Crashed[id] = mark
+			}
+			m.status[id] = st
+			_ = m.saveState()
+		}
+	}
+}
+
+// noTableRefusal is the refusal of a release the agent has no allow list for. It is a fact
+// about this agent build, not about the fragment, so it never costs a good file: a build
+// that has the table can still restore it (B5 r2-7).
+const noTableRefusal = "this release has no allow list in the agent"
+
+func (m *Manager) dropRefusedGood(id, refusal string) {
+	if refusal != noTableRefusal {
+		m.deleteGood(id)
+	}
 }
 
 func (m *Manager) setEndsDown(on bool) { m.setDown(&m.downEndsB, on) }
@@ -1053,7 +1122,7 @@ func (m *Manager) restoreGood(r runRec, g goodRec) (runRec, string) {
 	// every config then: a stored fragment is no way around the table (B5 r1-9).
 	tbl, known := m.table()
 	if !known {
-		return r, "this release has no allow list in the agent"
+		return r, noTableRefusal
 	}
 	res := tbl.Check(g.Frag, g.Accepted)
 	if !res.OK() {

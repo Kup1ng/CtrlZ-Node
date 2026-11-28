@@ -377,7 +377,7 @@ func (m *Manager) renderForRebuild(ctx context.Context, rb *rebuildReq, version 
 		return runRec{}, false, false
 	}
 	if err := m.testConfig(ctx, version, cfg); err != nil {
-		if _, isExit := err.(*CtlError); !isExit {
+		if !binaryRefused(err) {
 			return runRec{}, false, true
 		}
 		m.refuse(c, old, errText(err, c.Fragment))
@@ -407,8 +407,7 @@ func (m *Manager) carryRunning(ctx context.Context, version string, tbl xraysche
 		return runRec{}, false, false
 	}
 	if err := m.testConfig(ctx, version, cfg); err != nil {
-		_, isExit := err.(*CtlError)
-		return runRec{}, false, !isExit
+		return runRec{}, false, !binaryRefused(err)
 	}
 	return rec, true, false
 }
@@ -747,6 +746,13 @@ func (m *Manager) baseRetry() {
 func (m *Manager) recheckRunning(ctx context.Context) {
 	tbl, known := m.table()
 	if !known {
+		// Fail closed, as applyOne does: with no table nothing can be judged, so nothing
+		// stays up on trust. The good files stay, since the refusal is about this agent
+		// build and not about the fragments (B5 r2-7).
+		for _, r := range append([]runRec(nil), m.st.Running...) {
+			m.removeConfigKeeping(ctx, r.ID, true)
+			m.setStatus(r.ID, kRefused, noTableRefusal, r.Hash)
+		}
 		return
 	}
 	for _, r := range append([]runRec(nil), m.st.Running...) {

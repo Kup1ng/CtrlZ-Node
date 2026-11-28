@@ -143,3 +143,35 @@ func TestHostsOnlyResolverNeverAsksDNS(t *testing.T) {
 		t.Error("the lookup waited on the network")
 	}
 }
+
+// B5-r2-5: the hosts file adds to what Unbound answers, it is not read only when Unbound
+// is silent, so an address pinned in /etc/hosts reaches the block list.
+func TestHubLookupUnitesUnboundAndTheHostsFile(t *testing.T) {
+	a, b := netip.MustParseAddr("198.51.100.5"), netip.MustParseAddr("203.0.113.10")
+	f := combineHub(
+		func(context.Context, string) []netip.Addr { return []netip.Addr{a} },
+		func(context.Context, string) []netip.Addr { return []netip.Addr{b, a} })
+	if got := f(context.Background(), "hub.example.org"); !slices.Equal(got, []netip.Addr{a, b}) {
+		t.Fatalf("got %v, want both addresses once", got)
+	}
+}
+
+// B5-r2-6: a node that was off for longer than hubStale comes back with its list, since
+// staleness is judged against the newest answer in the file and not against now.
+func TestHubAddrsSurviveALongDowntime(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "hub.json")
+	kept, gone := netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("198.51.100.2")
+	h1 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h1.merge([]netip.Addr{kept, gone})
+	h1.seen[kept] = time.Now().Add(-5 * hubStale)
+	h1.seen[gone] = time.Now().Add(-8 * hubStale) // stale already before the node went off
+	h1.save()
+	h2 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h2.load()
+	if !slices.Equal(h2.got, []netip.Addr{kept}) {
+		t.Fatalf("list after the downtime: %v", h2.got)
+	}
+	if time.Since(h2.seen[kept]) > time.Minute {
+		t.Errorf("the downtime aged the address: %v", h2.seen[kept])
+	}
+}

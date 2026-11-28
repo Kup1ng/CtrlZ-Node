@@ -163,12 +163,26 @@ func (h *hubAddrs) load() {
 	if h.seen == nil {
 		h.seen = map[netip.Addr]time.Time{}
 	}
-	now := time.Now()
+	// Staleness is measured against the newest answer in the file, not against now: a
+	// node that was off for a day or more must come back with its list, or it would boot
+	// with no panel address blocked while Unbound is still warming up (B5 r2-6). The times
+	// are moved forward by the downtime so the merge that follows ages them the same way.
+	var newest time.Time
+	for _, e := range es {
+		if t := time.Unix(e.Seen, 0); e.Addr.IsValid() && t.After(newest) {
+			newest = t
+		}
+	}
+	shift := time.Duration(0)
+	if d := time.Since(newest); d > 0 {
+		shift = d
+	}
 	for _, e := range es {
 		t := time.Unix(e.Seen, 0)
-		if !e.Addr.IsValid() || now.Sub(t) > hubStale || len(h.got) >= hubMax || slices.Contains(h.got, e.Addr) {
+		if !e.Addr.IsValid() || newest.Sub(t) > hubStale || len(h.got) >= hubMax || slices.Contains(h.got, e.Addr) {
 			continue
 		}
+		t = t.Add(shift)
 		h.seen[e.Addr] = t
 		h.got = append(h.got, e.Addr)
 	}
@@ -232,25 +246,44 @@ func hostsOnlyResolver() *net.Resolver {
 	}
 }
 
-// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6. Only when it
-// answers nothing is the hosts file read, for a name that only the host knows: a file the
-// host's own admin writes is as trusted as agent.conf, which a DNS answer is not. The
-// host's plain resolver is never asked.
+// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6, and always adds
+// what the hosts file holds for it. The agent dials the hub through the host resolver,
+// which reads /etc/hosts first, so an address pinned there is the one the panel is
+// reached at and the one nft allows: leaving it out when Unbound also answers would
+// leave it unblocked for a proxy exit (B5 r2-5). A file the host's own admin writes is as
+// trusted as agent.conf, which a DNS answer is not, and both sources only add addresses
+// to block. The host's plain resolver is never asked.
 func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Addr {
 	v4, v6 := xray.UnboundResolver(unbound), xray.UnboundResolver6(unbound)
 	hosts := hostsOnlyResolver()
-	return func(ctx context.Context, host string) []netip.Addr {
-		var out []netip.Addr
-		for _, f := range []func(context.Context, string) ([]netip.Addr, error){v4, v6} {
-			if as, err := f(ctx, host); err == nil {
-				out = append(out, as...)
+	return combineHub(
+		func(ctx context.Context, host string) []netip.Addr {
+			var out []netip.Addr
+			for _, f := range []func(context.Context, string) ([]netip.Addr, error){v4, v6} {
+				if as, err := f(ctx, host); err == nil {
+					out = append(out, as...)
+				}
 			}
-		}
-		if len(out) == 0 {
+			return out
+		},
+		func(ctx context.Context, host string) []netip.Addr {
+			var out []netip.Addr
 			if ips, err := hosts.LookupNetIP(ctx, "ip", host); err == nil {
 				for _, ip := range ips {
 					out = append(out, ip.Unmap())
 				}
+			}
+			return out
+		})
+}
+
+// combineHub is the union of the two sources, Unbound's answers first, with no repeats.
+func combineHub(unbound, hosts func(ctx context.Context, host string) []netip.Addr) func(ctx context.Context, host string) []netip.Addr {
+	return func(ctx context.Context, host string) []netip.Addr {
+		out := unbound(ctx, host)
+		for _, a := range hosts(ctx, host) {
+			if !slices.Contains(out, a) {
+				out = append(out, a)
 			}
 		}
 		return out
