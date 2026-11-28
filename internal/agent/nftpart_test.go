@@ -185,3 +185,93 @@ func TestNftUnrenderableProxyPartStillAppliesTheDNSTable(t *testing.T) {
 		t.Error("no alert")
 	}
 }
+
+func nftScripts(r *fake.Runner) []string {
+	var out []string
+	for _, c := range r.Calls() {
+		if c.Name == "nft" && len(c.Args) == 2 && c.Args[0] == "-f" {
+			out = append(out, string(c.Stdin))
+		}
+	}
+	return out
+}
+
+// B4-r2-1 and B4-r2-4: while the proxy part stays unrenderable, the fallback table is
+// applied once. A second pass must not reload the table nor clear and raise nft_failed.
+func TestNftUnrenderableProxyPartIsAppliedOnce(t *testing.T) {
+	a, r, _ := nftAgent(t, goodUIDs)
+	a.cfg.Conf.ProxyBindIP = a.cfg.Conf.DNSBindIP
+	ctx := context.Background()
+	var flips []bool
+	a.cfg.NftGuard.OnFailure(func(f bool) { flips = append(flips, f) })
+	for i := 0; i < 3; i++ {
+		a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	}
+	if n := len(nftScripts(r)); n != 1 {
+		t.Errorf("nft -f ran %d times, want 1", n)
+	}
+	if len(flips) != 1 || !flips[0] {
+		t.Errorf("failure callbacks %v, want one raise and no clear", flips)
+	}
+	if !a.cfg.NftGuard.Failed() || a.cfg.NftGuard.Check() {
+		t.Error("the guard is not failed and off")
+	}
+}
+
+// B4-r2-3: on a node that already runs the proxy chains, a proxy part that can no
+// longer be rendered must not replace the table with the one of P4: the chains that
+// bound the running uids would go with it.
+func TestNftUnrenderableProxyPartKeepsTheRunningProxyChains(t *testing.T) {
+	a, r, _ := nftAgent(t, goodUIDs)
+	ctx := context.Background()
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if n := len(nftScripts(r)); n != 1 {
+		t.Fatalf("first apply: %d scripts", n)
+	}
+	a.cfg.Conf.ProxyBindIP = a.cfg.Conf.DNSBindIP
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if n := len(nftScripts(r)); n != 1 {
+		t.Errorf("the table was replaced: %d scripts", n)
+	}
+	if a.cfg.NftGuard.Check() {
+		t.Error("the guard is on over a table that is not the wanted one")
+	}
+	if !a.cfg.Faults.Has(hubv1.NodeFault_NODE_FAULT_NFT_FAILED) {
+		t.Error("the fault nft_failed is not set")
+	}
+}
+
+// B4-r2-2: a proxy script that renders but that nft refuses, on a node with no table
+// yet, still leaves the DNS_IP rules in place, with the guard off.
+func TestNftRefusedProxyScriptStillAppliesTheDNSTable(t *testing.T) {
+	a, r, _ := nftAgent(t, goodUIDs)
+	r.Reply = func(c fake.Call) ([]byte, error) {
+		if c.Name == "nft" && len(c.Args) == 2 && c.Args[0] == "-f" && strings.Contains(string(c.Stdin), "chain xray_out") {
+			return nil, errors.New("refused")
+		}
+		if len(c.Args) > 0 && c.Args[0] == "-s" {
+			return []byte("table inet ctrlz_agent"), nil
+		}
+		return nil, nil
+	}
+	ctx := context.Background()
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	sc := nftScripts(r)
+	if len(sc) != 2 {
+		t.Fatalf("%d scripts, want the refused one and the fallback", len(sc))
+	}
+	if strings.Contains(sc[1], "chain xray_out") || !strings.Contains(sc[1], "notrack") {
+		t.Errorf("the fallback is not the table of P4: %q", sc[1])
+	}
+	if a.cfg.NftGuard.Check() {
+		t.Error("the guard is on without the proxy chains")
+	}
+	if !a.cfg.Faults.Has(hubv1.NodeFault_NODE_FAULT_NFT_FAILED) {
+		t.Error("the fault nft_failed is not set")
+	}
+	// Heal leaves the fallback in the kernel and does not turn the guard on.
+	a.cfg.NftGuard.Heal(ctx)
+	if a.cfg.NftGuard.Check() {
+		t.Error("heal turned the guard on")
+	}
+}

@@ -65,12 +65,21 @@ func (g *Guard) OnFailure(f func(failed bool)) {
 }
 
 // Apply renders and applies the table, then records its read-back hash.
-func (g *Guard) Apply(ctx context.Context, p Params) error {
+func (g *Guard) Apply(ctx context.Context, p Params) error { return g.apply(ctx, p, false) }
+
+// ApplyRejected applies p, a table the agent fell back to because the one it wanted
+// cannot be used (the proxy part cannot be rendered, or nft refused it), and leaves the
+// guard off and failed. It is Apply followed by Reject without the instant in between
+// in which the failure would be cleared and raised again: that flip reached the fault
+// set and a heartbeat built in it (B4-r2-1).
+func (g *Guard) ApplyRejected(ctx context.Context, p Params) error { return g.apply(ctx, p, true) }
+
+func (g *Guard) apply(ctx context.Context, p Params, rejected bool) error {
 	g.mu.Lock()
 	prev := g.failed
 	w := p
 	g.wanted = &w
-	g.rejected = false
+	g.rejected = rejected
 	err := g.applyLocked(ctx, p)
 	cb, failed := g.onFail, g.failed
 	g.mu.Unlock()
@@ -197,4 +206,15 @@ func (g *Guard) setOK(v bool) {
 	default:
 	}
 	g.changes <- v
+}
+
+// Want sets the table Heal applies, without applying it: the agent calls it when a
+// fallback table was refused as well, so the timer goes on trying the table that was
+// wanted and not the fallback.
+func (g *Guard) Want(p Params) {
+	g.mu.Lock()
+	w := p
+	g.wanted = &w
+	g.rejected = false
+	g.mu.Unlock()
 }
