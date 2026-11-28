@@ -192,15 +192,14 @@ type Manager struct {
 	searchOut   []searchRec
 	noSearchTil time.Time
 	startFails  []time.Time
-	// untested are configs that run a fragment restored from good/ whose -test got no
-	// answer from the ctl (id to hash): tested again at the next reconcile (B5 r2-1).
-	untested   map[string]string
-	rewrites   int
-	hangFails  int
-	lastHang   time.Time
-	downFault  bool
-	downEndsB  bool
-	downStartB bool
+	stalls      map[[32]byte]int // input hash to its run of timeouts or signals (stallVerdict)
+	rbBroken    bool             // a rebuild found that the new release's binary cannot run
+	rewrites    int
+	hangFails   int
+	lastHang    time.Time
+	downFault   bool
+	downEndsB   bool
+	downStartB  bool
 
 	// rebuilds, 7.5 step 5 and 7.7
 	rb          *rebuildReq
@@ -238,7 +237,7 @@ func New(o Options) *Manager {
 	return &Manager{
 		opt: o, t: t, wake: make(chan struct{}, 1), probeCh: make(chan probeResult, 256),
 		wanted: map[string]*cfgRec{}, status: map[string]*cfgStatus{}, hl: map[string]*health{},
-		nextPr: map[string]time.Time{}, probing: map[string]bool{}, untested: map[string]string{}, probeSm: make(chan struct{}, 8),
+		nextPr: map[string]time.Time{}, probing: map[string]bool{}, stalls: map[[32]byte]int{}, probeSm: make(chan struct{}, 8),
 		noHealthy: map[uint32]time.Time{}, alerted: map[uint32]bool{},
 		stuck:   newStuckState(),
 		guardEv: make(chan struct{}, 1),
@@ -512,11 +511,50 @@ func (m *Manager) baseSignature() string {
 
 // ctlDo runs one ctl operation against a slot of a release.
 func (m *Manager) ctlDo(ctx context.Context, version, slot, op string, tags []string, stdin []byte) error {
-	return m.opt.Ctl.Do(ctx, sock.CtlRun{Version: version, Op: op, Slot: slot, Tags: tags, Stdin: stdin})
+	err := m.opt.Ctl.Do(ctx, sock.CtlRun{Version: version, Op: op, Slot: slot, Tags: tags, Stdin: stdin})
+	if len(stdin) == 0 {
+		return err // a removal by tag carries no fragment
+	}
+	return m.stallVerdict(version, op, stdin, err)
 }
 
 func (m *Manager) testConfig(ctx context.Context, version string, cfg []byte) error {
-	return m.opt.Ctl.Do(ctx, sock.CtlRun{Version: version, Op: sock.OpTest, Stdin: cfg})
+	return m.ctlDo(ctx, version, "", sock.OpTest, nil, cfg)
+}
+
+// maxStallsKept bounds the memory of stallVerdict: a fragment is at most 32 KiB and 64
+// configs are wanted, so this is far more than one reconcile can touch.
+const maxStallsKept = 512
+
+// stallsToVerdict is how many times in a row the same input may time out or be killed
+// before that counts as the binary's answer.
+const stallsToVerdict = 3
+
+// stallVerdict turns a repeated timeout or signal on the same input into a refusal by the
+// binary. One of them says nothing about the fragment (a busy node, a passing OOM kill),
+// but a fragment that makes the binary stall three times in a row is the cause, and would
+// otherwise stay pending for ever, hold the one-at-a-time ctl for 10 s at every retry and
+// fail every rebuild of every other config (B5 r1-2). The text is the agent's own: the
+// child said nothing, and nothing of the fragment is in it.
+func (m *Manager) stallVerdict(version, op string, stdin []byte, err error) error {
+	h := sha256.New()
+	h.Write([]byte(version + "\x00" + op + "\x00"))
+	h.Write(stdin)
+	var key [32]byte
+	copy(key[:], h.Sum(nil))
+	if err == nil || !stalled(err) {
+		delete(m.stalls, key) // an answer of any other kind ends the run of stalls
+		return err
+	}
+	if len(m.stalls) >= maxStallsKept {
+		m.stalls = map[[32]byte]int{}
+	}
+	m.stalls[key]++
+	if m.stalls[key] < stallsToVerdict {
+		return err
+	}
+	delete(m.stalls, key)
+	return &CtlError{Exit: 1, Text: "the Xray binary timed out or was killed three times in a row on this fragment"}
 }
 
 // errText is a short text for an error of the ctl, with the pasted values taken

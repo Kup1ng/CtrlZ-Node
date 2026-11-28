@@ -2,11 +2,14 @@ package xrayctl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -179,7 +182,7 @@ func TestExecRunnerKillsATimedOutChild(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	res := s.Exec(ctx, &sock.CtlRun{Version: "v26.11.9", Op: sock.OpTest, Stdin: []byte("SLEEP")})
-	if res.Exit != -1 || time.Since(start) > 10*time.Second {
+	if res.Exit != xrayrun.CtlTimeout || time.Since(start) > 10*time.Second {
 		t.Fatalf("%+v after %v", res, time.Since(start))
 	}
 }
@@ -244,5 +247,33 @@ func TestQueuedOperationOfAClientThatLeftNeverRuns(t *testing.T) {
 	defer g.mu.Unlock()
 	if g.runs != 1 {
 		t.Errorf("%d runs, want the first only", g.runs)
+	}
+}
+
+type errRunner struct{ err error }
+
+func (e errRunner) Run(context.Context, string, []string, []byte) (int, []byte, error) {
+	return -1, nil, e.err
+}
+
+// A child that a signal ended, a binary that cannot be executed and one that ran past its
+// limit answer three different codes, so the agent can tell a fragment that kills the
+// binary from a binary that is not there (B5 r1-2, r1-5).
+func TestNoStatusHasItsOwnCode(t *testing.T) {
+	run := &sock.CtlRun{Version: "v26.11.9", Op: sock.OpTest, Stdin: []byte("{}")}
+	if res := server(errRunner{&exec.ExitError{}}).Exec(context.Background(), run); res.Exit != xrayrun.CtlSignal {
+		t.Errorf("a signal: %+v", res)
+	}
+	if res := server(errRunner{errors.New("exec format error")}).Exec(context.Background(), run); res.Exit != xrayrun.CtlNoRun {
+		t.Errorf("no run: %+v", res)
+	}
+	s := server(ExecRunner{Dir: t.TempDir()})
+	s.Binary = func(string) string { return filepath.Join(t.TempDir(), "missing") }
+	if res := s.Exec(context.Background(), run); res.Exit != xrayrun.CtlNoRun {
+		t.Errorf("a missing binary: %+v", res)
+	}
+	s.ReadFile = func(string) ([]byte, error) { return []byte("v26.10.0\n"), nil }
+	if res := s.Exec(context.Background(), run); res.Exit != xrayrun.CtlNotJudged {
+		t.Errorf("a release not allowed: %+v", res)
 	}
 }

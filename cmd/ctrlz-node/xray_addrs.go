@@ -91,8 +91,8 @@ const (
 // must not change the list, because a change of it rebuilds the idle slot, so an
 // address stays until it has not been answered for hubStale. The list is bounded, and a
 // full list says so with an alert instead of dropping addresses without a word. The
-// answers come from the identified Unbound, or from the hosts file when it answers
-// nothing (lookupHub), never from the host's plain resolver, which a network attacker could
+// answers come from the identified Unbound together with the hosts file
+// (lookupHub joins the two), never from the host's plain resolver, which a network attacker could
 // fill with addresses of its choice.
 func (h *hubAddrs) merge(as []netip.Addr) {
 	if len(as) == 0 {
@@ -167,9 +167,19 @@ func (h *hubAddrs) load() {
 	// node that was off for a day or more must come back with its list, or it would boot
 	// with no panel address blocked while Unbound is still warming up (B5 r2-6). The times
 	// are moved forward by the downtime so the merge that follows ages them the same way.
+	// A time after now was written while the clock was wrong (an RTC far ahead before NTP
+	// synced). It is taken as now: left alone it would be the newest answer, every real entry
+	// would then look a day old and be dropped, and it would never age out itself (B5 r1-7).
+	now := time.Now()
+	seenAt := func(e hubEntry) time.Time {
+		if t := time.Unix(e.Seen, 0); t.Before(now) {
+			return t
+		}
+		return now
+	}
 	var newest time.Time
 	for _, e := range es {
-		if t := time.Unix(e.Seen, 0); e.Addr.IsValid() && t.After(newest) {
+		if t := seenAt(e); e.Addr.IsValid() && t.After(newest) {
 			newest = t
 		}
 	}
@@ -178,7 +188,7 @@ func (h *hubAddrs) load() {
 		shift = d
 	}
 	for _, e := range es {
-		t := time.Unix(e.Seen, 0)
+		t := seenAt(e)
 		if !e.Addr.IsValid() || newest.Sub(t) > hubStale || len(h.got) >= hubMax || slices.Contains(h.got, e.Addr) {
 			continue
 		}

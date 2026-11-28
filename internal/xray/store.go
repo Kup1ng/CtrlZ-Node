@@ -51,6 +51,12 @@ type persisted struct {
 	Trial   *trialRec         `json:"trial,omitempty"`
 	Crashed map[string]string `json:"crashed,omitempty"` // config id -> hash of the fragment that ended the process
 	Gens    map[string]int    `json:"gens,omitempty"`    // last generation of each config
+	// Restore is the configs whose good/ fragment is owed a -test before it goes back into the
+	// slot (config id to the hash of the good fragment). A third end or a failed start puts a
+	// config here when the ctl gave no verdict: the binary is never handed a fragment nothing
+	// judged, and the entry is kept in state.json so an agent restart does not forget it
+	// (B5 r1-1, r1-4).
+	Restore map[string]string `json:"restore,omitempty"`
 	// BaseSig is the signature of the base (the blocked ranges) that the active slot's
 	// process was started with: the slots outlive the agent, so a change of the node
 	// addresses while the agent was down is found by comparing it at the next start.
@@ -161,6 +167,9 @@ func (m *Manager) loadState() {
 	}
 	if m.st.Crashed == nil {
 		m.st.Crashed = map[string]string{}
+	}
+	if m.st.Restore == nil {
+		m.st.Restore = map[string]string{}
 	}
 	if m.st.Gens == nil {
 		m.st.Gens = map[string]int{}

@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -128,7 +129,7 @@ func (s *Server) execWatched(ctx context.Context, c net.Conn, r *sock.CtlRun) (*
 // child's own words, which the agent treats as untrusted.
 func (s *Server) Exec(ctx context.Context, r *sock.CtlRun) *sock.CtlResult {
 	res := &sock.CtlResult{ID: r.ID}
-	fail := func(msg string) *sock.CtlResult { res.Exit, res.Error = -1, msg; return res }
+	fail := func(msg string) *sock.CtlResult { res.Exit, res.Error = xrayrun.CtlNotJudged, msg; return res }
 
 	if !xrayrun.ValidVersion(r.Version) || (r.Op != sock.OpTest && !xrayrun.ValidSlot(r.Slot)) {
 		return fail("bad request")
@@ -164,11 +165,17 @@ func (s *Server) Exec(ctx context.Context, r *sock.CtlRun) *sock.CtlResult {
 	defer cancel()
 	exit, out, err := s.Runner.Run(cctx, bin, args, r.Stdin)
 	res.Exit = int32(exit)
+	// Each way of giving no status of its own has its own code, so the agent can tell a
+	// fragment that stalls or kills the binary from a binary that cannot run (B5 r1-2, r1-5).
+	var ee *exec.ExitError
 	switch {
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
-		res.Exit, res.Error = -1, "timeout"
+		res.Exit, res.Error = xrayrun.CtlTimeout, "timeout"
+	case err != nil && exit < 0 && errors.As(err, &ee):
+		// The process started and a signal ended it: ExitError with no status of its own.
+		res.Exit, res.Error = xrayrun.CtlSignal, "the binary was killed"
 	case err != nil && exit < 0:
-		res.Exit, res.Error = -1, "the binary did not run"
+		res.Exit, res.Error = xrayrun.CtlNoRun, "the binary did not run"
 	case exit != 0:
 		res.Error = clip(out)
 	}

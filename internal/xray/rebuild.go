@@ -217,6 +217,7 @@ func (m *Manager) runRebuild(ctx context.Context) {
 	}
 	idle := otherSlot(m.st.Slot)
 	sig := m.baseSignature()
+	m.rbBroken = false
 	var recs []runRec
 	port := FirstPort
 	for _, id := range m.order {
@@ -229,7 +230,7 @@ func (m *Manager) runRebuild(ctx context.Context) {
 		}
 		rec, ok, fatal := m.renderForRebuild(ctx, rb, version, tbl, idle, c, port)
 		if fatal {
-			m.rbFail(rb, "ctl")
+			m.rbFail(rb, m.fatalWhy())
 			return
 		}
 		if !ok {
@@ -239,7 +240,7 @@ func (m *Manager) runRebuild(ctx context.Context) {
 			if old := m.running(id); old != nil {
 				rec, ok, fatal = m.carryRunning(ctx, version, tbl, idle, c, old, port)
 				if fatal {
-					m.rbFail(rb, "ctl")
+					m.rbFail(rb, m.fatalWhy())
 					return
 				}
 			}
@@ -378,12 +379,31 @@ func (m *Manager) renderForRebuild(ctx context.Context, rb *rebuildReq, version 
 	}
 	if err := m.testConfig(ctx, version, cfg); err != nil {
 		if !binaryRefused(err) {
+			m.noteBroken(version, err)
 			return runRec{}, false, true
 		}
 		m.refuse(c, old, errText(err, c.Fragment))
 		return runRec{}, false, false
 	}
 	return rec, true, false
+}
+
+// noteBroken remembers that a rebuild of another release found its binary unable to run:
+// the new release is at fault, not the control socket (B5 r1-5).
+func (m *Manager) noteBroken(version string, err error) {
+	if version != m.version && binaryMissing(err) {
+		m.rbBroken = true
+	}
+}
+
+// fatalWhy names why a rebuild could not judge a fragment. A new release whose binary does
+// not execute is a release that did not start (7.7 step 5): the upgrade is blocked after the
+// short tries, not after the long waits that a node failure gets.
+func (m *Manager) fatalWhy() string {
+	if m.rbBroken {
+		return "start"
+	}
+	return "ctl"
 }
 
 // carryRunning renders the fragment that a config runs now, for the new slot, when
@@ -407,7 +427,11 @@ func (m *Manager) carryRunning(ctx context.Context, version string, tbl xraysche
 		return runRec{}, false, false
 	}
 	if err := m.testConfig(ctx, version, cfg); err != nil {
-		return runRec{}, false, !binaryRefused(err)
+		fatal = !binaryRefused(err)
+		if fatal {
+			m.noteBroken(version, err)
+		}
+		return runRec{}, false, fatal
 	}
 	return rec, true, false
 }

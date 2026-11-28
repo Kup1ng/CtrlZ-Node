@@ -74,6 +74,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 		if _, ok := m.wanted[id]; !ok && m.running(id) == nil {
 			delete(m.status, id)
 			delete(m.st.Crashed, id)
+			delete(m.st.Restore, id)
 			m.deleteGood(id)
 		}
 	}
@@ -522,7 +523,7 @@ func (m *Manager) removeConfigKeeping(ctx context.Context, id string, keepGood b
 	delete(m.status, id)
 	delete(m.hl, id)
 	delete(m.nextPr, id)
-	delete(m.untested, id)
+	delete(m.st.Restore, id)
 	if !keepGood {
 		m.deleteGood(id)
 	}
@@ -770,13 +771,15 @@ func (m *Manager) putBack(ctx context.Context) bool {
 					next = append(next, rr)
 					m.setStatus(r.ID, kLastGood, why, wantedHash)
 				case restoreNoVerdict:
-					// The ctl did not judge it: the good fragment stays in the slot, which is
-					// what the third end promises, and is tested again until the ctl answers
-					// (B5 r2-1). Leaving the config out would strand it, as reconcile never
-					// applies a crash-marked hash.
-					next = append(next, rr)
-					m.untested[r.ID] = rr.Hash
-					m.setStatus(r.ID, kLastGood, why, wantedHash)
+					// The ctl did not judge it, so the binary is not handed it: a good file
+					// can be older than the release now installed, and a fragment it refuses
+					// would fail the start and take every location of the node down (B5
+					// r1-1, r1-4). The config stays out of the slot file, owed a test in
+					// state.json: retestRestored puts it back after a verdict of the binary,
+					// also after a restart of the agent. Reconcile never applies a
+					// crash-marked hash, so it would not do it.
+					m.st.Restore[r.ID] = rr.Hash
+					m.setStatus(r.ID, kPending, why, wantedHash)
 				}
 				continue
 			}
@@ -899,7 +902,10 @@ func (m *Manager) onStartFail(ctx context.Context) {
 		case restoreRefused:
 			continue
 		case restoreNoVerdict:
-			m.untested[r.ID] = rr.Hash
+			// Left out of the file until the binary has judged it (B5 r1-1, r1-4).
+			m.st.Restore[r.ID] = rr.Hash
+			m.setStatus(r.ID, kPending, "crashed", r.Hash)
+			continue
 		}
 		next = append(next, rr)
 	}
@@ -941,31 +947,71 @@ func (m *Manager) testRestored(ctx context.Context, r runRec, hash string) resto
 	return restoreRefused
 }
 
-// retestRestored asks again for the fragments that run from good/ with no verdict yet. A
-// binary that refuses one now takes the config out, keeping its crash mark and the text.
+// retestRestored asks again for the good fragments that wait for a verdict of the binary
+// (st.Restore). One that the binary accepts goes back into the slot file and the slot is
+// started again; one that it refuses is dropped with the text; a ctl that still gives no
+// verdict stops the pass, since the other fragments would get the same answer and each would
+// hold the loop for the ctl's whole timeout (B5 r1-6).
 func (m *Manager) retestRestored(ctx context.Context) {
-	for id, hash := range m.untested {
-		r := m.running(id)
-		if r == nil || r.Hash != hash {
-			delete(m.untested, id)
+	ids := make([]string, 0, len(m.st.Restore))
+	for id := range m.st.Restore {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		hash, owed := m.st.Restore[id]
+		if !owed {
 			continue
 		}
-		wanted := hash
-		if c := m.wanted[id]; c != nil {
-			wanted = c.hash
+		if i > 0 {
+			// A pass that did tests takes long: an end, a hang or a drain must not wait for
+			// all of it, the same as between two configs of a reconcile.
+			m.between(ctx)
 		}
-		switch m.testRestored(ctx, *r, wanted) {
-		case restoreOK:
-			delete(m.untested, id)
-		case restoreRefused:
-			delete(m.untested, id)
-			mark, st := m.st.Crashed[id], m.status[id]
-			m.removeConfig(ctx, id)
-			if mark != "" {
-				m.st.Crashed[id] = mark
-			}
-			m.status[id] = st
+		if m.guardLost() {
+			return
+		}
+		g, ok := m.readGood(id)
+		c := m.wanted[id]
+		if c == nil || !ok || g.Hash != hash || m.running(id) != nil {
+			// Removed, edited into another fragment that reconcile judges, or already put
+			// back by another path: nothing is owed any more.
+			delete(m.st.Restore, id)
 			_ = m.saveState()
+			continue
+		}
+		port := m.freePort()
+		if port == 0 {
+			return // no port for it; reconcile's own add refuses the same way
+		}
+		rr, refusal := m.restoreGood(runRec{ID: id, Gen: m.st.Gens[id] + 1, Port: port}, g)
+		if refusal != "" {
+			delete(m.st.Restore, id)
+			m.dropRefusedGood(id, refusal)
+			m.setStatus(id, kRefused, refusal, c.hash)
+			_ = m.saveState()
+			continue
+		}
+		switch m.testRestored(ctx, rr, c.hash) {
+		case restoreNoVerdict:
+			return
+		case restoreRefused:
+			delete(m.st.Restore, id)
+			_ = m.saveState()
+		case restoreOK:
+			delete(m.st.Restore, id)
+			why := "crashed"
+			if s := m.status[id]; s != nil && s.hash == c.hash && s.kind == kRefused && s.err != "" {
+				why = s.err
+			}
+			m.st.Running = append(m.st.Running, rr)
+			m.st.Gens[id] = rr.Gen
+			if m.hl[id] == nil {
+				m.hl[id] = &health{}
+			}
+			m.nextPr[id] = m.opt.Now().Add(m.spread(id))
+			m.setStatus(id, kLastGood, why, c.hash)
+			m.rewriteAndRestart(ctx)
 		}
 	}
 }

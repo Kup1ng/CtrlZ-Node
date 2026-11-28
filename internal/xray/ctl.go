@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
+	"github.com/Kup1ng/CtrlZ-Node/internal/xrayrun"
 )
 
 // Ctl is the manager's way to the Xray binary: one operation at a time through
@@ -66,10 +67,24 @@ func (s *SockCtl) Do(ctx context.Context, r sock.CtlRun) error {
 }
 
 // binaryRefused is a judgment of the Xray binary: it ran and exited with its own non-zero
-// status. xrayctl answers exit -1 for a timeout, a binary that did not run, a release the
-// allow file does not name and a cancelled call, and none of those says anything about the
-// fragment, so they are no verdict and nothing may be refused or deleted on them (B5 r2-4).
+// status. xrayctl answers a status below 0 for a timeout, a binary that did not run, a
+// child a signal ended, a release the allow file does not name and a cancelled call, and
+// none of those says anything about the fragment on its own, so nothing may be refused or
+// deleted on one of them (B5 r2-4). The two that can be the fragment's doing, a timeout and
+// a signal, are counted by stallVerdict and become a verdict when they repeat.
 func binaryRefused(err error) bool {
 	var ce *CtlError
 	return asCtl(err, &ce) && ce.Exit > 0
+}
+
+// stalled is a child that ran past its limit or that a signal ended.
+func stalled(err error) bool {
+	var ce *CtlError
+	return asCtl(err, &ce) && (ce.Exit == xrayrun.CtlTimeout || ce.Exit == xrayrun.CtlSignal)
+}
+
+// binaryMissing is a binary that could not be executed at all.
+func binaryMissing(err error) bool {
+	var ce *CtlError
+	return asCtl(err, &ce) && ce.Exit == xrayrun.CtlNoRun
 }

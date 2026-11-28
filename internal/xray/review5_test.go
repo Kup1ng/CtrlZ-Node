@@ -8,15 +8,17 @@ import (
 	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
+	"github.com/Kup1ng/CtrlZ-Node/internal/xrayrun"
 )
 
 // ctlNoVerdict are the answers of a ctl that judged nothing about a fragment: no answer at
-// all, and the exit -1 that xrayctl gives for a timeout, a release its allow file does not
-// name and a binary that did not run (B5 r2-4).
+// all, a release its allow file does not name and a binary that did not run (B5 r2-4). A
+// timeout and a signal are left out: they count towards a verdict when they repeat, and have
+// their own tests (review6_test.go).
 var ctlNoVerdict = map[string]error{
-	"no answer": errors.New("xray: ctl.sock does not answer"),
-	"timeout":   &CtlError{Exit: -1, Text: "timeout"},
-	"not run":   &CtlError{Exit: -1, Text: "the binary did not run"},
+	"no answer":   errors.New("xray: ctl.sock does not answer"),
+	"not allowed": &CtlError{Exit: xrayrun.CtlNotJudged, Text: "release is not allowed"},
+	"not run":     &CtlError{Exit: xrayrun.CtlNoRun, Text: "the binary did not run"},
 }
 
 func (r *rig) setTestAnswer(f func() error) {
@@ -49,45 +51,6 @@ func editedConfigRunning(t *testing.T, r *rig) {
 	})
 }
 
-// B5-r2-1, r2-3, r2-4: when the ctl gives no verdict on the good fragment at the third
-// end, the fragment stays in the slot and the good file is not touched. It is tested
-// again, and the binary's own refusal later takes it out.
-func TestThirdEndKeepsTheGoodFragmentWhenTheCtlDoesNotJudge(t *testing.T) {
-	for name, noVerdict := range ctlNoVerdict {
-		t.Run(name, func(t *testing.T) {
-			r := newRig(t, func(tm *Timing) { tm.QuietHour = 700 * time.Millisecond })
-			editedConfigRunning(t, r)
-			good, _ := r.good(hexID(1))
-			r.setTestAnswer(func() error { return noVerdict })
-			for i := 0; i < 3; i++ {
-				time.Sleep(60 * time.Millisecond)
-				r.units.crash("a", "signal", 0)
-			}
-			r.eventually("the good fragment runs, last_good", func() bool {
-				x := r.runningRec(hexID(1))
-				k, _ := r.stateOf(1)
-				return x != nil && x.Hash == good.Hash && k == kLastGood
-			})
-			if _, ok := r.good(hexID(1)); !ok {
-				t.Fatal("the good file was deleted without a verdict")
-			}
-			if !strings.Contains(r.slotJSON("a"), hexID(1)) {
-				t.Error("the slot file lost the config")
-			}
-			// The ctl answers with the binary's refusal: now the config goes.
-			r.setTestAnswer(func() error { return &CtlError{Exit: 23, Text: "failed to load config: old spelling"} })
-			r.waitState(1, kRefused)
-			if _, e := r.stateOf(1); !strings.Contains(e, "old spelling") {
-				t.Errorf("error %q does not carry the test's text", e)
-			}
-			r.eventually("the config is out and its good file gone", func() bool {
-				_, ok := r.good(hexID(1))
-				return !ok && r.runningRec(hexID(1)) == nil && !strings.Contains(r.slotJSON("a"), hexID(1))
-			})
-		})
-	}
-}
-
 // B5-r2-2: two failed starts in 10 s write the config again from good/, each fragment
 // tested alone first: a refusal takes it out, no verdict keeps it and the good file.
 func TestStartFailRestoreIsTested(t *testing.T) {
@@ -115,13 +78,20 @@ func TestStartFailRestoreIsTested(t *testing.T) {
 			good, _ := r.good(hexID(1))
 			r.setTestAnswer(func() error { return noVerdict })
 			failTwice(r)
-			r.eventually("the good fragment runs", func() bool {
-				x := r.runningRec(hexID(1))
-				return x != nil && x.Hash == good.Hash
+			r.eventually("the config is out of the slot and owed a test", func() bool {
+				return r.runningRec(hexID(1)) == nil && r.persisted().Restore[hexID(1)] == good.Hash
 			})
 			if _, ok := r.good(hexID(1)); !ok {
 				t.Error("the good file was deleted without a verdict")
 			}
+			if strings.Contains(r.slotJSON("a"), hexID(1)) {
+				t.Error("the slot file holds a fragment that no test judged")
+			}
+			r.setTestAnswer(nil)
+			r.eventually("the tested good fragment runs", func() bool {
+				x := r.runningRec(hexID(1))
+				return x != nil && x.Hash == good.Hash
+			})
 		})
 	}
 }
@@ -130,7 +100,7 @@ func TestStartFailRestoreIsTested(t *testing.T) {
 // fragment; the config stays pending and is applied once the ctl answers.
 func TestTimeoutOfTheTestIsNotARefusal(t *testing.T) {
 	r := newRig(t, nil)
-	r.setTestAnswer(func() error { return &CtlError{Exit: -1, Text: "timeout"} })
+	r.setTestAnswer(func() error { return &CtlError{Exit: xrayrun.CtlNotJudged, Text: "cancelled"} })
 	r.start()
 	r.config(xc(1, 7, 1, vless("198.51.100.7")))
 	r.waitState(1, kPending)

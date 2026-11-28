@@ -175,3 +175,23 @@ func TestHubAddrsSurviveALongDowntime(t *testing.T) {
 		t.Errorf("the downtime aged the address: %v", h2.seen[kept])
 	}
 }
+
+// B5-r1-7: an entry saved while the clock was far ahead must not make every real address
+// look stale, and must not stay for ever.
+func TestHubAddrsIgnoreAFutureStamp(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "hub.json")
+	real, odd := netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("198.51.100.9")
+	h1 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h1.merge([]netip.Addr{real, odd})
+	h1.seen[real] = time.Now().Add(-2 * time.Hour)
+	h1.seen[odd] = time.Now().Add(400 * 24 * time.Hour)
+	h1.save()
+	h2 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h2.load()
+	if !slices.Contains(h2.got, real) {
+		t.Fatalf("the real address was dropped: %v", h2.got)
+	}
+	if h2.seen[odd].After(time.Now().Add(time.Minute)) {
+		t.Errorf("the future stamp stayed: %v", h2.seen[odd])
+	}
+}
