@@ -101,7 +101,17 @@ func (m *Manager) reconcile(ctx context.Context) {
 			continue
 		}
 		if r := m.running(id); r != nil && r.Hash == c.hash {
-			if s := m.status[id]; s == nil || s.hash != c.hash || s.kind != kApplied {
+			if accKey(r.Accepted) != c.acc && !m.acceptNewList(r, c) {
+				// The admin changed the accepted list of the fragment that runs, and the
+				// list no longer makes it valid: it is judged like an edit, and the running
+				// generation stays as last_good (B5 r3-3).
+				if !m.waitsForAdmin(c) {
+					m.between(ctx)
+					m.applyOne(ctx, c)
+				}
+				continue
+			}
+			if s := m.status[id]; s == nil || s.hash != c.hash || s.acc != c.acc || s.kind != kApplied {
 				m.setStatus(id, kApplied, "", c.hash)
 			}
 			continue
@@ -138,7 +148,7 @@ func (m *Manager) retryDelay() time.Duration { return 10 * m.t.Tick }
 // marked to be tried again (rbFail).
 func (m *Manager) waitsForAdmin(c *cfgRec) bool {
 	s := m.status[c.hex]
-	if s == nil || s.hash != c.hash || (s.kind != kRefused && s.kind != kLastGood) {
+	if s == nil || s.hash != c.hash || s.acc != c.acc || (s.kind != kRefused && s.kind != kLastGood) {
 		return false
 	}
 	return s.retryAt.IsZero() || m.opt.Now().Before(s.retryAt)
@@ -740,14 +750,20 @@ func (m *Manager) putBack(ctx context.Context) bool {
 		if c := m.wanted[r.ID]; c != nil {
 			wantedHash = c.hash
 		}
+		why := "crashed"
 		if ok {
-			r.Hash, r.Frag, r.Location, r.Priority, r.Stateful = g.Hash, g.Frag, g.Location, g.Priority, g.Stateful
-			r.Outs = len(outboundsOf(g.Frag))
-			next = append(next, r)
-			m.setStatus(r.ID, kLastGood, "crashed", wantedHash)
-		} else {
-			m.setStatus(r.ID, kRefused, "crashed", wantedHash)
+			// The good fragment is judged again with its own accepted list: a table tightened
+			// since it was written leaves the config with no good fragment (B5 r3-7).
+			if rr, refusal := m.restoreGood(r, g); refusal == "" {
+				next = append(next, rr)
+				m.setStatus(r.ID, kLastGood, why, wantedHash)
+				continue
+			} else {
+				why = refusal
+				m.deleteGood(r.ID)
+			}
 		}
+		m.setStatus(r.ID, kRefused, why, wantedHash)
 	}
 	if !changed {
 		return false
@@ -853,8 +869,13 @@ func (m *Manager) onStartFail(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		r.Hash, r.Frag, r.Location, r.Priority, r.Stateful = g.Hash, g.Frag, g.Location, g.Priority, g.Stateful
-		r.Outs = len(outboundsOf(g.Frag))
+		rr, refusal := m.restoreGood(r, g)
+		if refusal != "" {
+			m.deleteGood(r.ID)
+			m.setStatus(r.ID, kRefused, refusal, r.Hash)
+			continue
+		}
+		r = rr
 		if cfg, err := slotConfig(m.base(m.st.Slot), []runRec{r}); err != nil || m.testConfig(ctx, m.version, cfg) != nil {
 			continue
 		}
@@ -897,7 +918,7 @@ func (m *Manager) quiet(ctx context.Context) {
 		m.queueReconcile()
 	}
 	for _, r := range m.st.Running {
-		if g, ok := m.readGood(r.ID); !ok || g.Hash != r.Hash {
+		if g, ok := m.readGood(r.ID); !ok || g.Hash != r.Hash || accKey(g.Accepted) != accKey(r.Accepted) {
 			m.writeGood(r)
 		}
 	}
@@ -979,4 +1000,38 @@ func (m *Manager) onProbe(r probeResult) {
 		m.hl[r.id] = h
 	}
 	h.observe(r.ok, r.lat)
+}
+
+// acceptNewList takes the admin's new accepted list for the fragment that runs, when the
+// allow list still passes the fragment with it. The process is untouched: the list is no
+// part of what Xray runs, only of what the agent lets in (B5 r3-3).
+func (m *Manager) acceptNewList(r *runRec, c *cfgRec) bool {
+	tbl, known := m.table()
+	if !known {
+		return false
+	}
+	if res := tbl.Check(r.Frag, c.Accepted); !res.OK() {
+		return false
+	}
+	r.Accepted = append([]string(nil), c.Accepted...)
+	return true
+}
+
+// restoreGood puts a config's good/ fragment into its running record, judged again by
+// the allow list this agent ships with and by the accepted list stored with it. A
+// fragment the table refuses now is not restored, so no path of the manager runs a
+// fragment that xrayschema has not accepted (B5 r3-2, r3-7). why says what refused it.
+func (m *Manager) restoreGood(r runRec, g goodRec) (runRec, string) {
+	frag := g.Frag
+	if tbl, known := m.table(); known {
+		res := tbl.Check(g.Frag, g.Accepted)
+		if !res.OK() {
+			return r, "the last good fragment is refused by the allow list now: " + issueText(res)
+		}
+		frag = res.Normalized
+	}
+	r.Hash, r.Frag, r.Location, r.Priority, r.Stateful = g.Hash, frag, g.Location, g.Priority, g.Stateful
+	r.Accepted = append([]string(nil), g.Accepted...)
+	r.Outs = len(outboundsOf(frag))
+	return r, ""
 }

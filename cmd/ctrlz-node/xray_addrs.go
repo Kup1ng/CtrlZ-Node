@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -23,7 +27,7 @@ import (
 // a lookup and reads one small file; a change of the list is a change of the base and
 // rebuilds the idle slot (7.5 step 5).
 func xrayNodeAddrs(cfg *agent.Config) func() []netip.Addr {
-	hub := &hubAddrs{ac: cfg.Conf, lookup: lookupHub(identifiedUnbound), alert: cfg.Alert}
+	hub := &hubAddrs{ac: cfg.Conf, lookup: lookupHub(identifiedUnbound), alert: cfg.Alert, file: filepath.Join(cfg.Root, hubAddrsFile)}
 	hub.prime()
 	return func() []netip.Addr {
 		var out []netip.Addr
@@ -66,11 +70,18 @@ type hubAddrs struct {
 	capped   bool
 	at       time.Time
 	fetching bool
+	// file keeps the list across restarts of the agent (B5 r3-6); empty in tests that need none.
+	file  string
+	saved []netip.Addr
 }
 
 const (
 	hubRefresh = 5 * time.Minute
 	hubMax     = 32
+	// hubRetry is the wait between two lookups while the list is still empty: at a node boot
+	// Unbound may not answer for a while, and until it does the panel is not blocked (B5 r3-6).
+	hubRetry     = 10 * time.Second
+	hubAddrsFile = "xray-hub-addrs.json"
 	// hubStale is how long an address may go unanswered before it makes room: a list that
 	// only grew would freeze at the bound and miss the panel's next address (B5 r2-10).
 	hubStale = 24 * time.Hour
@@ -109,8 +120,9 @@ func (h *hubAddrs) merge(as []netip.Addr) {
 	}
 }
 
-// prime asks once, at the start, so that the first list is the one the running slots
-// were rendered with and a restart of the agent rebuilds nothing.
+// prime seeds the list from the file of the last run, then asks once, so that the first
+// list is the one the running slots were rendered with and a restart of the agent
+// rebuilds nothing. An empty answer (Unbound not up yet at a boot) leaves the seed.
 func (h *hubAddrs) prime() {
 	if len(h.ac.Panel()) > 0 {
 		return
@@ -118,9 +130,42 @@ func (h *hubAddrs) prime() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.load()
 	h.merge(h.lookup(ctx, h.ac.HubHost()))
+	h.save()
 	h.at = time.Now()
-	h.mu.Unlock()
+}
+
+// load reads the list of the last run. Its addresses count as just answered.
+func (h *hubAddrs) load() {
+	if h.file == "" {
+		return
+	}
+	b, err := os.ReadFile(h.file)
+	if err != nil {
+		return
+	}
+	var as []netip.Addr
+	if json.Unmarshal(b, &as) != nil {
+		return
+	}
+	h.merge(as)
+}
+
+// save writes the list when it changed. It holds panel addresses only, no secret.
+func (h *hubAddrs) save() {
+	if h.file == "" || slices.Equal(h.got, h.saved) {
+		return
+	}
+	b, err := json.Marshal(h.got)
+	if err != nil {
+		return
+	}
+	tmp := h.file + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil && os.Rename(tmp, h.file) == nil {
+		h.saved = slices.Clone(h.got)
+	}
 }
 
 func (h *hubAddrs) get() []netip.Addr {
@@ -129,7 +174,11 @@ func (h *hubAddrs) get() []netip.Addr {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.fetching && (h.at.IsZero() || time.Since(h.at) > hubRefresh) {
+	every := hubRefresh
+	if len(h.got) == 0 {
+		every = hubRetry
+	}
+	if !h.fetching && (h.at.IsZero() || time.Since(h.at) > every) {
 		h.fetching = true
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -137,6 +186,7 @@ func (h *hubAddrs) get() []netip.Addr {
 			as := h.lookup(ctx, h.ac.HubHost())
 			h.mu.Lock()
 			h.merge(as)
+			h.save()
 			h.at, h.fetching = time.Now(), false
 			h.mu.Unlock()
 		}()
@@ -144,7 +194,11 @@ func (h *hubAddrs) get() []netip.Addr {
 	return append([]netip.Addr(nil), h.got...)
 }
 
-// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6.
+// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6, and then the
+// host's own resolver, which is the one the agent dials and nft allows the panel through
+// (internal/agent/system.go): a name that only the host knows (hosts file, internal
+// zone) must be in the block list too. Both only add addresses to block, and the bound
+// of hubMax keeps either from growing the list; Unbound's answers come first.
 func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Addr {
 	v4, v6 := xray.UnboundResolver(unbound), xray.UnboundResolver6(unbound)
 	return func(ctx context.Context, host string) []netip.Addr {
@@ -152,6 +206,11 @@ func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Ad
 		for _, f := range []func(context.Context, string) ([]netip.Addr, error){v4, v6} {
 			if as, err := f(ctx, host); err == nil {
 				out = append(out, as...)
+			}
+		}
+		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host); err == nil {
+			for _, ip := range ips {
+				out = append(out, ip.Unmap())
 			}
 		}
 		return out

@@ -21,11 +21,12 @@ import (
 // hookUnits lets a test fail a start or a stop, or act at the moment a unit is read.
 type hookUnits struct {
 	*fakeUnits
-	startFail atomic.Bool // the start of slot b fails
-	stopFail  atomic.Bool // every stop fails
-	startsB   atomic.Int64
-	mu        sync.Mutex
-	onStatus  func(slot string)
+	startFail  atomic.Bool // the start of slot b fails
+	stopFail   atomic.Bool // every stop fails
+	statusFail atomic.Bool // every read of a unit fails
+	startsB    atomic.Int64
+	mu         sync.Mutex
+	onStatus   func(slot string)
 }
 
 func (u *hookUnits) Start(ctx context.Context, slot string) error {
@@ -46,6 +47,9 @@ func (u *hookUnits) Stop(ctx context.Context, slot string) error {
 }
 
 func (u *hookUnits) Status(ctx context.Context, slot string) (UnitStatus, error) {
+	if u.statusFail.Load() {
+		return UnitStatus{}, errors.New("systemd did not answer")
+	}
 	u.mu.Lock()
 	h := u.onStatus
 	u.mu.Unlock()

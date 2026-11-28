@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"net/netip"
+	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,5 +79,34 @@ func TestHubAddrsCapAlertsAndStaleAddressesMakeRoom(t *testing.T) {
 	h.merge([]netip.Addr{next})
 	if !slices.Contains(h.got, next) {
 		t.Errorf("the panel's new address is missing from %v", h.got)
+	}
+}
+
+// B5-r3-6: an empty answer at a node boot leaves the list of the last run, and an empty
+// list is asked for again soon, not after the long wait.
+func TestHubAddrsSurviveAnEmptyAnswerAtBootAndAreAskedAgainSoon(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "hub.json")
+	want := netip.MustParseAddr("198.51.100.9")
+	h1 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file,
+		lookup: func(context.Context, string) []netip.Addr { return []netip.Addr{want} }}
+	h1.prime()
+	var calls atomic.Int64
+	h2 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file,
+		lookup: func(context.Context, string) []netip.Addr { calls.Add(1); return nil }}
+	h2.prime() // Unbound is not up yet
+	if got := h2.get(); !slices.Equal(got, []netip.Addr{want}) {
+		t.Fatalf("the last run's list is gone after an empty answer: %v", got)
+	}
+	// With nothing known at all, the next ask comes after hubRetry, not hubRefresh.
+	h3 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, lookup: func(context.Context, string) []netip.Addr { calls.Add(1); return nil }}
+	h3.at = time.Now().Add(-2 * hubRetry)
+	before := calls.Load()
+	h3.get()
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls.Load() == before {
+		t.Error("an empty list was not asked for again after hubRetry")
 	}
 }

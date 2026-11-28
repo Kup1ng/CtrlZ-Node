@@ -80,6 +80,9 @@ type goodRec struct {
 	Location uint32 `json:"loc"`
 	Priority uint32 `json:"prio"`
 	Stateful bool   `json:"stateful,omitempty"`
+	// Accepted is the list the fragment was accepted with: a restored good fragment is judged
+	// by it and not by the list of the newer fragment that ended the process (B5 r3-2).
+	Accepted []string `json:"accepted,omitempty"`
 }
 
 // writeFile writes atomically: a temporary file in the directory, then a rename, so
@@ -184,7 +187,7 @@ func (m *Manager) readGood(id string) (goodRec, bool) {
 }
 
 func (m *Manager) writeGood(r runRec) {
-	b, _ := json.Marshal(goodRec{Hash: r.Hash, Frag: r.Frag, Location: r.Location, Priority: r.Priority, Stateful: r.Stateful})
+	b, _ := json.Marshal(goodRec{Hash: r.Hash, Frag: r.Frag, Location: r.Location, Priority: r.Priority, Stateful: r.Stateful, Accepted: r.Accepted})
 	_ = writeFile(m.goodPath(r.ID), b, 0o600)
 }
 

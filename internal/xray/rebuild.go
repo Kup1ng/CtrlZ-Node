@@ -300,10 +300,10 @@ func (m *Manager) runRebuild(ctx context.Context) {
 		m.rbDone(rb, false)
 		return
 	}
-	if healthy < need && rb.reason != rbAllSilent && rb.reason != rbBase {
-		// The new slot is no better: it is stopped and the old one stays (7.7 step 5). A base
-		// change alters no fragment, so it is not held to this comparison: one flapping exit
-		// must not keep the new address list out of the slot (R9, B5 r2-7).
+	if healthy < need && rb.reason != rbAllSilent && !m.changesNoFragment(rb, recs) {
+		// The new slot is no better: it is stopped and the old one stays (7.7 step 5). Only a
+		// request that changes no fragment is exempt (see changesNoFragment): one flapping
+		// exit must not keep the new address list out of the slot (R9, B5 r2-7).
 		m.abandonIdle(ctx, idle)
 		m.blockUpgrade(rb)
 		m.rbDone(rb, false)
@@ -311,6 +311,31 @@ func (m *Manager) runRebuild(ctx context.Context) {
 	}
 	m.switchTo(ctx, rb, idle, version, sig, recs, results)
 	m.rbDone(rb, true)
+}
+
+// changesNoFragment: a pure base rebuild (the node addresses changed) whose every config
+// goes in with the hash that runs now. Any other request, also a base change merged into
+// an upgrade, an add or a stuck remote, must still pass the healthy comparison, or a worse
+// new release or a failing new fragment would take the place of the old one (B5 r3-1, r3-5).
+func (m *Manager) changesNoFragment(rb *rebuildReq, recs []runRec) bool {
+	if rb.reason != rbBase || rb.isUpgrade() || rb.stuck || rb.allSilent {
+		return false
+	}
+	in := map[string]bool{}
+	for _, r := range recs {
+		old := m.running(r.ID)
+		if old == nil || old.Hash != r.Hash {
+			return false
+		}
+		in[r.ID] = true
+	}
+	for _, r := range m.st.Running {
+		// A running config that the new slot leaves out is a change too, unless it is gone.
+		if !in[r.ID] && m.wanted[r.ID] != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // renderForRebuild is the wanted fragment of a config as the new slot would run it.
@@ -326,9 +351,10 @@ func (m *Manager) renderForRebuild(ctx context.Context, rb *rebuildReq, version 
 		m.refuse(c, old, issueText(res))
 		return runRec{}, false, false
 	}
-	if m.waitsForAdmin(c) && !rb.isUpgrade() && rb.reason != rbBase {
+	if m.waitsForAdmin(c) && !rb.isUpgrade() {
 		// Refused by the binary for this very fragment (an API error): it stays out
-		// until it changes (step 5), though a new release or base gets another try.
+		// until it changes (step 5), though a new release gets another try. A base
+		// rebuild carries the running fragment instead (B5 r3-5).
 		return runRec{}, false, false
 	}
 	rec = runRec{ID: c.hex, Gen: m.st.Gens[c.hex] + 1, Port: port, Outs: len(outboundsOf(res.Normalized)), Hash: c.hash,
@@ -434,6 +460,15 @@ func (m *Manager) rbFail(rb *rebuildReq, why string) {
 			m.refuse(m.wanted[id], m.running(id), "the rebuild of the Xray slot failed: "+why)
 			m.status[id].retryAt = m.opt.Now().Add(wait)
 		}
+	}
+	if rb.isUpgrade() && why != "start" {
+		// The control socket or the slot files failed: nothing was judged about the new
+		// release. The candidate run id is consumed, so the request itself is kept and tried
+		// again after the long wait instead of being blocked (B5 r3-4).
+		rb.tries = 0
+		rb.retryAt = m.opt.Now().Add(wait)
+		m.retryIn(wait)
+		return
 	}
 	// An upgrade whose new release did not start is blocked, not dropped silently (7.7 step 5).
 	m.blockUpgrade(rb)

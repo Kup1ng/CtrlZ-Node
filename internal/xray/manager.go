@@ -96,6 +96,7 @@ type cfgRec struct {
 	Fragment []byte
 	Accepted []string
 	hash     string // sha256 of Fragment, hex
+	acc      string // accKey of Accepted: the list is part of what makes the fragment valid (B5 r3-3)
 }
 
 type snapshot struct {
@@ -111,6 +112,7 @@ type cfgStatus struct {
 	kind hubv1.XrayConfigStateKind
 	err  string
 	hash string // hash of the wanted fragment this status is about
+	acc  string // accKey of the accepted list it was judged with
 	// retryAt, when set, ends the wait for the admin: the refusal was a failure of the
 	// node (rbFail), not a verdict on the fragment.
 	retryAt time.Time
@@ -272,6 +274,7 @@ func (m *Manager) Config(nc *hubv1.NodeConfig) {
 			ID: append([]byte(nil), x.GetId()...), hex: idHex(x.GetId()), Location: x.GetLocation(),
 			Tag: x.GetTag(), Priority: x.GetPriority(), Fragment: frag,
 			Accepted: append([]string(nil), x.GetAcceptedUnknown()...), hash: hex.EncodeToString(sum[:]),
+			acc: accKey(x.GetAcceptedUnknown()),
 		})
 	}
 	m.mu.Lock()
@@ -552,7 +555,22 @@ func issueText(r xrayschema.Result) string {
 }
 
 func (m *Manager) setStatus(id string, kind hubv1.XrayConfigStateKind, err, hash string) {
-	m.status[id] = &cfgStatus{kind: kind, err: err, hash: hash}
+	s := &cfgStatus{kind: kind, err: err, hash: hash}
+	// The verdict is about the wanted fragment together with its accepted list.
+	if c := m.wanted[id]; c != nil && c.hash == hash {
+		s.acc = c.acc
+	}
+	m.status[id] = s
+}
+
+// accKey is the accepted_unknown list as one comparable string, in a fixed order.
+func accKey(acc []string) string {
+	if len(acc) == 0 {
+		return ""
+	}
+	s := append([]string(nil), acc...)
+	sort.Strings(s)
+	return strings.Join(s, "\x00")
 }
 
 // running finds a config in the active slot's running set.
@@ -756,7 +774,9 @@ func (m *Manager) enforceOff(ctx context.Context) {
 	failed := false
 	for _, slot := range []string{"a", "b"} {
 		st, err := m.opt.Units.Status(ctx, slot)
-		if err != nil || (!st.Active && !st.AutoRestart) {
+		// A slot whose state cannot be read is stopped anyway (stop is idempotent): skipping
+		// it would leave it serving without the nft rule and with no alert (B5 r3-8).
+		if err == nil && !st.Active && !st.AutoRestart {
 			continue
 		}
 		if m.opt.Units.Stop(ctx, slot) != nil {
