@@ -200,6 +200,12 @@ func (p *Part) Config(nc *hubv1.NodeConfig) {
 			}
 		}
 		cut = len(e) != 8
+		if cut {
+			// A node with no root neither asks nor uses keys (10.3): an ask still
+			// pending would age past MissingAfter and be reported as a fault the
+			// node was told it does not have.
+			clear(p.pend)
+		}
 	}
 	if hostsChanged {
 		// A key checked against the old names may not exclude a zone or panel host

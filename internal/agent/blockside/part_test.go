@@ -654,3 +654,19 @@ func TestBundleWithAnUnknownExtraUsageIsRefused(t *testing.T) {
 		t.Fatal("an intermediate with an extra usage was accepted")
 	}
 }
+
+// A pending ask does not outlive the root: a node told it has none must not report
+// a missing key (B6-r2-1).
+func TestEmptyEpochForgetsPendingAsks(t *testing.T) {
+	r := newRig(t)
+	r.connectBlock()
+	r.recv()
+	r.needKey(id16(1), id16(2))
+	eventually(t, func() bool { return len(r.sentMsgs()) == 1 })
+	r.advance(11 * time.Minute)
+	r.p.Config(&hubv1.NodeConfig{Zones: []string{"ctrl-z.org"}, PanelHostnames: []string{"panel.example"}})
+	r.p.check()
+	if r.faults.has(hubv1.NodeFault_NODE_FAULT_BLOCK_KEY_MISSING) {
+		t.Fatal("block_key_missing was reported for a node with no root")
+	}
+}

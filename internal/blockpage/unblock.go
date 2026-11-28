@@ -100,6 +100,26 @@ func (u *unblocker) admit(endpoint, source []byte) bool {
 	return true
 }
 
+// refund gives back the count that admit took for a request that could not be
+// relayed: the visitor was told to try again, so the try must not be spent. A
+// window that has turned since is left alone.
+func (u *unblocker) refund(endpoint, source []byte) {
+	var sk srcKey
+	copy(sk.endpoint[:], endpoint)
+	copy(sk.source[:], source)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.hour != u.now().Unix()/3600 {
+		return
+	}
+	if u.perSrc[sk] > 0 {
+		u.perSrc[sk]--
+	}
+	if u.perEP[sk.endpoint] > 0 {
+		u.perEP[sk.endpoint]--
+	}
+}
+
 // cleanMessage makes the visitor's text what the hub accepts: valid UTF-8, no
 // control character but a line break and a tab, at most 500 characters. It
 // reports false for text that is not UTF-8, which no browser sends.

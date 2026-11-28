@@ -236,8 +236,11 @@ const (
 	acceptWaitMax = time.Second
 )
 
-// send writes one frame and reports whether it went. A failed write ends the
-// connection; the reader then notices and the keys stop being used.
+// send writes one frame and reports whether it went. A failed write only closes the
+// connection and leaves it installed: the reader then fails its Read and its
+// detach is what ends the connection, so that the keys are dropped in the one
+// place every end goes through. Clearing l.conn here would make that detach a
+// no-op and the keys would outlive the link.
 func (l *agentLink) send(m *sock.BlockMsg) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -247,35 +250,47 @@ func (l *agentLink) send(m *sock.BlockMsg) bool {
 	_ = l.conn.SetWriteDeadline(time.Now().Add(agentWriteTimeout))
 	if err := sock.BlockCodec.Write(l.conn, m); err != nil {
 		_ = l.conn.Close()
-		l.conn = nil
 		return false
 	}
 	return true
 }
 
-// attach installs c and reports whether it replaced a live connection. The old
-// reader's detach then sees another conn and does not run keys.lost, so the caller
-// must: the new connection has sent no epoch yet.
-func (l *agentLink) attach(c net.Conn) (replaced bool) {
+// attach installs c. When it replaces a connection, lost runs under the same lock
+// that makes c current, so no frame of the old reader (apply checks the lock and
+// the connection) can land after it, and the new connection starts with no epoch.
+func (l *agentLink) attach(c net.Conn, lost func()) {
 	l.mu.Lock()
 	old := l.conn
 	l.conn = c
+	if old != nil {
+		lost()
+	}
 	l.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
 	}
-	return old != nil
 }
 
-// detach clears c if it is still the current connection and reports that it was.
-func (l *agentLink) detach(c net.Conn) bool {
+// detach ends c if it is still the current connection and runs lost under the
+// lock: a new attach cannot slip in between and then have its epoch wiped.
+func (l *agentLink) detach(c net.Conn, lost func()) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.conn != c {
-		return false
+		return
 	}
 	l.conn = nil
-	return true
+	lost()
+}
+
+// apply runs fn only while c is the current connection. Frames are applied under
+// the lock that attach and detach take, which orders them against a replacement.
+func (l *agentLink) apply(c net.Conn, fn func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn == c {
+		fn()
+	}
 }
 
 func (l *agentLink) close() {
@@ -292,9 +307,7 @@ func (l *agentLink) close() {
 // accept; every frame is checked for being one the agent may send, and a frame
 // that is not ends the connection (2.1).
 func (s *Server) ServeAgent(c net.Conn) {
-	if s.link.attach(c) {
-		s.keys.lost()
-	}
+	s.link.attach(c, s.keys.lost)
 	go func() {
 		defer func() { _ = c.Close() }()
 		for {
@@ -306,15 +319,15 @@ func (s *Server) ServeAgent(c net.Conn) {
 			case sock.BlockPage:
 				s.pages.deliver(m.Page.Hash, m.Page.Blob)
 			case sock.BlockEpoch:
-				s.keys.setEpoch(m.Epoch.Epoch)
+				s.link.apply(c, func() { s.keys.setEpoch(m.Epoch.Epoch) })
 			case sock.BlockIntermediate:
-				if err := s.keys.put(m.Intermediate); err != nil {
-					log.Printf("blockpage: an intermediate was refused: %v", err)
+				var perr error
+				s.link.apply(c, func() { perr = s.keys.put(m.Intermediate) })
+				if perr != nil {
+					log.Printf("blockpage: an intermediate was refused: %v", perr)
 				}
 			}
 		}
-		if s.link.detach(c) {
-			s.keys.lost()
-		}
+		s.link.detach(c, s.keys.lost)
 	}()
 }

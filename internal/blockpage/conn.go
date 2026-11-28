@@ -177,7 +177,9 @@ func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, htt
 		sent := s.link.send(&sock.BlockMsg{Type: sock.BlockUnblock, Unblock: &sock.UnblockMsg{
 			Endpoint: f.Endpoint, Profile: p.Profile, Name: f.Name, Message: msg, At: s.now().Unix()}})
 		if !sent {
-			// The agent is not there to take it: say so, the visitor may try again.
+			// The agent is not there to take it: say so, the visitor may try again,
+			// and the try is given back.
+			s.unb.refund(f.Endpoint, f.Source)
 			writeEmpty(w, http.StatusServiceUnavailable)
 			return
 		}
