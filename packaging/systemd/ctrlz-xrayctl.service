@@ -1,0 +1,53 @@
+# The Xray control process (p4b-proxy 7.5, 7.6): the one place that runs
+# `xray run -test` and `xray api` for the agent, as ctrlz-xray, because the binary also
+# parses what an admin pasted. It takes the fixed operations of 2.1 on ctl.sock and
+# never a path. It has the settings of a slot and sees no slot file: the test
+# therefore has the file and network rights of the real unit.
+[Unit]
+Description=Ctrl Z Xray control
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ctrlz-xray
+Group=ctrlz-xray
+ExecStart=/usr/local/bin/ctrlz-node xrayctl
+Restart=always
+RestartSec=2s
+LimitCORE=0
+MemoryMax=512M
+TasksMax=64
+OOMScoreAdjust=500
+Environment=GODEBUG=multipathtcp=0
+StandardOutput=null
+StandardError=null
+ReadWritePaths=/run/ctrlz-xrayctl
+InaccessiblePaths=/var/lib/ctrlz
+# /etc/ctrlz is an empty tmpfs but for the allow file (the dash: it does not exist
+# before the first upgrade of Xray): the version it may run is
+# named there (7.7), and no slot file is visible.
+TemporaryFileSystem=/etc/ctrlz:ro
+BindReadOnlyPaths=-/etc/ctrlz/versions/xray.allow
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
