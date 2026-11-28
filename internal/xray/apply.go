@@ -754,14 +754,18 @@ func (m *Manager) putBack(ctx context.Context) bool {
 		if ok {
 			// The good fragment is judged again with its own accepted list: a table tightened
 			// since it was written leaves the config with no good fragment (B5 r3-7).
-			if rr, refusal := m.restoreGood(r, g); refusal == "" {
-				next = append(next, rr)
-				m.setStatus(r.ID, kLastGood, why, wantedHash)
+			rr, refusal := m.restoreGood(r, g)
+			if refusal == "" {
+				// The restored fragment is tested by the binary that will run it: a good file
+				// can be older than the release now installed (B5 r1-2).
+				if m.testRestored(ctx, rr, wantedHash) {
+					next = append(next, rr)
+					m.setStatus(r.ID, kLastGood, why, wantedHash)
+				}
 				continue
-			} else {
-				why = refusal
-				m.deleteGood(r.ID)
 			}
+			why = refusal
+			m.deleteGood(r.ID)
 		}
 		m.setStatus(r.ID, kRefused, why, wantedHash)
 	}
@@ -875,14 +879,37 @@ func (m *Manager) onStartFail(ctx context.Context) {
 			m.setStatus(r.ID, kRefused, refusal, r.Hash)
 			continue
 		}
-		r = rr
-		if cfg, err := slotConfig(m.base(m.st.Slot), []runRec{r}); err != nil || m.testConfig(ctx, m.version, cfg) != nil {
+		if !m.testRestored(ctx, rr, r.Hash) {
 			continue
 		}
-		next = append(next, r)
+		next = append(next, rr)
 	}
 	m.st.Running = next
 	m.rewriteAndRestart(ctx)
+}
+
+// testRestored runs `-test` on a fragment restored from good/ alone, as every other path
+// that puts a fragment into a slot file does. A refusal by the binary leaves the config
+// out with the test's text and drops the good file, which that release cannot run; a ctl
+// that does not answer judged nothing, so the config stays pending and is tried again.
+func (m *Manager) testRestored(ctx context.Context, r runRec, hash string) bool {
+	cfg, err := slotConfig(m.base(m.st.Slot), []runRec{r})
+	if err != nil {
+		m.setStatus(r.ID, kRefused, "the fragment could not be rendered", hash)
+		return false
+	}
+	err = m.testConfig(ctx, m.version, cfg)
+	if err == nil {
+		return true
+	}
+	if _, isExit := err.(*CtlError); !isExit {
+		m.setStatus(r.ID, kPending, "", hash)
+		m.retryIn(m.retryDelay())
+		return false
+	}
+	m.deleteGood(r.ID)
+	m.setStatus(r.ID, kRefused, errText(err, r.Frag), hash)
+	return false
 }
 
 func (m *Manager) setEndsDown(on bool) { m.setDown(&m.downEndsB, on) }
@@ -1022,14 +1049,17 @@ func (m *Manager) acceptNewList(r *runRec, c *cfgRec) bool {
 // fragment the table refuses now is not restored, so no path of the manager runs a
 // fragment that xrayschema has not accepted (B5 r3-2, r3-7). why says what refused it.
 func (m *Manager) restoreGood(r runRec, g goodRec) (runRec, string) {
-	frag := g.Frag
-	if tbl, known := m.table(); known {
-		res := tbl.Check(g.Frag, g.Accepted)
-		if !res.OK() {
-			return r, "the last good fragment is refused by the allow list now: " + issueText(res)
-		}
-		frag = res.Normalized
+	// With no allow list for the running release nothing is restored, as applyOne refuses
+	// every config then: a stored fragment is no way around the table (B5 r1-9).
+	tbl, known := m.table()
+	if !known {
+		return r, "this release has no allow list in the agent"
 	}
+	res := tbl.Check(g.Frag, g.Accepted)
+	if !res.OK() {
+		return r, "the last good fragment is refused by the allow list now: " + issueText(res)
+	}
+	frag := res.Normalized
 	r.Hash, r.Frag, r.Location, r.Priority, r.Stateful = g.Hash, frag, g.Location, g.Priority, g.Stateful
 	r.Accepted = append([]string(nil), g.Accepted...)
 	r.Outs = len(outboundsOf(frag))

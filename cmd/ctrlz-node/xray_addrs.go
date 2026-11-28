@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -71,8 +72,7 @@ type hubAddrs struct {
 	at       time.Time
 	fetching bool
 	// file keeps the list across restarts of the agent (B5 r3-6); empty in tests that need none.
-	file  string
-	saved []netip.Addr
+	file string
 }
 
 const (
@@ -91,8 +91,9 @@ const (
 // must not change the list, because a change of it rebuilds the idle slot, so an
 // address stays until it has not been answered for hubStale. The list is bounded, and a
 // full list says so with an alert instead of dropping addresses without a word. The
-// answers come from the identified Unbound only (lookupHub), never from the host's
-// plain resolver, which a network attacker could fill with addresses of its choice.
+// answers come from the identified Unbound, or from the hosts file when it answers
+// nothing (lookupHub), never from the host's plain resolver, which a network attacker could
+// fill with addresses of its choice.
 func (h *hubAddrs) merge(as []netip.Addr) {
 	if len(as) == 0 {
 		return
@@ -137,7 +138,16 @@ func (h *hubAddrs) prime() {
 	h.at = time.Now()
 }
 
-// load reads the list of the last run. Its addresses count as just answered.
+// hubEntry is one stored address with the time it was last answered. The time is kept
+// so that a restart does not make an address young again: a forged address that a
+// restart reloaded as fresh would never reach the hubStale eviction (B5 r1-7).
+type hubEntry struct {
+	Addr netip.Addr `json:"addr"`
+	Seen int64      `json:"seen"` // unix seconds
+}
+
+// load reads the list of the last run with each address's own last-answer time. An
+// address that went unanswered for hubStale is not taken back.
 func (h *hubAddrs) load() {
 	if h.file == "" {
 		return
@@ -146,25 +156,41 @@ func (h *hubAddrs) load() {
 	if err != nil {
 		return
 	}
-	var as []netip.Addr
-	if json.Unmarshal(b, &as) != nil {
+	var es []hubEntry
+	if json.Unmarshal(b, &es) != nil {
 		return
 	}
-	h.merge(as)
+	if h.seen == nil {
+		h.seen = map[netip.Addr]time.Time{}
+	}
+	now := time.Now()
+	for _, e := range es {
+		t := time.Unix(e.Seen, 0)
+		if !e.Addr.IsValid() || now.Sub(t) > hubStale || len(h.got) >= hubMax || slices.Contains(h.got, e.Addr) {
+			continue
+		}
+		h.seen[e.Addr] = t
+		h.got = append(h.got, e.Addr)
+	}
 }
 
-// save writes the list when it changed. It holds panel addresses only, no secret.
+// save writes the list with its times. It holds panel addresses only, no secret. It is
+// written after every answer, because the times move even when the list does not.
 func (h *hubAddrs) save() {
-	if h.file == "" || slices.Equal(h.got, h.saved) {
+	if h.file == "" {
 		return
 	}
-	b, err := json.Marshal(h.got)
+	es := make([]hubEntry, 0, len(h.got))
+	for _, a := range h.got {
+		es = append(es, hubEntry{Addr: a, Seen: h.seen[a].Unix()})
+	}
+	b, err := json.Marshal(es)
 	if err != nil {
 		return
 	}
 	tmp := h.file + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil && os.Rename(tmp, h.file) == nil {
-		h.saved = slices.Clone(h.got)
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		_ = os.Rename(tmp, h.file)
 	}
 }
 
@@ -194,13 +220,25 @@ func (h *hubAddrs) get() []netip.Addr {
 	return append([]netip.Addr(nil), h.got...)
 }
 
-// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6, and then the
-// host's own resolver, which is the one the agent dials and nft allows the panel through
-// (internal/agent/system.go): a name that only the host knows (hosts file, internal
-// zone) must be in the block list too. Both only add addresses to block, and the bound
-// of hubMax keeps either from growing the list; Unbound's answers come first.
+// hostsOnlyResolver answers from the hosts file alone: its Dial never opens a socket, so
+// a name that the file does not hold fails at once instead of asking the plain resolver
+// of /etc/resolv.conf, whose answers a network attacker could forge (B5 r1-7).
+func hostsOnlyResolver() *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("no dns: hosts file only")
+		},
+	}
+}
+
+// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6. Only when it
+// answers nothing is the hosts file read, for a name that only the host knows: a file the
+// host's own admin writes is as trusted as agent.conf, which a DNS answer is not. The
+// host's plain resolver is never asked.
 func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Addr {
 	v4, v6 := xray.UnboundResolver(unbound), xray.UnboundResolver6(unbound)
+	hosts := hostsOnlyResolver()
 	return func(ctx context.Context, host string) []netip.Addr {
 		var out []netip.Addr
 		for _, f := range []func(context.Context, string) ([]netip.Addr, error){v4, v6} {
@@ -208,9 +246,11 @@ func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Ad
 				out = append(out, as...)
 			}
 		}
-		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host); err == nil {
-			for _, ip := range ips {
-				out = append(out, ip.Unmap())
+		if len(out) == 0 {
+			if ips, err := hosts.LookupNetIP(ctx, "ip", host); err == nil {
+				for _, ip := range ips {
+					out = append(out, ip.Unmap())
+				}
 			}
 		}
 		return out

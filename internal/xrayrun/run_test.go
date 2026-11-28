@@ -23,8 +23,9 @@ func (h *fakeHost) env() Env {
 			}
 			return nil, fs.ErrNotExist
 		},
-		Remove: func(p string) error { h.removed = append(h.removed, p); return h.rmErr },
-		Exec:   func(path string, argv []string) error { h.execArg = argv; return errors.New("test") },
+		Remove:  func(p string) error { h.removed = append(h.removed, p); return h.rmErr },
+		Exec:    func(path string, argv []string) error { h.execArg = argv; return errors.New("test") },
+		Geteuid: func() int { return 1001 },
 	}
 }
 
@@ -69,5 +70,24 @@ func TestRunStopsWhenAStaleFileCannotBeRemoved(t *testing.T) {
 	h := &fakeHost{files: map[string]string{"/e/xray/a.version": "v26.11.9", "/e/versions/xray.allow": "v26.11.9"}, rmErr: errors.New("busy")}
 	if Run([]string{"a"}, h.env()) == 0 || h.execArg != nil {
 		t.Fatal("exec after a failed removal")
+	}
+}
+
+// B5-r1-6: xray-run does not start Xray as root, whatever the unit file says.
+func TestRunRefusesToRunAsRoot(t *testing.T) {
+	h := &fakeHost{files: map[string]string{
+		"/e/xray/a.version":      "v26.11.9\n",
+		"/e/versions/xray.allow": "v26.11.9\n",
+	}}
+	env := h.env()
+	env.Geteuid = func() int { return 0 }
+	if got := Run([]string{"a"}, env); got != 1 {
+		t.Fatalf("status %d", got)
+	}
+	if h.execArg != nil || len(h.removed) != 0 {
+		t.Fatalf("root went on: exec %v removed %v", h.execArg, h.removed)
+	}
+	if RefuseRoot(0) == nil || RefuseRoot(1001) != nil {
+		t.Fatal("RefuseRoot must refuse uid 0 only")
 	}
 }

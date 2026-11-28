@@ -42,7 +42,11 @@ type rebuildReq struct {
 	version string
 	remote  string // for rbStuck
 	tries   int
-	retryAt time.Time
+	// longWaits counts the rounds of failures of the node itself (ctl, files, units) that an
+	// upgrade waited out; a bounded number of them ends in a blocked upgrade, the one signal
+	// the owner gets (7.7 step 5, B5 r1-8).
+	longWaits int
+	retryAt   time.Time
 	// stuck and allSilent say which latches of 5.5 this request holds, also when it was
 	// merged into a request of another reason.
 	stuck, allSilent bool
@@ -257,6 +261,15 @@ func (m *Manager) runRebuild(ctx context.Context) {
 	if m.guardLost() {
 		return // nothing is written: the slot file holds every credential
 	}
+	// The idle slot may still run an older rendering: a rebuild that an agent restart cut
+	// short leaves it up, and `systemctl start` does nothing for an active unit, so the
+	// probes below would greet the stale process and the switch would put it in charge
+	// (B5 r1-1). It is stopped, with its file, before the new file is written.
+	m.abandonIdle(ctx, idle)
+	if st, err := m.opt.Units.Status(ctx, idle); err != nil || st.Active {
+		m.rbFail(rb, "units")
+		return
+	}
 	if err := m.writeSlotFiles(idle, version, recs); err != nil {
 		m.rbFail(rb, "files")
 		return
@@ -402,7 +415,9 @@ func (m *Manager) carryRunning(ctx context.Context, version string, tbl xraysche
 
 // abandonIdle stops the idle slot and deletes its file, which holds credentials.
 func (m *Manager) abandonIdle(ctx context.Context, idle string) {
-	_ = m.opt.Units.Stop(ctx, idle)
+	// The stop must not depend on the loop's context: an agent that is stopping has a
+	// cancelled one, and the process would keep the credentials of the file in memory.
+	_ = m.opt.Units.Stop(context.WithoutCancel(ctx), idle)
 	m.dropSlotFile(idle)
 }
 
@@ -444,6 +459,9 @@ func (m *Manager) dropSlotFile(slot string) {
 	_ = os.Remove(m.opt.Layout.SlotVersion(slot))
 }
 
+// maxLongWaits is how many long waits an upgrade survives when the node itself fails.
+const maxLongWaits = 3
+
 // rbFail keeps the request and tries again later, three times; then the configs that
 // waited for it are refused with a plain text, and the admin sees it. The refusal is
 // the node's, not the fragment's, so it is tried again after a longer wait.
@@ -461,10 +479,13 @@ func (m *Manager) rbFail(rb *rebuildReq, why string) {
 			m.status[id].retryAt = m.opt.Now().Add(wait)
 		}
 	}
-	if rb.isUpgrade() && why != "start" {
+	if rb.isUpgrade() && why != "start" && rb.longWaits < maxLongWaits {
+		rb.longWaits++
 		// The control socket or the slot files failed: nothing was judged about the new
 		// release. The candidate run id is consumed, so the request itself is kept and tried
-		// again after the long wait instead of being blocked (B5 r3-4).
+		// again after the long wait instead of being blocked (B5 r3-4). After maxLongWaits
+		// rounds it is blocked with the alert, so a socket or a disk that stays broken shows
+		// (B5 r1-8).
 		rb.tries = 0
 		rb.retryAt = m.opt.Now().Add(wait)
 		m.retryIn(wait)
@@ -585,6 +606,14 @@ func (m *Manager) switchTo(ctx context.Context, rb *rebuildReq, idle, version, s
 			delete(m.hl, id)
 		}
 	}
+	// A config that kept its last_good status because a generation ran, but whose last
+	// fragment the new release refused as well, has nothing running now: it shows refused
+	// with the text, not a last good fragment that is not in use (B5 r1-3).
+	for _, id := range m.order {
+		if s := m.status[id]; s != nil && s.kind == kLastGood && m.running(id) == nil && !m.inSearch(id) {
+			m.setStatus(id, kRefused, s.err, s.hash)
+		}
+	}
 	if wg || rb.reason == rbAllSilent {
 		_ = m.opt.Units.Stop(ctx, oldSlot)
 		m.dropSlotFile(oldSlot)
@@ -678,6 +707,10 @@ func (m *Manager) recover(ctx context.Context) {
 	if m.st.Drain != nil {
 		m.endDrain(ctx)
 	}
+	// The other slot is recorded nowhere but as the drain: a rebuild that the stop of the
+	// agent cut short leaves its idle slot running with credentials, and the next rebuild
+	// must not meet it (B5 r1-1).
+	m.abandonIdle(ctx, otherSlot(m.st.Slot))
 	m.recheckRunning(ctx)
 	if !m.guardOn {
 		// The units are not tied to the agent: slots that outlived it keep serving, and

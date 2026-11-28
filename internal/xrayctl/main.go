@@ -18,6 +18,9 @@ const DefaultSock = "/run/ctrlz-xrayctl/ctl.sock"
 // runs the fixed operations until ctx ends. The unit runs it as ctrlz-xray with a
 // RuntimeDirectory, so the directory exists and belongs to that account.
 func Main(ctx context.Context, sockPath string) error {
+	if err := xrayrun.RefuseRoot(os.Geteuid()); err != nil {
+		return err
+	}
 	if sockPath == "" {
 		sockPath = DefaultSock
 	}

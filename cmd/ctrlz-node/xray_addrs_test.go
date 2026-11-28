@@ -110,3 +110,36 @@ func TestHubAddrsSurviveAnEmptyAnswerAtBootAndAreAskedAgainSoon(t *testing.T) {
 		t.Error("an empty list was not asked for again after hubRetry")
 	}
 }
+
+// B5-r1-7: the stored list keeps each address's own last-answer time, so a restart does
+// not make a forged address young again and the stale eviction can still reach it.
+func TestHubAddrsKeepTheirLastAnswerTimeAcrossARestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "hub.json")
+	old, fresh := netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("198.51.100.2")
+	h1 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h1.merge([]netip.Addr{old, fresh})
+	h1.seen[old] = time.Now().Add(-2 * hubStale)
+	h1.save()
+	h2 := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, file: file}
+	h2.load()
+	if !slices.Equal(h2.got, []netip.Addr{fresh}) {
+		t.Fatalf("an address that was stale before the restart came back: %v", h2.got)
+	}
+	if time.Since(h2.seen[fresh]) > time.Minute {
+		t.Errorf("a fresh address lost its time: %v", h2.seen[fresh])
+	}
+}
+
+// B5-r1-7: the hosts-file resolver never opens a socket, so a name the file does not
+// hold fails at once and no plain DNS answer can reach the block list.
+func TestHostsOnlyResolverNeverAsksDNS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if ips, err := hostsOnlyResolver().LookupNetIP(ctx, "ip", "no-such-name.ctrlz-test.invalid"); err == nil {
+		t.Fatalf("a name that is not in the hosts file resolved: %v", ips)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Error("the lookup waited on the network")
+	}
+}

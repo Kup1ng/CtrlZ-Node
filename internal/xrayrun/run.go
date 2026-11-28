@@ -17,6 +17,19 @@ type Env struct {
 	Remove   func(string) error
 	// Exec replaces the process. It returns only on failure.
 	Exec func(path string, argv []string) error
+	// Geteuid is the process's effective uid; nil reads the real one.
+	Geteuid func() int
+}
+
+// RefuseRoot is the guard of 7.5 that Xray never runs as another uid than ctrlz-xray:
+// the unit's User= is the one place that says so, and a unit file that loses the line, or
+// a test run by hand as root, would otherwise parse admin-pasted text or serve exits as
+// root. Root is the case that matters; the other accounts have no rights to lose.
+func RefuseRoot(euid int) error {
+	if euid == 0 {
+		return errors.New("refusing to run as root: this role runs as ctrlz-xray")
+	}
+	return nil
 }
 
 // OSEnv is the real host.
@@ -38,6 +51,14 @@ func Run(args []string, env Env) int {
 		return 2
 	}
 	slot := args[0]
+	euid := os.Geteuid
+	if env.Geteuid != nil {
+		euid = env.Geteuid
+	}
+	if err := RefuseRoot(euid()); err != nil {
+		fmt.Fprintln(os.Stderr, "xray-run:", err)
+		return 1
+	}
 	l := env.Layout
 	raw, err := env.ReadFile(l.SlotVersion(slot))
 	if err != nil {
