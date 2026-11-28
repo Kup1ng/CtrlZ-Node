@@ -8,10 +8,12 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"math/big"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -465,4 +467,190 @@ func TestNoHostDropsEverything(t *testing.T) {
 	p.needKey(id16(1), id16(2))
 	p.needPage(make([]byte, 32))
 	p.check()
+}
+
+// A NodeConfig that withdraws the root must stop ctrlz-block from signing: there
+// is no "none" epoch on the socket, so the session ends and the redial sends
+// nothing (B6-r1-1, r1-9).
+func TestEmptyEpochEndsTheSessionAndSendsNoKeys(t *testing.T) {
+	r := newRig(t)
+	if err := r.p.Bundle(newIssuer(t, "A").bundle(t, r.node, id16(2), epoch1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.connectBlock()
+	r.recv() // epoch
+	r.recv() // the key
+	r.p.Config(&hubv1.NodeConfig{Zones: []string{"ctrl-z.org"}, PanelHostnames: []string{"panel.example"}})
+	select {
+	case <-r.ended:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the session went on after the epoch became empty")
+	}
+	if len(r.p.keys) != 0 {
+		t.Fatal("the agent kept a key with no root")
+	}
+	// The redial: no epoch, no key; the first frame is the answer to an ask.
+	r.connectBlock()
+	_ = r.block.Send(&sock.BlockMsg{Type: sock.BlockNeedPage, NeedPage: &sock.NeedPage{Hash: make([]byte, 32)}})
+	if m := r.recv(); m.Type != sock.BlockPage {
+		t.Fatalf("the redial sent %+v first", m)
+	}
+}
+
+// A zone or panel host added later must be excluded by every held key; a key that
+// does not is dropped and the block process loses it with the session (B6-r1-10).
+func TestNewZoneDropsAKeyThatDoesNotExcludeIt(t *testing.T) {
+	r := newRig(t)
+	is := newIssuer(t, "A")
+	keepsAll := func(c *x509.Certificate) {
+		c.ExcludedDNSDomains = []string{"ctrl-z.org", "panel.example", "new.example"}
+	}
+	if err := r.p.Bundle(is.bundle(t, r.node, id16(2), epoch1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.p.Bundle(is.bundle(t, r.node, id16(3), epoch1, keepsAll)); err != nil {
+		t.Fatal(err)
+	}
+	r.connectBlock()
+	r.recv()
+	r.recv()
+	r.recv()
+	r.p.Config(&hubv1.NodeConfig{BlockRootEpoch: epoch1, Zones: []string{"ctrl-z.org", "new.example"}, PanelHostnames: []string{"panel.example"}})
+	select {
+	case <-r.ended:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the session went on with a key that leaves the new zone open")
+	}
+	r.p.mu.Lock()
+	_, a := r.p.keys[[16]byte(id16(2))]
+	_, b := r.p.keys[[16]byte(id16(3))]
+	r.p.mu.Unlock()
+	if a || !b {
+		t.Fatalf("keys held after the change: account 2 %v, account 3 %v (want false, true)", a, b)
+	}
+	// The redial carries the epoch and the one key that passes.
+	r.connectBlock()
+	if m := r.recv(); m.Type != sock.BlockEpoch {
+		t.Fatalf("%+v", m)
+	}
+	if m := r.recv(); m.Type != sock.BlockIntermediate || !bytes.Equal(m.Intermediate.Account, id16(3)) {
+		t.Fatalf("%+v", m)
+	}
+}
+
+// A key still good is not a missing key, however long the hub keeps silent about
+// its refresh; the clock starts when the key ends (B6-r1-3).
+func TestRefreshAskWithAGoodKeyIsNotMissing(t *testing.T) {
+	r := newRig(t)
+	r.connectBlock()
+	r.recv()
+	if err := r.p.Bundle(newIssuer(t, "A").bundle(t, r.node, id16(2), epoch1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	r.recv() // the key, pushed
+	r.advance(6 * 24 * time.Hour)
+	r.p.check()
+	r.needKey(id16(1), id16(2))
+	r.recv() // the key, answered from memory
+	eventually(t, func() bool { return len(r.sentMsgs()) == 1 })
+	r.advance(11 * time.Minute)
+	r.p.check()
+	if r.faults.has(hubv1.NodeFault_NODE_FAULT_BLOCK_KEY_MISSING) {
+		t.Fatal("the fault was set while a good key was held")
+	}
+	// A visitor keeps asking up to the end of the key (a need nobody repeats ages out).
+	r.advance(23*time.Hour + 19*time.Minute)
+	r.needKey(id16(1), id16(2))
+	r.recv()
+	eventually(t, func() bool { return len(r.sentMsgs()) == 2 })
+	r.p.check()
+	if r.faults.has(hubv1.NodeFault_NODE_FAULT_BLOCK_KEY_MISSING) {
+		t.Fatal("the fault was set an hour before the key ended")
+	}
+	r.advance(31 * time.Minute) // the key ended a minute ago
+	r.p.check()
+	if r.faults.has(hubv1.NodeFault_NODE_FAULT_BLOCK_KEY_MISSING) {
+		t.Fatal("the fault was set the moment the key ended")
+	}
+	r.advance(11 * time.Minute)
+	r.p.check()
+	if !r.faults.has(hubv1.NodeFault_NODE_FAULT_BLOCK_KEY_MISSING) {
+		t.Fatal("no fault ten minutes after the key ended with no new one")
+	}
+}
+
+// ctrlz-block that closes every connection at once is not redialled in a loop
+// (B6-r1-2).
+func TestRedialIsPacedAfterASessionThatEndsAtOnce(t *testing.T) {
+	var mu sync.Mutex
+	dials := 0
+	p := New(Config{Dial: func(ctx context.Context) (net.Conn, error) {
+		mu.Lock()
+		dials++
+		mu.Unlock()
+		a, b := net.Pipe()
+		b.Close()
+		return a, nil
+	}})
+	p.Config(&hubv1.NodeConfig{BlockRootEpoch: epoch1})
+	ctx, cancel := context.WithTimeout(context.Background(), 1300*time.Millisecond)
+	defer cancel()
+	p.Run(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+	// 100, 200, 400 and 800 ms pauses: at most five dials in 1.3 s.
+	if dials < 2 || dials > 6 {
+		t.Fatalf("%d dials in 1.3 s", dials)
+	}
+}
+
+// Nothing is written to a socket whose server is not ctrlz-block (B6-r1-11).
+func TestNothingIsSentToAServerThatFailsThePeerCheck(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the node runs on Linux; unix socket paths of a Windows host do not dial")
+	}
+	path := t.TempDir() + "/b.sock"
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan int, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			got <- -1
+			return
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, _ := c.Read(make([]byte, 64))
+		got <- n
+	}()
+	errPeer := errors.New("not ctrlz-block")
+	p := New(Config{Path: path})
+	p.peerOK = func(net.Conn) error { return errPeer }
+	p.Config(&hubv1.NodeConfig{BlockRootEpoch: epoch1})
+	c, err := p.dialBlock(context.Background())
+	if err == nil {
+		c.Close()
+		t.Fatal("the dial passed a failing peer check")
+	}
+	if !errors.Is(err, errPeer) {
+		t.Fatalf("the dial failed for another reason: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	ln.Close()
+	if n := <-got; n > 0 {
+		t.Fatalf("%d bytes were sent to the wrong server", n)
+	}
+}
+
+func TestBundleWithAnUnknownExtraUsageIsRefused(t *testing.T) {
+	r := newRig(t)
+	err := r.p.Bundle(newIssuer(t, "A").bundle(t, r.node, id16(2), epoch1, func(c *x509.Certificate) {
+		c.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 3, 6, 1, 4, 1, 99999, 1}}
+	}))
+	if err == nil {
+		t.Fatal("an intermediate with an extra usage was accepted")
+	}
 }

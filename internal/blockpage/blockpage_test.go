@@ -438,7 +438,7 @@ func TestLeafCacheBoundsPerAccount(t *testing.T) {
 	cert := &tls.Certificate{}
 	na := time.Now().Add(24 * time.Hour)
 	for i := 0; i < MaxLeavesPerAccount+50; i++ {
-		c.add(leafKey{acct, "n" + itoa(i)}, cert, na)
+		c.add(leafKey{acct, "n" + itoa(i)}, cert, na, nil)
 	}
 	if c.perAcct[acct] != MaxLeavesPerAccount {
 		t.Fatalf("%d leaves of one account", c.perAcct[acct])
@@ -446,7 +446,7 @@ func TestLeafCacheBoundsPerAccount(t *testing.T) {
 	var other [16]byte
 	other[0] = 2
 	for i := 0; i < MaxLeaves; i++ {
-		c.add(leafKey{other, "m" + itoa(i)}, cert, na)
+		c.add(leafKey{other, "m" + itoa(i)}, cert, na, nil)
 	}
 	if c.ll.Len() > MaxLeaves {
 		t.Fatalf("%d leaves", c.ll.Len())

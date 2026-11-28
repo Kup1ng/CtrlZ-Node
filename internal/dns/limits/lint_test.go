@@ -40,6 +40,14 @@ var bannedImports = []string{
 
 var bannedTypeName = regexp.MustCompile(`(?i)(limiter|ratelimit|tokenbucket|bucket|semaphore)`)
 
+// typeNameExempt lists the packages whose own rate limits are not DNS limits. The
+// block page process (p4b-proxy 10.2, 12) keeps token buckets for page asks, leaf
+// mints and unblock forms: they bound a process that serves no DNS and has no
+// listener in the registry of L13, so the registry walk could not see them anyway.
+// Only the type-name rule is lifted for them: library limiters, and any use of the
+// engine and data types of this package, are still failures there.
+var typeNameExempt = map[string]bool{"internal/blockpage": true}
+
 var ownTypes = map[string]bool{"Set": true, "Conn": true, "Pending": true, "Entry": true, "ListenerSettings": true, "Key": true, "Exemption": false}
 
 // lintFile returns the violations of one file. pkgDir is the directory of the
@@ -75,7 +83,7 @@ func lintFile(pkgDir, name string, src []byte) []string {
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch v := n.(type) {
 		case *ast.TypeSpec:
-			if bannedTypeName.MatchString(v.Name.Name) {
+			if bannedTypeName.MatchString(v.Name.Name) && !typeNameExempt[pkgDir] {
 				add(v.Pos(), "type "+v.Name.Name+" looks like a limiter")
 			}
 		case *ast.CompositeLit:
@@ -138,6 +146,17 @@ func f() { s, _ := limits.NewSet(limits.Default()); _ = s; _ = limits.Listeners(
 type conn struct{ c *limits.Conn }`
 	if got := lintFile("internal/dns/listen", "x.go", []byte(ok)); len(got) != 0 {
 		t.Errorf("false positive: %v", got)
+	}
+	// The block page process may name its own buckets, but nothing else of this lint is
+	// lifted there, and no other package gets the allowance.
+	if got := lintFile("internal/blockpage", "x.go", []byte(cases["a token bucket"])); len(got) != 0 {
+		t.Errorf("a bucket type of the block page process was flagged: %v", got)
+	}
+	if got := lintFile("internal/blockpage", "x.go", []byte(cases["an x/time/rate import"])); len(got) == 0 {
+		t.Error("a library limiter passed in the block page process")
+	}
+	if got := lintFile("internal/blockpage", "x.go", []byte(cases["a Set literal"])); len(got) == 0 {
+		t.Error("a limits.Set literal passed in the block page process")
 	}
 	// The package itself is exempt, and so are tests.
 	if got := lintFile("internal/dns/limits", "x.go", []byte(cases["a token bucket"])); len(got) != 0 {

@@ -90,7 +90,12 @@ func (s *Server) request(raw net.Conn, rw io.ReadWriter, f *sock.ServeFrame, htt
 	}
 	// The body is allowed after the headers were read under their own cap.
 	lr.N += MaxFormBody + 1
-	_ = raw.SetDeadline(start.Add(ConnTimeout))
+	// A body is part of the request, so reading it stays inside the 5 s of 10.2: the
+	// read deadline keeps its value until the form is in, and only the write side
+	// gets the connection's 30 s now. Without this a client could drip a 4 KiB body
+	// for half a minute and hold one of the connection slots.
+	_ = raw.SetWriteDeadline(start.Add(ConnTimeout))
+	bodyIn := func() { _ = raw.SetReadDeadline(start.Add(ConnTimeout)) }
 
 	// Anything but a page load gets an empty 403: a script, an image or a frame of
 	// a blocked site must not receive markup (10.4).
@@ -101,10 +106,12 @@ func (s *Server) request(raw net.Conn, rw io.ReadWriter, f *sock.ServeFrame, htt
 	lang := pickLang(req.Header.Get("Accept-Language"))
 	switch {
 	case req.Method == http.MethodPost && req.URL.Path == unblockPath:
-		s.unblock(rw, req, f, https, lang)
+		s.unblock(rw, req, f, https, lang, bodyIn)
 	case req.Method == http.MethodGet || req.Method == http.MethodHead:
+		bodyIn()
 		s.page(rw, req, f, lang)
 	default:
+		bodyIn()
 		writeEmpty(rw, http.StatusMethodNotAllowed)
 	}
 }
@@ -127,7 +134,7 @@ func (s *Server) page(w io.Writer, req *http.Request, f *sock.ServeFrame, lang *
 
 // unblock takes the form (10.4). The order is cheapest check first, and nothing is
 // relayed that the token, the origin and the sizes have not passed.
-func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, https bool, lang *texts) {
+func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, https bool, lang *texts, bodyIn func()) {
 	p := s.pages.get(req.Context(), f.Account, f.PageHash)
 	if !p.Custom || p.Mode != policyv1.UnblockMode_UNBLOCK_MODE_REQUEST || len(p.Profile) != 16 {
 		writeEmpty(w, http.StatusForbidden)
@@ -146,6 +153,7 @@ func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, htt
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(req.Body, MaxFormBody+1))
+	bodyIn()
 	if err != nil || len(raw) > MaxFormBody {
 		writeEmpty(w, http.StatusRequestEntityTooLarge)
 		return

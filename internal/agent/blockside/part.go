@@ -19,7 +19,9 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"log"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -42,9 +44,17 @@ const (
 	NeedLife = time.Hour
 	// MaxKeys bounds the intermediates and the pending asks held.
 	MaxKeys = 4096
-	// maxLife is the longest validity the node accepts for an intermediate: seven
-	// days (10.3) and a day of slack for the clocks.
+	// maxLife is the longest validity the node accepts for an intermediate: the hub
+	// issues seven days (10.3) and the node allows a day of slack for the clocks.
 	maxLife = 8 * 24 * time.Hour
+
+	// Redial pacing of Run: a session that ends is followed by a pause, doubling
+	// from redialMin to redialMax, and the pause starts over only after a session
+	// that lasted stableAfter. Without it a ctrlz-block that accepts and closes at
+	// once (a wrong account, a protocol error) is redialled in a tight loop.
+	redialMin   = 100 * time.Millisecond
+	redialMax   = 5 * time.Second
+	stableAfter = 30 * time.Second
 )
 
 // ErrOtherEpoch is returned by Bundle for a bundle of another epoch than the
@@ -85,6 +95,10 @@ type Config struct {
 	Tick         time.Duration
 	AskEvery     time.Duration
 	MissingAfter time.Duration
+	// Dial makes the connection to ctrlz-block, for tests. Nil dials Path and checks
+	// that the server is the account ctrlz-block: every held private key goes down
+	// this socket, so the end that holds the secrets verifies who listens.
+	Dial func(ctx context.Context) (net.Conn, error)
 }
 
 // DefaultPath is the block agent socket (2.1).
@@ -92,6 +106,7 @@ const DefaultPath = "/run/ctrlz-block/agent.sock"
 
 type key struct {
 	epoch     [8]byte
+	cert      *x509.Certificate // the intermediate, kept to check its constraints against a new list of names
 	inter     *sock.Intermediate
 	notBefore time.Time
 	notAfter  time.Time
@@ -119,6 +134,10 @@ type Part struct {
 	keys    map[[16]byte]*key
 	pend    map[[16]byte]*pending
 	upSince time.Time
+
+	// Used by Run's goroutine alone.
+	peerOK sock.PeerCheck
+	logged map[string]bool
 }
 
 // New returns a Part with no Host: until Attach, every ask is dropped.
@@ -155,6 +174,12 @@ func (p *Part) Heartbeat(*hubv1.Heartbeat) {}
 
 // Config takes the epoch of the root and the names the intermediates must exclude.
 // A change of epoch drops every key held (10.3) and tells ctrlz-block.
+//
+// Two changes cannot be told to ctrlz-block by a frame, because the block socket has
+// no "none" epoch and no "forget this key": an epoch that becomes empty, and a list
+// of names that a held key no longer excludes. Both end the session instead.
+// ctrlz-block forgets every key when a connection ends, and the redial sends
+// nothing (empty epoch) or only the keys that still pass.
 func (p *Part) Config(nc *hubv1.NodeConfig) {
 	var e []byte
 	if len(nc.GetBlockRootEpoch()) == 8 {
@@ -163,7 +188,9 @@ func (p *Part) Config(nc *hubv1.NodeConfig) {
 	hosts := append(append([]string(nil), nc.GetZones()...), nc.GetPanelHostnames()...)
 	p.mu.Lock()
 	changed := string(e) != string(p.epoch)
+	hostsChanged := !slices.Equal(hosts, p.hosts)
 	p.epoch, p.hosts = e, hosts
+	cut := false
 	if changed {
 		var ne [8]byte
 		copy(ne[:], e)
@@ -172,7 +199,20 @@ func (p *Part) Config(nc *hubv1.NodeConfig) {
 				delete(p.keys, a)
 			}
 		}
+		cut = len(e) != 8
 	}
+	if hostsChanged {
+		// A key checked against the old names may not exclude a zone or panel host
+		// the owner added since; with a held key the tenant's page could then be
+		// served under our own new hostname.
+		for a, k := range p.keys {
+			if !excludesAll(k.cert, hosts) {
+				delete(p.keys, a)
+				cut = true
+			}
+		}
+	}
+	c := p.conn
 	p.mu.Unlock()
 	if changed {
 		select {
@@ -180,28 +220,73 @@ func (p *Part) Config(nc *hubv1.NodeConfig) {
 		default:
 		}
 	}
+	if cut && c != nil {
+		_ = c.Close()
+	}
 }
 
 // Run connects to ctrlz-block's socket, and keeps connecting: the block process may
 // start after the agent or restart. It returns when ctx ends.
 func (p *Part) Run(ctx context.Context) {
 	go p.watch(ctx)
-	backoff := 100 * time.Millisecond
+	dial := p.cfg.Dial
+	if dial == nil {
+		dial = p.dialBlock
+	}
+	backoff := redialMin
 	for ctx.Err() == nil {
-		c, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "unix", p.cfg.Path)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
+		began := time.Now()
+		if c, err := dial(ctx); err == nil {
+			p.session(ctx, c)
+			if time.Since(began) >= stableAfter {
+				backoff = redialMin
 			}
-			if backoff < 5*time.Second {
-				backoff *= 2
-			}
-			continue
 		}
-		backoff = 100 * time.Millisecond
-		p.session(ctx, c)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < redialMax {
+			backoff = min(backoff*2, redialMax)
+		}
+	}
+}
+
+// dialBlock dials the block agent socket and checks the server's uid before a
+// single byte is written. The account is resolved on the first dial and kept; an
+// unknown account is a dial that fails, so nothing is sent to a socket whose owner
+// cannot be told.
+func (p *Part) dialBlock(ctx context.Context) (net.Conn, error) {
+	if p.peerOK == nil {
+		chk, err := sock.UsersCheck(false, sock.UserBlock)
+		if err != nil {
+			p.logOnce("the ctrlz-block account is unknown")
+			return nil, err
+		}
+		p.peerOK = chk
+	}
+	c, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "unix", p.cfg.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.peerOK(c); err != nil {
+		_ = c.Close()
+		p.logOnce("the block agent socket is not served by ctrlz-block")
+		return nil, err
+	}
+	return c, nil
+}
+
+// logOnce says a fixed line the first time only: the redial loop would repeat it
+// every few seconds, and the text never carries a path or an id.
+func (p *Part) logOnce(msg string) {
+	if p.logged == nil {
+		p.logged = map[string]bool{}
+	}
+	if !p.logged[msg] {
+		p.logged[msg] = true
+		log.Printf("blockside: %s", msg)
 	}
 }
 
@@ -457,13 +542,18 @@ func (p *Part) Bundle(cb *hubv1.CertBundle) error {
 	}
 	var acct [16]byte
 	copy(acct[:], cb.AccountHash)
-	k := &key{inter: in, notBefore: chain[0].NotBefore, notAfter: chain[0].NotAfter}
+	k := &key{cert: chain[0], inter: in, notBefore: chain[0].NotBefore, notAfter: chain[0].NotAfter}
 	copy(k.epoch[:], cb.BlockRootEpoch)
 	p.mu.Lock()
 	// The epoch may have moved while the bundle was opened.
 	if string(p.epoch) != string(cb.BlockRootEpoch) {
 		p.mu.Unlock()
 		return ErrOtherEpoch
+	}
+	// So may the names: a NodeConfig that added a zone while this bundle opened.
+	if !slices.Equal(hosts, p.hosts) && !excludesAll(chain[0], p.hosts) {
+		p.mu.Unlock()
+		return errors.New("blockside: the name constraints leave a zone or panel host open")
 	}
 	if _, ok := p.keys[acct]; !ok && len(p.keys) >= MaxKeys {
 		for a := range p.keys { // the cap is far above the accounts of a node; drop any one
@@ -481,7 +571,7 @@ func (p *Part) Bundle(cb *hubv1.CertBundle) error {
 // checkBundle is what the node requires of an intermediate before it holds the key
 // (10.3): the key is the certificate's, the chain is consistent up to a CA root, the
 // certificate is a CA with pathlen 0 and serverAuth alone, valid now for at most
-// seven days, and its name constraints are critical and exclude every zone and
+// eight days (maxLife), and its name constraints are critical and exclude every zone and
 // panel host and all IP addresses, so that a hub that went wrong cannot hand out a
 // key that signs for a bank's name.
 func checkBundle(chainPEM, keyDER []byte, now time.Time, protect []string) ([]*x509.Certificate, error) {
@@ -528,7 +618,7 @@ func checkBundle(chainPEM, keyDER []byte, now time.Time, protect []string) ([]*x
 	if !c.IsCA || !c.BasicConstraintsValid || c.MaxPathLen != 0 || !c.MaxPathLenZero {
 		return nil, errors.New("blockside: the intermediate is not a CA of path length 0")
 	}
-	if len(c.ExtKeyUsage) != 1 || c.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
+	if len(c.ExtKeyUsage) != 1 || c.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth || len(c.UnknownExtKeyUsage) != 0 {
 		return nil, errors.New("blockside: the intermediate is not for serverAuth alone")
 	}
 	if now.Before(c.NotBefore) || !now.Before(c.NotAfter) || c.NotAfter.Sub(c.NotBefore) > maxLife {
@@ -537,12 +627,19 @@ func checkBundle(chainPEM, keyDER []byte, now time.Time, protect []string) ([]*x
 	if !c.PermittedDNSDomainsCritical || !excludesAllIPs(c) {
 		return nil, errors.New("blockside: the name constraints are not critical or leave IP addresses open")
 	}
-	for _, h := range protect {
-		if !excludesName(c, h) {
-			return nil, errors.New("blockside: the name constraints leave a zone or panel host open")
-		}
+	if !excludesAll(c, protect) {
+		return nil, errors.New("blockside: the name constraints leave a zone or panel host open")
 	}
 	return chain, nil
+}
+
+func excludesAll(c *x509.Certificate, hosts []string) bool {
+	for _, h := range hosts {
+		if !excludesName(c, h) {
+			return false
+		}
+	}
+	return true
 }
 
 func excludesName(c *x509.Certificate, host string) bool {
@@ -602,6 +699,15 @@ func (p *Part) check() {
 	for a, pd := range p.pend {
 		if now.Sub(pd.lastNeed) > NeedLife {
 			delete(p.pend, a)
+			continue
+		}
+		// An ask made while a key still good is held (the refresh of the last third
+		// of its life) is not a missing key: the node signs and blocks as before.
+		// The clock starts at the key's end: a refusal of the hub is a fault only once
+		// the node has nothing to sign with.
+		if k := p.keys[a]; k != nil && len(p.epoch) == 8 && string(p.epoch) == string(k.epoch[:]) &&
+			!now.Before(k.notBefore) && now.Before(k.notAfter) {
+			pd.first = k.notAfter
 			continue
 		}
 		since := pd.first

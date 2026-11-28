@@ -64,6 +64,12 @@ func ParsePage(blob []byte) (*Page, error) {
 // string through the template per connection would copy it into a buffer each time.
 const logoSentinel = "ctrlzlogosentinel0123456789"
 
+// logoTagOpen and logoTag are the template's own text around the sentinel.
+const (
+	logoTagOpen = `<img class="logo" alt="" src="`
+	logoTag     = logoTagOpen + logoSentinel + `">`
+)
+
 type texts struct {
 	Lang, Dir                                          string
 	DefTitle, DefMessage, Blocked, Button, Label, Link string
@@ -236,11 +242,15 @@ func finish(v *view, logoURI string) (*rendered, error) {
 		out.head = buf.Bytes()
 		return out, nil
 	}
-	i := bytes.Index(buf.Bytes(), []byte(logoSentinel))
+	// The place is found by the whole tag around the sentinel, not by the sentinel's
+	// own text: a title or message a tenant wrote can hold those letters, but
+	// html/template escapes the "<" of any text, so the tag cannot come from data.
+	i := bytes.Index(buf.Bytes(), []byte(logoTag))
 	if i < 0 {
 		return nil, errors.New("blockpage: the logo place is missing")
 	}
 	b := buf.Bytes()
+	i += len(logoTagOpen)
 	out.head, out.tail, out.logo = b[:i], b[i+len(logoSentinel):], logoURI
 	return out, nil
 }

@@ -71,7 +71,7 @@ func (k *keyring) setEpoch(e []byte) {
 	var ne [8]byte
 	copy(ne[:], e)
 	k.mu.Lock()
-	changed := k.epoch != ne // the old value stays through a reconnect, so the same epoch keeps its keys
+	changed := k.epoch != ne
 	k.epoch, k.haveEpoch = ne, true
 	if changed {
 		// Everything held is of the old epoch: a key of the new one comes only after
@@ -84,12 +84,20 @@ func (k *keyring) setEpoch(e []byte) {
 	}
 }
 
-// lost is called when the agent connection ends: until the next epoch frame no
-// key is used.
+// lost is called when the agent connection ends or is replaced: until the next
+// epoch frame no key is used. The keys and leaves go too, not only the epoch flag.
+// The agent holds the truth and resends every intermediate it still has after its
+// epoch frame, so a reconnect costs nothing; but a key kept across the gap would
+// outlive a decision the agent took meanwhile (a withdrawn root, a zone added that
+// the key does not exclude), and the new connection could never tell us.
 func (k *keyring) lost() {
 	k.mu.Lock()
 	k.haveEpoch = false
+	k.keys.Clear()
 	k.mu.Unlock()
+	if k.onPurge != nil {
+		k.onPurge()
+	}
 }
 
 // put installs an intermediate the agent sent. It is checked again here, since

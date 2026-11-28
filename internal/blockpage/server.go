@@ -120,8 +120,8 @@ func Run(ctx context.Context, cfg Config) error {
 		serveLn.Close()
 		agentLn.Close()
 	}()
-	go acceptLoop(agentLn, cfg.AgentCheck, s.ServeAgent)
-	acceptLoop(serveLn, cfg.ServeCheck, s.dispatchServe)
+	go acceptLoop("agent", agentLn, cfg.AgentCheck, s.ServeAgent)
+	acceptLoop("serve", serveLn, cfg.ServeCheck, s.dispatchServe)
 	s.link.close()
 	s.wg.Wait()
 	return ctx.Err()
@@ -146,12 +146,30 @@ func (s *Server) dispatchServe(c net.Conn) {
 // acceptLoop checks the peer of each connection before any frame is read. 32 KiB
 // buffers on both ends of serve.sock are the spec's (10.2): the default of a unix
 // socket is larger and a connection of 128 KiB in all (12) is the budget.
-func acceptLoop(ln net.Listener, check sock.PeerCheck, handle func(net.Conn)) {
+//
+// It ends only when the listener is closed. Any other Accept error (out of file
+// descriptors under a flood, a connection reset before accept) is waited out and
+// tried again: a listener that quietly died would leave the process up with no
+// agent socket, or exit it with status 0, and nothing would say why. The error text
+// is not logged, since it can carry a path; the kind of listener is.
+func acceptLoop(name string, ln net.Listener, check sock.PeerCheck, handle func(net.Conn)) {
+	wait := acceptWaitMin
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if wait == acceptWaitMin {
+				log.Printf("blockpage: accept on the %s socket failed, retrying", name)
+			}
+			time.Sleep(wait)
+			if wait < acceptWaitMax {
+				wait *= 2
+			}
+			continue
 		}
+		wait = acceptWaitMin
 		if err := check(c); err != nil {
 			_ = c.Close()
 			continue
@@ -211,7 +229,12 @@ type agentLink struct {
 	conn net.Conn
 }
 
-const agentWriteTimeout = 2 * time.Second
+const (
+	agentWriteTimeout = 2 * time.Second
+	// The pause after a failed Accept: doubling from 5 ms to a second, as net/http does.
+	acceptWaitMin = 5 * time.Millisecond
+	acceptWaitMax = time.Second
+)
 
 // send writes one frame and reports whether it went. A failed write ends the
 // connection; the reader then notices and the keys stop being used.
@@ -230,7 +253,10 @@ func (l *agentLink) send(m *sock.BlockMsg) bool {
 	return true
 }
 
-func (l *agentLink) attach(c net.Conn) {
+// attach installs c and reports whether it replaced a live connection. The old
+// reader's detach then sees another conn and does not run keys.lost, so the caller
+// must: the new connection has sent no epoch yet.
+func (l *agentLink) attach(c net.Conn) (replaced bool) {
 	l.mu.Lock()
 	old := l.conn
 	l.conn = c
@@ -238,6 +264,7 @@ func (l *agentLink) attach(c net.Conn) {
 	if old != nil {
 		_ = old.Close()
 	}
+	return old != nil
 }
 
 // detach clears c if it is still the current connection and reports that it was.
@@ -265,7 +292,9 @@ func (l *agentLink) close() {
 // accept; every frame is checked for being one the agent may send, and a frame
 // that is not ends the connection (2.1).
 func (s *Server) ServeAgent(c net.Conn) {
-	s.link.attach(c)
+	if s.link.attach(c) {
+		s.keys.lost()
+	}
 	go func() {
 		defer func() { _ = c.Close() }()
 		for {

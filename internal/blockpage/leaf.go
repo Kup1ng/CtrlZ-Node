@@ -1,6 +1,7 @@
 package blockpage
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/ecdsa"
@@ -29,6 +30,10 @@ type leafEntry struct {
 	k        leafKey
 	cert     *tls.Certificate
 	notAfter time.Time
+	// issuer is the DER of the intermediate that signed the leaf. A handshake that
+	// took its key before an epoch change can finish its mint after the purge; the
+	// entry it adds is of the old root, and a hit is only valid for the key in hand.
+	issuer []byte
 }
 
 // leafCache is the LRU of (account, name) of 10.2: 4096 leaves, at most 256 of one
@@ -44,7 +49,7 @@ func newLeafCache() *leafCache {
 	return &leafCache{ll: list.New(), m: map[leafKey]*list.Element{}, perAcct: map[[16]byte]int{}}
 }
 
-func (c *leafCache) get(k leafKey, now time.Time) *tls.Certificate {
+func (c *leafCache) get(k leafKey, now time.Time, issuer []byte) *tls.Certificate {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[k]
@@ -54,7 +59,7 @@ func (c *leafCache) get(k leafKey, now time.Time) *tls.Certificate {
 	le := e.Value.(*leafEntry)
 	// A leaf with under an hour left is not handed out: a handshake that starts now
 	// must not outlive it.
-	if le.notAfter.Sub(now) < time.Hour {
+	if le.notAfter.Sub(now) < time.Hour || !bytes.Equal(le.issuer, issuer) {
 		c.removeLocked(e)
 		return nil
 	}
@@ -62,7 +67,7 @@ func (c *leafCache) get(k leafKey, now time.Time) *tls.Certificate {
 	return le.cert
 }
 
-func (c *leafCache) add(k leafKey, cert *tls.Certificate, notAfter time.Time) {
+func (c *leafCache) add(k leafKey, cert *tls.Certificate, notAfter time.Time, issuer []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.m[k]; ok {
@@ -80,7 +85,7 @@ func (c *leafCache) add(k leafKey, cert *tls.Certificate, notAfter time.Time) {
 	for c.ll.Len() >= MaxLeaves {
 		c.removeLocked(c.ll.Back())
 	}
-	c.m[k] = c.ll.PushFront(&leafEntry{k: k, cert: cert, notAfter: notAfter})
+	c.m[k] = c.ll.PushFront(&leafEntry{k: k, cert: cert, notAfter: notAfter, issuer: issuer})
 	c.perAcct[k.account]++
 }
 
@@ -134,7 +139,7 @@ func (m *leafMaker) certificate(ctx context.Context, account []byte, name string
 	copy(k.account[:], account)
 	k.name = name
 	now := m.now()
-	if c := m.cache.get(k, now); c != nil {
+	if c := m.cache.get(k, now, h.interDER); c != nil {
 		return c, nil
 	}
 	if !m.acct.allow(k.account, now) || !m.node.allow(now) {
@@ -171,6 +176,6 @@ func (m *leafMaker) certificate(ctx context.Context, account []byte, name string
 		return nil, errors.New("blockpage: the leaf was not signed")
 	}
 	cert := &tls.Certificate{Certificate: [][]byte{der, h.interDER}, PrivateKey: m.key}
-	m.cache.add(k, cert, notAfter)
+	m.cache.add(k, cert, notAfter, h.interDER)
 	return cert, nil
 }
