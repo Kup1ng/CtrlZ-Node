@@ -194,6 +194,11 @@ func (p *Peer) SetEnv(e Env) {
 	p.poke()
 }
 
+// Bound reports whether SetEnv has been called. The agent's boot test asks it, so that
+// a merge which drops the bind fails a test instead of leaving a part that never
+// opens its listener.
+func (p *Peer) Bound() bool { return p.env.Load() != nil }
+
 // Stats returns the counters.
 func (p *Peer) Stats() *Stats { return &p.stat }
 

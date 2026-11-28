@@ -168,6 +168,15 @@ func (p *Part) Attach(h Host) {
 	p.mu.Unlock()
 }
 
+// Attached reports whether Attach has been called. The agent's boot test asks it, so
+// that a merge which drops the Attach call fails a test instead of silently leaving a
+// part that drops every ask.
+func (p *Part) Attached() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.host != nil
+}
+
 // Heartbeat adds nothing: the one thing this part reports is a fault, and it says
 // that to the agent's Faults and never to the Heartbeat itself.
 func (p *Part) Heartbeat(*hubv1.Heartbeat) {}

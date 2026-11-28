@@ -36,11 +36,13 @@ import (
 	enrollv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/enroll/v1"
 	hubv1 "github.com/Kup1ng/CtrlZ-Shared/gen/ctrlz/hub/v1"
 
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/blockside"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/fakehub"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/hubconn"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx/fake"
 	"github.com/Kup1ng/CtrlZ-Node/internal/enroll"
 	"github.com/Kup1ng/CtrlZ-Node/internal/labroot"
+	"github.com/Kup1ng/CtrlZ-Node/internal/peer"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store/storetest"
 )
 
@@ -673,5 +675,63 @@ func TestBootFinishesAResumableEnrolmentOnceTheHostIsMended(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(rig.keys, enroll.PendingFile)); err == nil {
 		t.Error("the pending record outlived the enrolment")
+	}
+}
+
+// The block part and the peer part are made before the agent and bound to it after,
+// in boot and nowhere else. A merge that drops either line builds and passes every
+// test of the parts alone, yet leaves the block part dropping every ask and the peer
+// part opening no listener; this test starts boot and asks both parts.
+func TestBootBindsTheBlockPartAndThePeerPart(t *testing.T) {
+	eh := newEnrollHub(t)
+	rootJSON, _ := protojson.Marshal(storetest.NewKeys(t).Root)
+	rig := newBootRig(t, eh.caPEM, eh.pin, rootJSON)
+	eh.approve.Store(true)
+	hub := fakehub.New()
+	hub.Start()
+	t.Cleanup(hub.Stop)
+	rig.env.TuneEnroll = func(c *enroll.Config) {
+		c.PollEvery = 10 * time.Millisecond
+		c.Dial = func(ctx context.Context, _ string) (net.Conn, error) { return eh.lis.DialContext(ctx) }
+	}
+	rig.env.Tune = func(c *Config) {
+		c.SockGroup = ""
+		c.PeerCheck = func(net.Conn) error { return nil }
+		c.Dial = func(hubconn.Role) (*grpc.ClientConn, error) { return hub.Dial() }
+		c.Runner, c.Files = &fake.Runner{}, fake.NewFiles(nil)
+		c.NoSystem, c.SkipHostChecks = true, true
+		c.RetryEvery, c.LogPoll, c.ProbeEvery = time.Hour, time.Hour, time.Hour
+	}
+	built := make(chan *Agent, 1)
+	rig.env.Built = func(a *Agent) { built <- a }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- boot(ctx, rig.env) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	var a *Agent
+	select {
+	case a = <-built:
+	case <-time.After(10 * time.Second):
+		t.Fatal("boot did not reach the end of its wiring")
+	}
+	var blk *blockside.Part
+	var pp *peer.Peer
+	for _, p := range a.cfg.Parts {
+		switch p := p.(type) {
+		case *blockside.Part:
+			blk = p
+		case *peer.Peer:
+			pp = p
+		}
+	}
+	if blk == nil || pp == nil {
+		t.Fatalf("the agent's parts miss one: block %v, peer %v", blk != nil, pp != nil)
+	}
+	if !blk.Attached() {
+		t.Error("the block part has no Host: it would drop every ask")
+	}
+	if !pp.Bound() {
+		t.Error("the peer part has no Env: it would open no listener")
 	}
 }

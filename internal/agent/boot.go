@@ -41,6 +41,7 @@ type bootEnv struct {
 	LookupUID     func(name string) (uint32, error)                // the uid of ctrlz-dns
 	TuneEnroll    func(*enroll.Config)                             // timings and the dialer of the enrolment
 	Tune          func(*Config)                                    // the real Config before New
+	Built         func(*Agent)                                     // the agent as boot has wired it, before Run
 	Sleep         func(ctx context.Context, d time.Duration) error // the waits of the enrolment back-off
 }
 
@@ -124,6 +125,9 @@ func boot(ctx context.Context, env bootEnv) error {
 	}
 	blk.attach(a)
 	bindPeerPart(peerPart, a)
+	if env.Built != nil {
+		env.Built(a) // a test's look at the wiring above; nil in production
+	}
 	// Run opens Control: 4.2 step 7, after the certificate is stored and not before.
 	return a.Run(ctx)
 }
