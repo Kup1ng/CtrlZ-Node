@@ -34,9 +34,9 @@ const (
 )
 
 // DefaultConntrackMax is the value used until the load test (T-374) measures
-// one. It is the common default of a 4 GiB host raised for a resolver, and
-// provisional (D31).
-const DefaultConntrackMax = 262144
+// one. P4b raised it from 262,144 to hold the tracked entries of the proxy
+// (p4b-proxy 5.5); provisional (D31).
+const DefaultConntrackMax = 524288
 
 // Finding is a failed check.
 type Finding struct {
@@ -201,4 +201,36 @@ func Syncookies(files sysx.Files) []Finding {
 		return []Finding{{Code: alert.SyncookiesOff, Detail: "tcp_syncookies is off"}}
 	}
 	return nil
+}
+
+// ProxySysctl is the table of p4b-proxy 5.5 (D31): the keys the install sets for the
+// proxy role, with the value each must have. nf_conntrack_max and the port range have
+// checks of their own (EnsureConntrack, unbound.CheckRanges). The agent cannot write
+// /proc/sys, so a key that differs is an alert and an operator's fix.
+var ProxySysctl = [][2]string{
+	{"net.ipv4.tcp_tw_reuse", "1"},
+	{"net.ipv4.tcp_rmem", "4096 131072 2097152"},
+	{"net.ipv4.tcp_wmem", "4096 16384 2097152"},
+	{"net.ipv4.tcp_notsent_lowat", "131072"},
+	{"net.ipv4.tcp_mem", "786432 1048576 1572864"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_syn_sent", "10"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_last_ack", "10"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_fin_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_close_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_time_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_unacknowledged", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_max_retrans", "30"},
+}
+
+// ProxyKernel reads those keys and reports each one that is unreadable or differs.
+// The detail names the key, never a value.
+func ProxyKernel(files sysx.Files) []Finding {
+	var out []Finding
+	for _, k := range ProxySysctl {
+		b, err := files.ReadFile("/proc/sys/" + strings.ReplaceAll(k[0], ".", "/"))
+		if err != nil || strings.Join(strings.Fields(string(b)), " ") != k[1] {
+			out = append(out, Finding{Code: alert.SysctlOff, Detail: "a kernel setting of the proxy role is not the one of the install: " + k[0]})
+		}
+	}
+	return out
 }

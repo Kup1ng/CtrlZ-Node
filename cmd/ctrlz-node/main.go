@@ -18,7 +18,9 @@ import (
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
 	"github.com/Kup1ng/CtrlZ-Node/internal/blockpage"
+	"github.com/Kup1ng/CtrlZ-Node/internal/config"
 	"github.com/Kup1ng/CtrlZ-Node/internal/dnsrole"
+	"github.com/Kup1ng/CtrlZ-Node/internal/proxy"
 	"github.com/Kup1ng/CtrlZ-Node/internal/upgrade"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xrayctl"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xrayrun"
@@ -58,9 +60,8 @@ func run(args []string) int {
 	case "dns":
 		err = runDNS(ctx)
 	case "proxy":
-		// Idle in P4: the proxy role binds nothing and holds nothing. The unit exists
-		// so the install and the sandbox are the final ones when P4b fills it.
-		<-ctx.Done()
+		// Binds nothing until dns has sent its config over proxy.sock (p4b 5.1).
+		err = proxy.Run(ctx, config.Load())
 	case "agent":
 		// The parts that live in packages importing agent (the Xray manager) are built
 		// by the tune hook, because boot cannot import them without a cycle.

@@ -4,17 +4,12 @@ import (
 	"path/filepath"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nft"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xray"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xrayctl"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xrayrun"
 )
-
-// nftGuard is the guard of 5.5 that the Xray manager waits on. B4 makes it (the
-// read-back of the agent's table); until it is merged and set here, the manager has
-// none and fails closed: it starts no slot (xray.Manager.guard is false for a nil
-// Guard). The integration step assigns it before the agent is built.
-var nftGuard func(*agent.Config) agent.Guard
 
 // identifiedUnbound is the identified Unbound (SC 5.2a), the one resolver that the Xray
 // manager and the hub name lookup trust.
@@ -23,24 +18,35 @@ const identifiedUnbound = "127.0.0.10:5300"
 // wireXray is the one block of this part in the agent's boot: it builds the Xray
 // manager with the Faults and DNS that every part shares and adds it to the parts.
 func wireXray(cfg *agent.Config) {
+	cfg.Parts = append(cfg.Parts, xray.New(xrayOptions(cfg)))
+}
+
+// xrayOptions makes the manager's options. It is apart from wireXray so that a test
+// can see which Guard the manager waits on.
+func xrayOptions(cfg *agent.Config) xray.Options {
 	if cfg.Faults == nil {
 		cfg.Faults = agent.NewFaults()
 	}
 	if cfg.DNS == nil {
 		cfg.DNS = &agent.DNS{}
 	}
-	var guard agent.Guard
-	if nftGuard != nil {
-		guard = nftGuard(cfg)
+	// The guard of 5.5 is made here, in the tune, because the manager reads it when it
+	// is built and boot runs the tune before wireNftGuard. wireNftGuard keeps a guard
+	// that is already set and runs that same one as its part, so the table the agent
+	// applies and the table the manager waits on are one object. A nil *nft.Guard
+	// must never be handed over: inside an agent.Guard it is not nil, and Check would
+	// run on it.
+	if cfg.NftGuard == nil {
+		cfg.NftGuard = nft.NewGuard(cfg.Runner)
 	}
 	const unbound = identifiedUnbound
-	m := xray.New(xray.Options{
+	return xray.Options{
 		Layout:    xrayrun.DefaultLayout(),
 		StateDir:  filepath.Join(cfg.Root, "xray"),
 		Ctl:       &xray.SockCtl{Path: xrayctl.DefaultSock},
 		Units:     xray.SystemdUnits{Runner: sysx.ExecRunner{}},
 		Prober:    xray.SocksProber{},
-		Guard:     guard,
+		Guard:     cfg.NftGuard,
 		Faults:    cfg.Faults,
 		Publish:   cfg.DNS.Publish,
 		Alert:     cfg.Alert,
@@ -48,6 +54,5 @@ func wireXray(cfg *agent.Config) {
 		NodeAddrs: xrayNodeAddrs(cfg),
 		Unbound:   unbound,
 		Timing:    xray.DefaultTiming(),
-	})
-	cfg.Parts = append(cfg.Parts, m)
+	}
 }

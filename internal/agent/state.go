@@ -37,7 +37,15 @@ func addrOf(b []byte) (netip.Addr, bool) {
 // be (SC 5.2a): this node's bind and advertised addresses, from agent.conf and
 // the NodeConfig, and the dns_ip of every node of the applied PairTable.
 func (a *Agent) nodeAddrs() []netip.Addr {
-	return nodeAddrList(a.cfg.Conf, a.nodeCfg.Load(), a.push.Member())
+	return nodeAddrList(a.cfg.Conf, a.nodeCfg.Load(), a.member())
+}
+
+// member is the applied PairTable, nil before any and in a test with no store.
+func (a *Agent) member() *policyv1.PairTable {
+	if a.push == nil {
+		return nil
+	}
+	return a.push.Member()
 }
 
 // nodeAddrList is nodeAddrs for the inputs it is made of, so that the start before

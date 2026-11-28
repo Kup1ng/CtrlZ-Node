@@ -36,6 +36,11 @@ die() {
 # node that served DNS with no DNS and no agent until someone noticed, because the
 # units were stopped by hand and systemd's Restart= does not undo that.
 WAS_ACTIVE=
+# The units of the node that run its own binary. The slots come first so that they stop
+# before the proxy that sends to them.
+NODE_UNITS="ctrlz-xray@a.service ctrlz-xray@b.service ctrlz-xrayctl.service ctrlz-block.service ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service"
+# The ones that are enabled: the slots are not, the agent starts the active one.
+ENABLED_UNITS="ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service ctrlz-block.service ctrlz-xrayctl.service"
 PRC=/usr/sbin/policy-rc.d
 PRC_MARK='# ctrlz-install: no service starts while the packages install'
 
@@ -236,13 +241,18 @@ fi
 # runs before quiesce, so the usual ways an upgrade fails (a held dpkg lock, a
 # package that does not resolve) leave the node as it was.
 quiesce() {
-	for u in ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service; do
+	# The P4b units are stopped with them: a slot or the block process that kept running
+	# would hold the binary that is about to be replaced. The agent starts the active
+	# slot again once its table is in place (p4b-proxy 7.6), so a slot is started again
+	# here only by cleanup, when a step has failed.
+	for u in $NODE_UNITS; do
 		if systemctl is-active --quiet "$u" >/dev/null 2>&1; then
 			WAS_ACTIVE="$WAS_ACTIVE $u"
 		fi
 	done
-	systemctl stop ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service >/dev/null 2>&1 || true
-	for u in ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service; do
+	# shellcheck disable=SC2086
+	systemctl stop $NODE_UNITS >/dev/null 2>&1 || true
+	for u in $NODE_UNITS; do
 		if systemctl is-active --quiet "$u" >/dev/null 2>&1; then
 			die "$u is still running; stop it before the install"
 		fi
@@ -654,8 +664,14 @@ reset_unbound_conf() {
 apply_services() {
 	systemctl daemon-reload
 	restart_stale_unbound
-	# The Unbound units are not enabled: the agent starts them after its checks.
-	systemctl enable ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service chrony.service >/dev/null 2>&1 || die 'enabling the units failed'
+	# The run directories of P4b (p4b-proxy 3.3) are made before any unit that needs one.
+	if command -v systemd-tmpfiles >/dev/null 2>&1; then
+		systemd-tmpfiles --create /etc/tmpfiles.d/ctrlz.conf >/dev/null 2>&1 || die 'the run directories could not be made'
+	fi
+	# The Unbound units and the Xray slots are not enabled: the agent starts them after
+	# its checks.
+	# shellcheck disable=SC2086
+	systemctl enable $ENABLED_UNITS chrony.service >/dev/null 2>&1 || die 'enabling the units failed'
 	# chrony.service conflicts with systemd-timesyncd, which apt removed with its package;
 	# a copy of it that was still running is stopped here.
 	systemctl stop systemd-timesyncd.service >/dev/null 2>&1 || true
@@ -666,7 +682,8 @@ apply_services() {
 	# relying on an order: dns serves plain DNS from its last image until the agent
 	# hands it a NodeConfig, and the agent restarts dns when that NodeConfig changes
 	# what dns bound (7.3).
-	systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service || die 'starting the units failed'
+	# shellcheck disable=SC2086
+	systemctl restart $ENABLED_UNITS || die 'starting the units failed'
 }
 
 apply_version() {

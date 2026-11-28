@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nft"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx/fake"
 	"github.com/Kup1ng/CtrlZ-Node/internal/xray"
 )
 
@@ -43,5 +45,28 @@ func TestAgentRoleWiresTheXrayManager(t *testing.T) {
 	// when they are nil, so these two must be set for all of them to share one pair.
 	if cfg.Faults == nil || cfg.DNS == nil {
 		t.Fatalf("faults %v, dns %v: the parts would not share them", cfg.Faults != nil, cfg.DNS != nil)
+	}
+}
+
+// INT2-r1-2, INT2-r1-6: boot runs the tune before it runs wireNftGuard, and the manager
+// reads its Guard when it is built. The Guard it gets must be the one boot then runs as
+// the nft part (wireNftGuard keeps a guard that is set), never nil (no slot would ever
+// start) and never a nil *nft.Guard inside the interface (Check would crash the agent).
+func TestXrayManagerWaitsOnTheGuardBootRuns(t *testing.T) {
+	cfg := agent.Config{Root: t.TempDir(), Runner: &fake.Runner{}}
+	opts := xrayOptions(&cfg)
+	if cfg.NftGuard == nil {
+		t.Fatal("the tune leaves no guard for boot to run as the nft part")
+	}
+	g, ok := opts.Guard.(*nft.Guard)
+	if !ok || g == nil || g != cfg.NftGuard {
+		t.Fatalf("the manager waits on %T %v, not on the guard of the config", opts.Guard, opts.Guard)
+	}
+
+	// A guard that is already there is the one the manager gets.
+	own := nft.NewGuard(&fake.Runner{})
+	cfg = agent.Config{Root: t.TempDir(), NftGuard: own}
+	if opts = xrayOptions(&cfg); opts.Guard.(*nft.Guard) != own || cfg.NftGuard != own {
+		t.Fatal("a guard set before the tune is replaced")
 	}
 }

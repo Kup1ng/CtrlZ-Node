@@ -177,11 +177,14 @@ func runHostChecks(ctx context.Context, cfg Config, al alert.Alerter, nodeAddrs 
 		want = hostcheck.DefaultConntrackMax
 	}
 	hostcheck.Alerts(al, hostcheck.EnsureConntrack(ctx, cfg.Files, cfg.Runner, want))
+	if cfg.NftGuard != nil { // the proxy role is wired (boot.go): its kernel keys matter
+		hostcheck.Alerts(al, hostcheck.ProxyKernel(cfg.Files))
+	}
 }
 
 // applyNft applies the agent's table when DNS_IP or the panel addresses changed.
 func (a *Agent) applyNft(ctx context.Context) {
-	a.nftTable.apply(ctx, a.cfg, a.al, a.dnsIP())
+	a.nftTable.applyWith(ctx, a.cfg, a.al, a.dnsIP(), a.proxyNft())
 }
 
 // nftApplier applies the agent's nftables table and remembers the text it applied. The
@@ -191,10 +194,21 @@ func (a *Agent) applyNft(ctx context.Context) {
 type nftApplier struct {
 	mu   sync.Mutex
 	last string // the nftables script last applied
+	// panel is the hub's addresses of the last lookup that answered: a lookup that
+	// fails later must not render a table with no panel address, which would leave
+	// the guard on over the older table.
+	panel []netip.Addr
+	// g, when set, applies the table and keeps the read-back of 5.5 (nftpart.go).
+	g *nft.Guard
 }
 
 func (n *nftApplier) apply(ctx context.Context, cfg Config, al alert.Alerter, dnsIP netip.Addr) {
-	p := nft.Params{DNSIP: dnsIP, PanelAddrs: cfg.Conf.Panel(), FreePortLo: unbound.FreePortLo, FreePortHi: unbound.FreePortHi}
+	n.applyWith(ctx, cfg, al, dnsIP, nil)
+}
+
+// applyWith is apply with the proxy chains of p4b-proxy 5.5 (px nil: the table of P4).
+func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter, dnsIP netip.Addr, px *nft.ProxyParams) {
+	p := nft.Params{DNSIP: dnsIP, PanelAddrs: cfg.Conf.Panel(), FreePortLo: unbound.FreePortLo, FreePortHi: unbound.FreePortHi, Proxy: px}
 	if len(p.PanelAddrs) == 0 {
 		// The hub is a name: resolve it once, here, because nftables needs addresses.
 		if ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", cfg.Conf.HubHost()); err == nil {
@@ -202,25 +216,92 @@ func (n *nftApplier) apply(ctx context.Context, cfg Config, al alert.Alerter, dn
 				p.PanelAddrs = append(p.PanelAddrs, ip.Unmap())
 			}
 		}
+		n.mu.Lock()
+		if len(p.PanelAddrs) > 0 {
+			n.panel = p.PanelAddrs
+		} else {
+			p.PanelAddrs = n.panel
+		}
+		n.mu.Unlock()
 	}
 	text, err := nft.Render(p)
+	// fresh: this process has applied no table yet. Only then is there no older table
+	// of ours in the kernel to stand, so only then is the table of P4 a fallback worth
+	// its cost. On a node that already runs the proxy chains it would delete xray_out,
+	// proxy_out, block_out and socks_guard, which bind the uids still running
+	// (B4-r2-3): there the older table stays and the guard is told it is not the wanted
+	// one.
+	n.mu.Lock()
+	fresh := n.last == ""
+	n.mu.Unlock()
+	fallback := false
+	if err != nil && px != nil && fresh {
+		// When the proxy part is what cannot be rendered (an address equal to DNS_IP, an
+		// unusable uid), the table of P4 still goes in: the notrack and flood rules of
+		// DNS_IP must not be lost with it (5.5). The guard stays off and nft_failed is
+		// raised. n.last then holds the P4 text, so the next pass is not fresh and does
+		// not apply it again (B4-r2-1, B4-r2-4).
+		p4 := p
+		p4.Proxy = nil
+		if t4, err4 := nft.Render(p4); err4 == nil {
+			p, text, err, fallback = p4, t4, nil, true
+			al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the proxy chains could not be rendered"})
+		}
+	}
 	if err != nil {
 		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "the nftables table could not be rendered"})
+		if n.g != nil {
+			n.g.Reject()
+		}
 		return
 	}
 	n.mu.Lock()
 	same := n.last == text
 	n.mu.Unlock()
-	if same {
+	// A guard that is failed (a table that could not be rendered or applied since)
+	// needs the apply even for the text that is in the kernel: it is what ends the
+	// failure and puts the guard on again.
+	if same && (n.g == nil || !n.g.Failed()) {
 		return
 	}
-	if err := nft.Apply(ctx, cfg.Runner, p); err != nil {
+	err = n.applyTable(ctx, cfg, p, fallback)
+	if err != nil && p.Proxy != nil && fresh && n.g != nil {
+		// The script rendered but nft refused it, and no older table exists: the DNS_IP
+		// rules must not wait for chains that have never run on this kernel
+		// (B4-r2-2). nft applies a script whole or not at all, so nothing is half
+		// there; the fallback goes in with the guard off and the next pass tries the
+		// full table again.
+		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "nft refused the proxy chains"})
+		p4 := p
+		p4.Proxy = nil
+		if t4, err4 := nft.Render(p4); err4 == nil {
+			if err = n.applyTable(ctx, cfg, p4, true); err == nil {
+				text = t4
+			} else {
+				n.g.Want(p)
+			}
+		}
+	}
+	if err != nil {
 		al.Alert(alert.Alert{Code: alert.NftFailed, Detail: "nft refused the table"})
 		return
 	}
 	n.mu.Lock()
 	n.last = text
 	n.mu.Unlock()
+}
+
+// applyTable applies p through the guard when there is one. rejected keeps the guard
+// off and failed for a table that is only the fallback of the one wanted.
+func (n *nftApplier) applyTable(ctx context.Context, cfg Config, p nft.Params, rejected bool) error {
+	switch {
+	case n.g == nil:
+		return nft.Apply(ctx, cfg.Runner, p)
+	case rejected:
+		return n.g.ApplyRejected(ctx, p)
+	default:
+		return n.g.Apply(ctx, p)
+	}
 }
 
 func (a *Agent) updateChrony(ctx context.Context) {

@@ -84,9 +84,10 @@ func (sv *service) Forward(stream grpc.BidiStreamingServer[peerv1.GrantForward, 
 	if !ok {
 		return status.Error(codes.PermissionDenied, "no peer identity")
 	}
-	// Only the pair peer forwards. The address check already admits no other node; this
-	// stays for a connection that was admitted under an earlier table (the pair moved), so
-	// that its stream ends here, before one of its messages is read.
+	// Only the pair peer forwards. The address check already admits no other node, and
+	// recheck closes the connections of a node the pair moved away from; this stays for
+	// the stream that opens in the gap between the new table and that close, so that it
+	// ends here, before one of its messages is read.
 	v0 := p.view()
 	if pl := v0.peerLive(); pl == nil || pl.id != node {
 		return status.Error(codes.PermissionDenied, "not the pair peer")

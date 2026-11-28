@@ -114,7 +114,7 @@ func TestParsedValuesAreTheSpec(t *testing.T) {
 	}
 	ub, _ := os.ReadFile(filepath.Join(realPackaging, "systemd/ctrlz-agent.service"))
 	u := ParseUnit(string(ub))
-	if !sameSet(u.Words("Service.ReadWritePaths"), []string{"/var/lib/ctrlz", "/etc/ctrlz/unbound", "/etc/ctrlz/chrony"}) {
+	if !sameSet(u.Words("Service.ReadWritePaths"), []string{"/var/lib/ctrlz", "/etc/ctrlz/unbound", "/etc/ctrlz/chrony", "/etc/ctrlz/xray"}) {
 		t.Fatalf("agent ReadWritePaths %v", u.Words("Service.ReadWritePaths"))
 	}
 }
@@ -156,7 +156,37 @@ func TestMutantsAreFound(t *testing.T) {
 		{"chronyd may write the drop-in", "apparmor/local-usr.sbin.chronyd", "/etc/ctrlz/chrony/** r,", "/etc/ctrlz/chrony/** rw,", "must be read-only"},
 		{"chronyd profile forgotten by files.conf", "files.conf", "apparmor/local-usr.sbin.chronyd /etc/apparmor.d/local/usr.sbin.chronyd 0644\n", "", "in no list"},
 		{"core dumps kept", "coredump/ctrlz.conf", "Storage=none", "Storage=external", "Storage must be none"},
-		{"ephemeral range reaches the free ports", "sysctl/60-ctrlz.conf", "32768 39999", "32768 60999", "ip_local_port_range"},
+		{"ephemeral range reaches the free ports", "sysctl/60-ctrlz.conf", "10240 39999", "10240 60999", "ip_local_port_range"},
+		{"the old port range", "sysctl/60-ctrlz.conf", "10240 39999", "32768 39999", "ip_local_port_range"},
+		{"conntrack at the P4 value", "sysctl/60-ctrlz.conf", "nf_conntrack_max = 524288", "nf_conntrack_max = 262144", "nf_conntrack_max must be 524288"},
+		{"a conntrack timeout dropped", "sysctl/60-ctrlz.conf", "-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30\n", "", "nf_conntrack_tcp_timeout_time_wait"},
+		{"tcp_mem raised", "sysctl/60-ctrlz.conf", "net.ipv4.tcp_mem = 786432 1048576 1572864", "net.ipv4.tcp_mem = 786432 1048576 9999999", "tcp_mem"},
+		{"proxy with a second capability", "systemd/ctrlz-proxy.service", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW", "CAP_NET_BIND_SERVICE only"},
+		{"proxy with no descriptor limit", "systemd/ctrlz-proxy.service", "LimitNOFILE=524288", "LimitNOFILE=1024", "LimitNOFILE"},
+		{"proxy with no memory ceiling", "systemd/ctrlz-proxy.service", "MemoryMax=2G", "MemoryMax=infinity", "MemoryMax"},
+		{"block with the network", "systemd/ctrlz-block.service", "RestrictAddressFamilies=AF_UNIX", "RestrictAddressFamilies=AF_UNIX AF_INET", "AF_UNIX alone"},
+		{"block with a capability", "systemd/ctrlz-block.service", "CapabilityBoundingSet=\n", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n", "no capability"},
+		{"block writes elsewhere", "systemd/ctrlz-block.service", "ReadWritePaths=/run/ctrlz-block", "ReadWritePaths=/run/ctrlz-block /var/lib/ctrlz", "ReadWritePaths must be"},
+		{"block in the proxy's group", "accounts.conf", "member ctrlz-proxy ctrlz-link\n", "member ctrlz-proxy ctrlz-link\nmember ctrlz-block ctrlz-link\n", "group ctrlz-link has members"},
+		{"xray slot in the xrayctl group", "accounts.conf", "member ctrlz-agent ctrlz-xrayctl\n", "member ctrlz-agent ctrlz-xrayctl\nmember ctrlz-xray ctrlz-xrayctl\n", "group ctrlz-xrayctl has members"},
+		{"xrayctl directory not setgid", "tmpfiles/ctrlz.conf", "2750 ctrlz-xray ", "0750 ctrlz-xray ", "ctrlz-xrayctl"},
+		{"block sees the node's configuration", "systemd/ctrlz-block.service", "TemporaryFileSystem=/etc/ctrlz:ro\n", "", "empty tmpfs"},
+		{"proxy sees the store", "systemd/ctrlz-proxy.service", "InaccessiblePaths=/var/lib/ctrlz -/run/ctrlz", "InaccessiblePaths=/var/lib/nothing", "must be inaccessible"},
+		{"block directory not setgid to the proxy's group", "tmpfiles/ctrlz.conf", "2711 ctrlz-block  ctrlz-link ", "0711 ctrlz-block  ctrlz-block", "ctrlz-block"},
+		{"xray slot enabled", "systemd/ctrlz-xray@.service", "UMask=0077\n", "UMask=0077\n[Install]\nWantedBy=multi-user.target\n", "must not be enabled"},
+		{"xray slot sees the store", "systemd/ctrlz-xray@.service", "InaccessiblePaths=/var/lib/ctrlz", "InaccessiblePaths=/var/lib/nothing", "must be inaccessible"},
+		{"xray slot sees the whole of /etc/ctrlz", "systemd/ctrlz-xray@.service", "TemporaryFileSystem=/etc/ctrlz:ro\n", "", "empty tmpfs"},
+		{"xray slot sees another file", "systemd/ctrlz-xray@.service", "/etc/ctrlz/versions/xray.allow", "/etc/ctrlz/unbound/identified.conf", "visible to a slot"},
+		{"xray slot as another user", "systemd/ctrlz-xray@.service", "User=ctrlz-xray", "User=ctrlz-agent", "runs as"},
+		{"xray slot with a capability", "systemd/ctrlz-xray@.service", "CapabilityBoundingSet=\n", "CapabilityBoundingSet=CAP_NET_ADMIN\n", "no capability"},
+		{"xrayctl without its task limit", "systemd/ctrlz-xrayctl.service", "TasksMax=64\n", "", "TasksMax"},
+		{"dns writes outside its socket directory", "systemd/ctrlz-dns.service", "ReadWritePaths=/run/ctrlz-link", "ReadWritePaths=/run/ctrlz-link /var/lib/ctrlz", "writes nowhere"},
+		{"dns without its OOM score", "systemd/ctrlz-dns.service", "OOMScoreAdjust=-500\n", "", "OOMScoreAdjust"},
+		{"polkit: the block unit", "polkit/50-ctrlz-agent.rules", `"chrony.service"`, `"chrony.service", "ctrlz-block.service"`, "units are"},
+		{"run directory open to others", "tmpfiles/ctrlz.conf", "d /run/ctrlz-link          0750", "d /run/ctrlz-link          0755", "ctrlz-link"},
+		{"run directory of a group that is not declared", "tmpfiles/ctrlz.conf", "ctrlz-xrayctl  -", "ctrlz-nobody    -", "not declared"},
+		{"a run directory forgotten", "tmpfiles/ctrlz.conf", "d /run/ctrlz-xray-b        0700 ctrlz-xray   ctrlz-xray     -\n", "", "ctrlz-xray-b"},
+		{"tmpfiles forgotten by files.conf", "files.conf", "tmpfiles/ctrlz.conf /etc/tmpfiles.d/ctrlz.conf 0644\n", "", "in no list"},
 		{"syn cookies off", "sysctl/60-ctrlz.conf", "net.ipv4.tcp_syncookies = 1", "net.ipv4.tcp_syncookies = 0", "tcp_syncookies"},
 		{"apport's core pattern left in place", "sysctl/60-ctrlz.conf", "kernel.core_pattern = |/usr/lib/systemd/systemd-coredump", "kernel.core_pattern = |/usr/share/apport/apport", "core_pattern"},
 		{"no core pattern", "sysctl/60-ctrlz.conf", "kernel.core_pattern", "#kernel.core_pattern", "core_pattern"},

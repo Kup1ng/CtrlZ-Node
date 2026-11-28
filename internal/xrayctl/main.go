@@ -15,8 +15,12 @@ import (
 const DefaultSock = "/run/ctrlz-xrayctl/ctl.sock"
 
 // Main is `ctrlz-node xrayctl`: it listens on ctl.sock for the agent and root and
-// runs the fixed operations until ctx ends. The unit runs it as ctrlz-xray with a
-// RuntimeDirectory, so the directory exists and belongs to that account.
+// runs the fixed operations until ctx ends. The unit runs it as ctrlz-xray, and the
+// directory of the socket is made by tmpfiles (2750, setgid, group ctrlz-xrayctl;
+// p4b-proxy 3.3), so ctl.sock is born in a group that the agent is a member of and the
+// Xray slots are not. The unit must not declare RuntimeDirectory=: systemd would reset
+// the directory to the unit's own user and group, mode 0755 and no setgid, at every
+// start, and the agent could no longer connect.
 func Main(ctx context.Context, sockPath string) error {
 	if err := xrayrun.RefuseRoot(os.Geteuid()); err != nil {
 		return err
@@ -50,6 +54,6 @@ func Main(ctx context.Context, sockPath string) error {
 	return s.Serve(ctx, ln)
 }
 
-// workDir is a directory with nothing in it: the unit's RuntimeDirectory (the
-// socket's parent) holds only the socket, which no tag of the allowed forms names.
+// workDir is a directory with nothing in it: the socket's parent (made by tmpfiles,
+// see Main) holds only the socket, which no tag of the allowed forms names.
 func workDir() string { return filepath.Dir(DefaultSock) }

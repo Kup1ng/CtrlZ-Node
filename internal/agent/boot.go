@@ -98,6 +98,9 @@ func boot(ctx context.Context, env bootEnv) error {
 	if env.Tune != nil {
 		env.Tune(&cfg)
 	}
+	// B4 (p4b 5.5): the nftables guard, as a part. After Tune, so it holds the final Runner;
+	// a guard that the tune made (the Xray manager waits on it) is kept and run as the part.
+	wireNftGuard(&cfg)
 	have, err := haveIdentity(keys)
 	if err != nil {
 		return err

@@ -1,8 +1,9 @@
-# The proxy role: idle in P4, binds nothing and holds nothing (p4-nodes 7.1). The
-# unit exists so the install and the sandbox are the final ones when P4b fills it;
-# P4b adds the capabilities and sockets it needs here.
+# The proxy role (p4b-proxy 5.1): ports 80 and 443 on PROXY_IP, sniff, SOCKS to the
+# active Xray slot, splice. It holds no key, no policy and no Grant, and reads no file
+# of ours: its only inputs are proxy.sock (dns) and what clients send. It binds
+# nothing until dns has sent its config over that socket.
 [Unit]
-Description=Ctrl Z proxy (idle)
+Description=Ctrl Z proxy
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -13,12 +14,25 @@ User=ctrlz-proxy
 Group=ctrlz-proxy
 ExecStart=/usr/local/bin/ctrlz-node proxy
 Restart=always
-RestartSec=5s
+RestartSec=2s
 LimitCORE=0
+# One descriptor for each client and one for each SOCKS leg (12: 30,000 connections).
+LimitNOFILE=524288
+# The socket memory of 12 is counted in this limit; the proxy trims stalled
+# connections before it is reached (5.4).
+MemoryMax=2G
+# Under memory pressure the proxy and the slots go before DNS (5.4).
+OOMScoreAdjust=500
+Environment=GODEBUG=multipathtcp=0
 
-CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
+# Nothing of ours is readable (5.1): the node's configuration and store are hidden,
+# so a parser bug here shows an attacker no address and no topology.
+TemporaryFileSystem=/etc/ctrlz:ro
+InaccessiblePaths=/var/lib/ctrlz -/run/ctrlz
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -34,6 +48,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0077
+# No name, address or source is ever written; the output is the journal's.
 
 [Install]
 WantedBy=multi-user.target

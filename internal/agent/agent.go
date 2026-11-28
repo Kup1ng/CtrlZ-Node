@@ -43,6 +43,7 @@ import (
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/control"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/freefacts"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/hubconn"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/nft"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/probe"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx"
@@ -105,6 +106,12 @@ type Config struct {
 	Parts  []Part
 	Faults *Faults
 	DNS    *DNS
+	// NftGuard applies the agent's nftables table and reads it back (p4b-proxy 5.5).
+	// The Xray manager reads Check and Changed from it before and while it runs a slot.
+	NftGuard *nft.Guard
+	// LookupUIDs resolves account names to uids for the proxy chains; nil takes
+	// os/user. A test gives its own.
+	LookupUIDs func(names ...string) ([]uint32, error)
 
 	// FSHook is a fault-injection point on the node's own disk writes, for tests.
 	FSHook func(path string, s fsx.Step) error
@@ -273,6 +280,7 @@ func New(cfg Config) (*Agent, error) {
 		revs: map[revKey]*policyv1.Revocation{}, revUnsynced: map[revKey]struct{}{}, acmes: map[string]*hubv1.AcmeChallenge{}, acmeSeq: map[string]uint64{}, lastPub: map[string]string{}}
 	a.started = cfg.Now()
 	a.downSince.Store(a.started.UnixNano())
+	a.nftTable.g = cfg.NftGuard
 
 	w := &fsx.Writer{Hook: cfg.FSHook}
 	root, err := store.Open(cfg.Root, w)

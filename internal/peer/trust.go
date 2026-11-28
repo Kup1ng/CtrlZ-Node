@@ -207,12 +207,18 @@ func (p *Peer) bindLeaf(pc *peerConn, spki [32]byte) error {
 }
 
 // recheck ends every connection whose key the table v no longer trusts: a revoked
-// peer's calls stop at the entry that empties its key, not at the next reconnect.
+// peer's calls stop at the entry that empties its key, not at the next reconnect. It
+// also ends every connection of a node that v does not name as the live pair peer,
+// whatever its key: a former peer that is still live and trusted must not keep the
+// connections it was admitted with once the pair moved, and one still in its handshake
+// (no key recorded yet) goes with them (INT2-r1-8).
 func (p *Peer) recheck(v *view) {
+	pl := v.peerLive()
 	p.cmu.Lock()
 	var drop []*peerConn
 	for c := range p.conns {
-		if spki, has := c.leaf(); has && !v.trusts(c.node, spki) {
+		spki, has := c.leaf()
+		if pl == nil || pl.id != c.node || (has && !v.trusts(c.node, spki)) {
 			drop = append(drop, c)
 		}
 	}

@@ -80,13 +80,13 @@ func TestEnsureConntrack(t *testing.T) {
 	ctx := context.Background()
 	f := fake.NewFiles(map[string]string{ConntrackMax: "65536\n"})
 	r := &fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
-		f.Set(ConntrackMax, "262144\n")
+		f.Set(ConntrackMax, "524288\n")
 		return nil, nil
 	}}
 	if fs := EnsureConntrack(ctx, f, r, DefaultConntrackMax); len(fs) != 0 {
 		t.Fatalf("raised value still alerted: %v", fs)
 	}
-	if got := r.Lines(); len(got) != 1 || got[0] != "sysctl -w net.netfilter.nf_conntrack_max=262144" {
+	if got := r.Lines(); len(got) != 1 || got[0] != "sysctl -w net.netfilter.nf_conntrack_max=524288" {
 		t.Errorf("calls %v", got)
 	}
 	// already enough: no command
@@ -139,5 +139,26 @@ func TestSyncookies(t *testing.T) {
 	Alerts(mem, fs)
 	if mem.Count(alert.SyncookiesOff) != 1 {
 		t.Error("the finding was not raised as an alert")
+	}
+}
+
+func TestProxyKernel(t *testing.T) {
+	m := map[string]string{}
+	for _, k := range ProxySysctl {
+		// /proc/sys values of three numbers are separated by tabs.
+		m["/proc/sys/"+strings.ReplaceAll(k[0], ".", "/")] = strings.ReplaceAll(k[1], " ", "\t") + "\n"
+	}
+	f := fake.NewFiles(m)
+	if fs := ProxyKernel(f); len(fs) != 0 {
+		t.Fatalf("findings on the installed values: %v", fs)
+	}
+	f.Set("/proc/sys/net/ipv4/tcp_mem", "1\t2\t3\n")
+	fs := ProxyKernel(f)
+	if len(fs) != 1 || fs[0].Code != alert.SysctlOff || !strings.Contains(fs[0].Detail, "tcp_mem") {
+		t.Fatalf("findings %v", fs)
+	}
+	// A missing module has no file for the timeouts: that is a finding too.
+	if fs := ProxyKernel(fake.NewFiles(nil)); len(fs) != len(ProxySysctl) {
+		t.Fatalf("findings %d", len(fs))
 	}
 }

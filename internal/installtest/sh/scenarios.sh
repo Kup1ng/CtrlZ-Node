@@ -157,10 +157,10 @@ check_layout() {
 	eq "$(grep -c 'action\.id ===' "$rule")" 1 'actions in the polkit rule'
 	grep -q 'org.freedesktop.systemd1.manage-units' "$rule" || fail 'polkit: no manage-units'
 	eq "$(grep -c 'polkit.Result.YES' "$rule")" 1 'grants in the polkit rule'
-	units=$(grep -A6 'var units' "$rule" | grep -o '"[a-z.-]*service"' | tr -d '"' | sort | tr '\n' ' ')
-	eq "$units" 'chrony.service ctrlz-dns.service ctrlz-unbound-free.service ctrlz-unbound.service ' 'polkit units'
-	eq "$(grep '^ReadWritePaths=' /etc/systemd/system/ctrlz-agent.service)" 'ReadWritePaths=/var/lib/ctrlz /etc/ctrlz/unbound /etc/ctrlz/chrony' 'agent writable paths'
-	eq "$(grep -c '^LimitCORE=0$' /etc/systemd/system/ctrlz-dns.service /etc/systemd/system/ctrlz-agent.service /etc/systemd/system/ctrlz-proxy.service /etc/systemd/system/ctrlz-unbound.service /etc/systemd/system/ctrlz-unbound-free.service | grep -c ':1$')" 5 'units with LimitCORE=0'
+	units=$(grep -A6 'var units' "$rule" | grep -o '"[a-z@.-]*service"' | tr -d '"' | sort | tr '\n' ' ')
+	eq "$units" 'chrony.service ctrlz-dns.service ctrlz-unbound-free.service ctrlz-unbound.service ctrlz-xray@a.service ctrlz-xray@b.service ' 'polkit units'
+	eq "$(grep '^ReadWritePaths=' /etc/systemd/system/ctrlz-agent.service)" 'ReadWritePaths=/var/lib/ctrlz /etc/ctrlz/unbound /etc/ctrlz/chrony /etc/ctrlz/xray' 'agent writable paths'
+	eq "$(grep -c '^LimitCORE=0$' /etc/systemd/system/ctrlz-dns.service /etc/systemd/system/ctrlz-agent.service /etc/systemd/system/ctrlz-proxy.service /etc/systemd/system/ctrlz-unbound.service /etc/systemd/system/ctrlz-unbound-free.service /etc/systemd/system/ctrlz-block.service /etc/systemd/system/ctrlz-xrayctl.service /etc/systemd/system/ctrlz-xray@.service | grep -c ':1$')" 8 'units with LimitCORE=0'
 	grep -q '^Storage=none$' /etc/systemd/coredump.conf.d/ctrlz.conf || fail 'coredump Storage'
 	grep -q '^ProcessSizeMax=0$' /etc/systemd/coredump.conf.d/ctrlz.conf || fail 'coredump ProcessSizeMax'
 	grep -q '^CPUQuota=[0-9]*%$' /etc/systemd/system/ctrlz-unbound-free.service.d/10-limits.conf || fail 'free unbound CPUQuota drop-in'
@@ -260,13 +260,13 @@ sc_happy() {
 	# The order of fetches: root.json first, then the CA, the verifier, the bundle.
 	eq "$(sed -n 1,3p /var/log/stub/fetch.log | tr '\n' ' ')" '/install/root.json /install/node_ca.pem /install/ctrlz-verify ' 'first fetches'
 	eq "$(sed -n 4p /var/log/stub/fetch.log)" /install/bundle/3/manifest.json 'fourth fetch'
-	grep -E '^systemctl enable' /var/log/stub/calls.log | grep -q 'ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' || fail 'units not enabled'
-	grep -qE '^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' /var/log/stub/calls.log || fail 'units not started'
-	grep -qE '^systemctl stop ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' /var/log/stub/calls.log || fail 'the units that run as the agent were not stopped first'
+	grep -E '^systemctl enable' /var/log/stub/calls.log | grep -q 'ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service ctrlz-block.service ctrlz-xrayctl.service chrony.service' || fail 'units not enabled'
+	grep -qE '^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service ctrlz-block.service ctrlz-xrayctl.service' /var/log/stub/calls.log || fail 'units not started'
+	grep -qE '^systemctl stop ctrlz-xray@a.service ctrlz-xray@b.service ctrlz-xrayctl.service ctrlz-block.service ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' /var/log/stub/calls.log || fail 'the units that run as the agent were not stopped first'
 	# The packages go in first (a failure there leaves the node running); then the stop,
 	# before anything of the agent's tree is touched and before any enable or restart:
 	# the first systemctl call that is not about the distribution's own units.
-	eq "$(grep -v -e '^systemctl mask ' -e '^systemctl disable ' -e '^systemctl is-active ' /var/log/stub/calls.log | sed -n 1p)" 'systemctl stop ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' 'first systemctl call that changes the node'
+	eq "$(grep -v -e '^systemctl mask ' -e '^systemctl disable ' -e '^systemctl is-active ' /var/log/stub/calls.log | sed -n 1p)" 'systemctl stop ctrlz-xray@a.service ctrlz-xray@b.service ctrlz-xrayctl.service ctrlz-block.service ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' 'first systemctl call that changes the node'
 
 	# A second run of the same bundle (a repair) leaves the same state and the same groups.
 	: >/var/log/stub/apt.log
@@ -283,7 +283,7 @@ sc_happy() {
 	}
 	no_leak 'second install'
 	# The repair replaced the identity files and the binary, so the running units must be restarted.
-	grep -qE "^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service" /var/log/stub/calls.log || fail "a repeat install did not restart the units"
+	grep -qE "^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service ctrlz-block.service ctrlz-xrayctl.service" /var/log/stub/calls.log || fail "a repeat install did not restart the units"
 	check_unbound_conf_reset 'a repeat install'
 	check_layout
 	check_agent_files
@@ -512,7 +512,7 @@ sc_upgrade() {
 	after=$(cat /usr/local/bin/ctrlz-node)
 	[ "$after" != "$before" ] || fail 'the binary did not change'
 	eq "$(cat /etc/ctrlz/versions/node)" 4 'version after the upgrade'
-	grep -qE '^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service' /var/log/stub/calls.log || fail 'units not restarted'
+	grep -qE '^systemctl restart ctrlz-agent.service ctrlz-dns.service ctrlz-proxy.service ctrlz-block.service ctrlz-xrayctl.service' /var/log/stub/calls.log || fail 'units not restarted'
 	check_unbound_conf_reset 'an upgrade'
 	eq "$(dpkg-query -W -f='${Version}' unbound)" 1.20.0-1 'unbound after the upgrade'
 	check_layout

@@ -225,13 +225,22 @@ func lines(text string) [][]string {
 
 // What 7.1 fixes, in one place. A change here is a change of the design.
 var (
-	unitNames = []string{"ctrlz-dns", "ctrlz-agent", "ctrlz-proxy", "ctrlz-unbound", "ctrlz-unbound-free"}
-	// AgentUnits are the units the agent may start, stop and restart.
-	AgentUnits = []string{"chrony.service", "ctrlz-dns.service", "ctrlz-unbound-free.service", "ctrlz-unbound.service"}
+	unitNames = []string{"ctrlz-dns", "ctrlz-agent", "ctrlz-proxy", "ctrlz-unbound", "ctrlz-unbound-free", "ctrlz-block", "ctrlz-xrayctl", "ctrlz-xray@"}
+	// AgentUnits are the units the agent may start, stop and restart: the two Xray
+	// slots are among them (p4b-proxy 7.6), the units of the other P4b roles are not.
+	AgentUnits = []string{"chrony.service", "ctrlz-dns.service", "ctrlz-unbound-free.service", "ctrlz-unbound.service", "ctrlz-xray@a.service", "ctrlz-xray@b.service"}
 	// AgentVerbs are the verbs it may use on them.
 	AgentVerbs = []string{"restart", "start", "stop"}
 	// AgentWritable are the agent unit's ReadWritePaths.
-	AgentWritable = []string{"/etc/ctrlz/chrony", "/etc/ctrlz/unbound", "/var/lib/ctrlz"}
+	AgentWritable = []string{"/etc/ctrlz/chrony", "/etc/ctrlz/unbound", "/etc/ctrlz/xray", "/var/lib/ctrlz"}
+	// runDirs are the run directories of P4b (p4b-proxy 3.3): owner, group, mode.
+	runDirs = map[string][3]string{
+		"/run/ctrlz-link":    {"ctrlz-dns", "ctrlz-link", "0750"},
+		"/run/ctrlz-block":   {"ctrlz-block", "ctrlz-link", "2711"},
+		"/run/ctrlz-xrayctl": {"ctrlz-xray", "ctrlz-xrayctl", "2750"},
+		"/run/ctrlz-xray-a":  {"ctrlz-xray", "ctrlz-xray", "0700"},
+		"/run/ctrlz-xray-b":  {"ctrlz-xray", "ctrlz-xray", "0700"},
+	}
 	// ctrlzMembers are the only members of group ctrlz.
 	ctrlzMembers = []string{"ctrlz-agent", "ctrlz-dns"}
 	// groupShared are the directories of /var/lib/ctrlz that dns reads: group ctrlz and setgid.
@@ -286,6 +295,7 @@ func Check(root string) []Finding {
 		units[n] = ParseUnit(read("systemd/" + n + ".service"))
 	}
 	checkUnits(units, acc, dirs, bad)
+	checkTmpfiles(read("tmpfiles/ctrlz.conf"), acc, bad)
 	checkPolkit(ParsePolkit(read("polkit/50-ctrlz-agent.rules")), bad)
 	checkHost(read("coredump/ctrlz.conf"), read("sysctl/60-ctrlz.conf"), read("chrony/chrony.conf"), bad)
 	checkApparmor("unbound", read("apparmor/local-usr.sbin.unbound"), apparmorPaths, bad)
@@ -297,6 +307,16 @@ func Check(root string) []Finding {
 func checkAccounts(a Accounts, bad func(string, ...any)) {
 	if !sameSet(a.Members["ctrlz"], ctrlzMembers) {
 		bad("group ctrlz has members %v, want exactly %v", a.Members["ctrlz"], ctrlzMembers)
+	}
+	// The group of proxy.sock (3.3): block is not in it, for it would reach the link
+	// socket; its serve.sock gets the group from the setgid directory.
+	if !sameSet(a.Members["ctrlz-link"], []string{"ctrlz-dns", "ctrlz-proxy"}) {
+		bad("group ctrlz-link has members %v, want exactly ctrlz-dns and ctrlz-proxy", a.Members["ctrlz-link"])
+	}
+	// The group of ctl.sock: the Xray slots run as the account that serves it, and a
+	// membership would give every slot a group that is meant for the agent alone.
+	if !sameSet(a.Members["ctrlz-xrayctl"], []string{"ctrlz-agent"}) {
+		bad("group ctrlz-xrayctl has members %v, want exactly ctrlz-agent", a.Members["ctrlz-xrayctl"])
 	}
 	have := map[string]bool{}
 	for _, g := range a.Groups {
@@ -450,8 +470,8 @@ func checkUnits(units map[string]Unit, acc Accounts, dirs []Dir, bad func(string
 	if !sameSet(dns.Words("Service.CapabilityBoundingSet"), []string{"CAP_NET_BIND_SERVICE"}) || !sameSet(dns.Words("Service.AmbientCapabilities"), []string{"CAP_NET_BIND_SERVICE"}) {
 		bad("ctrlz-dns: capabilities must be CAP_NET_BIND_SERVICE only")
 	}
-	if len(dns.Words("Service.ReadWritePaths")) > 0 {
-		bad("ctrlz-dns writes nowhere")
+	if !sameSet(dns.Words("Service.ReadWritePaths"), []string{"/run/ctrlz-link"}) {
+		bad("ctrlz-dns writes nowhere on disk but its socket directory /run/ctrlz-link")
 	}
 
 	agent := units["ctrlz-agent"]
@@ -532,6 +552,7 @@ func checkUnits(units map[string]Unit, acc Accounts, dirs []Dir, bad func(string
 			bad("%s must run in a group of its own, has %q", n, g)
 		}
 	}
+	checkP4bUnits(units, bad)
 	// The ReadWritePaths of the agent must be directories the install makes.
 	made := map[string]bool{}
 	for _, d := range dirs {
@@ -568,7 +589,7 @@ func checkPolkit(p Polkit, bad func(string, ...any)) {
 	}
 }
 
-var reSysctlRange = regexp.MustCompile(`(?m)^net\.ipv4\.ip_local_port_range\s*=\s*32768\s+39999\s*$`)
+var reSysctlRange = regexp.MustCompile(`(?m)^net\.ipv4\.ip_local_port_range\s*=\s*10240\s+39999\s*$`)
 var reSyncookies = regexp.MustCompile(`(?m)^net\.ipv4\.tcp_syncookies\s*=\s*[12]\s*$`)
 var reBuf = regexp.MustCompile(`(?m)^net\.core\.(rmem_max|wmem_max)\s*=\s*(\d+)\s*$`)
 
@@ -585,7 +606,7 @@ func checkHost(coredump, sysctl, chrony string, bad func(string, ...any)) {
 		bad("coredump drop-in: ProcessSizeMax must be 0")
 	}
 	if !reSysctlRange.MatchString(sysctl) {
-		bad("sysctl: net.ipv4.ip_local_port_range must be 32768 39999")
+		bad("sysctl: net.ipv4.ip_local_port_range must be 10240 39999")
 	}
 	if !reSyncookies.MatchString(sysctl) {
 		bad("sysctl: net.ipv4.tcp_syncookies must be 1 (T-017)")
@@ -605,8 +626,14 @@ func checkHost(coredump, sysctl, chrony string, bad func(string, ...any)) {
 	if !reCorePattern.MatchString(sysctl) {
 		bad("sysctl: kernel.core_pattern must be the systemd-coredump pipe (apport's pipe stops both Unbound units)")
 	}
-	if !strings.Contains(sysctl, "nf_conntrack_max") {
-		bad("sysctl: nf_conntrack_max is not set")
+	if !regexp.MustCompile(`(?m)^-?net\.netfilter\.nf_conntrack_max\s*=\s*524288\s*$`).MatchString(sysctl) {
+		bad("sysctl: nf_conntrack_max must be 524288 (p4b-proxy 5.5)")
+	}
+	for _, k := range p4bSysctl {
+		re := `(?m)^-?` + regexp.QuoteMeta(k[0]) + `\s*=\s*` + strings.ReplaceAll(regexp.QuoteMeta(k[1]), " ", `\s+`) + `\s*$`
+		if !regexp.MustCompile(re).MatchString(sysctl) {
+			bad("sysctl: %s must be %s (p4b-proxy 5.5)", k[0], k[1])
+		}
 	}
 	// chronyd parses chrony.conf as root and the agent writes into the sourcedir, so
 	// everything that is not a source line must be fixed here (R16) and the agent's
@@ -733,3 +760,137 @@ func checkApparmor(name, text string, want []string, bad func(string, ...any)) {
 // apparmorChronyPaths is the one directory chronyd reads from the node: the agent's
 // time-source drop-in and the panel CA beside it, read-only.
 var apparmorChronyPaths = []string{"/etc/ctrlz/chrony/", "/etc/ctrlz/chrony/**"}
+
+// p4bSysctl are the keys of the table in p4b-proxy 5.5 (D31), other than the port range
+// and nf_conntrack_max, which have their own checks. The agent's host check reads the
+// same list (hostcheck.ProxySysctl); a test ties the two.
+var p4bSysctl = [][2]string{
+	{"net.ipv4.tcp_tw_reuse", "1"},
+	{"net.ipv4.tcp_rmem", "4096 131072 2097152"},
+	{"net.ipv4.tcp_wmem", "4096 16384 2097152"},
+	{"net.ipv4.tcp_notsent_lowat", "131072"},
+	{"net.ipv4.tcp_mem", "786432 1048576 1572864"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_syn_sent", "10"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_last_ack", "10"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_fin_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_close_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_time_wait", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_unacknowledged", "30"},
+	{"net.netfilter.nf_conntrack_tcp_timeout_max_retrans", "30"},
+}
+
+// P4bSysctl is the same list for the agent's host check and for the test that ties it
+// to the file.
+func P4bSysctl() [][2]string { return append([][2]string(nil), p4bSysctl...) }
+
+// checkP4bUnits holds what p4b-proxy 5.1, 5.4, 7.6 and 10.2 fix for the units of the
+// proxy, the block page, the Xray control process and the Xray slots.
+func checkP4bUnits(units map[string]Unit, bad func(string, ...any)) {
+	val := func(name, key string) string {
+		v, _ := units[name].One(key)
+		return v
+	}
+	noCap := func(name string) {
+		u := units[name]
+		if len(u.Words("Service.CapabilityBoundingSet")) != 0 || len(u["Service.AmbientCapabilities"]) != 0 {
+			bad("%s: no capability", name)
+		}
+	}
+	proxy := units["ctrlz-proxy"]
+	if !sameSet(proxy.Words("Service.CapabilityBoundingSet"), []string{"CAP_NET_BIND_SERVICE"}) || !sameSet(proxy.Words("Service.AmbientCapabilities"), []string{"CAP_NET_BIND_SERVICE"}) {
+		bad("ctrlz-proxy: capabilities must be CAP_NET_BIND_SERVICE only")
+	}
+	for _, c := range [][3]string{
+		{"ctrlz-proxy", "Service.LimitNOFILE", "524288"}, {"ctrlz-proxy", "Service.MemoryMax", "2G"}, {"ctrlz-proxy", "Service.OOMScoreAdjust", "500"},
+		{"ctrlz-block", "Service.MemoryMax", "512M"}, {"ctrlz-block", "Service.OOMScoreAdjust", "500"},
+		{"ctrlz-xrayctl", "Service.MemoryMax", "512M"}, {"ctrlz-xrayctl", "Service.TasksMax", "64"},
+		{"ctrlz-xray@", "Service.MemoryMax", "5G"}, {"ctrlz-xray@", "Service.LimitNOFILE", "262144"}, {"ctrlz-xray@", "Service.OOMScoreAdjust", "500"},
+		{"ctrlz-xray@", "Service.Restart", "always"},
+		{"ctrlz-dns", "Service.OOMScoreAdjust", "-500"}, {"ctrlz-agent", "Service.OOMScoreAdjust", "-500"},
+	} {
+		if got := val(c[0], c[1]); got != c[2] {
+			bad("%s: %s is %q, want %q", c[0], c[1], got, c[2])
+		}
+	}
+	for _, n := range []string{"ctrlz-block", "ctrlz-xrayctl", "ctrlz-xray@"} {
+		noCap(n)
+	}
+	if v := val("ctrlz-block", "Service.User"); v != "ctrlz-block" {
+		bad("ctrlz-block runs as %q", v)
+	}
+	if !sameSet(units["ctrlz-block"].Words("Service.RestrictAddressFamilies"), []string{"AF_UNIX"}) {
+		bad("ctrlz-block: RestrictAddressFamilies must be AF_UNIX alone")
+	}
+	if !sameSet(units["ctrlz-block"].Words("Service.ReadWritePaths"), []string{"/run/ctrlz-block"}) {
+		bad("ctrlz-block: ReadWritePaths must be /run/ctrlz-block alone")
+	}
+	// The proxy parses every hostile hello and block holds signing keys; neither may
+	// read a file of ours (5.1), so the configuration and the store are out of sight.
+	for _, n := range []string{"ctrlz-proxy", "ctrlz-block"} {
+		inacc := " " + strings.Join(units[n].Words("Service.InaccessiblePaths"), " ") + " "
+		if !strings.Contains(inacc, " /var/lib/ctrlz ") || !strings.Contains(inacc, " -/run/ctrlz ") {
+			bad("%s: /var/lib/ctrlz and /run/ctrlz must be inaccessible", n)
+		}
+		if got := units[n].Words("Service.TemporaryFileSystem"); len(got) != 1 || got[0] != "/etc/ctrlz:ro" {
+			bad("%s: /etc/ctrlz must be an empty tmpfs", n)
+		}
+	}
+	for _, n := range []string{"ctrlz-xrayctl", "ctrlz-xray@"} {
+		// The Xray binary never runs under another uid than ctrlz-xray (7.5), and
+		// the slot files and the store are out of sight (7.6).
+		if v := val(n, "Service.User"); v != "ctrlz-xray" {
+			bad("%s runs as %q, want ctrlz-xray", n, v)
+		}
+		if !strings.Contains(" "+strings.Join(units[n].Words("Service.InaccessiblePaths"), " ")+" ", " /var/lib/ctrlz ") {
+			bad("%s: /var/lib/ctrlz must be inaccessible", n)
+		}
+		if got := units[n].Words("Service.TemporaryFileSystem"); len(got) != 1 || got[0] != "/etc/ctrlz:ro" {
+			bad("%s: /etc/ctrlz must be an empty tmpfs", n)
+		}
+	}
+	if len(units["ctrlz-xray@"]["Install.WantedBy"]) != 0 {
+		bad("ctrlz-xray@ must not be enabled; the agent starts the active slot")
+	}
+	if !strings.HasSuffix(val("ctrlz-xray@", "Service.ExecStart"), "ctrlz-node xray-run %i") {
+		bad("ctrlz-xray@: ExecStart must run xray-run for its instance")
+	}
+	// Of its config a slot sees its own two files and the allow file.
+	for _, w := range units["ctrlz-xray@"].Words("Service.BindReadOnlyPaths") {
+		if !strings.HasPrefix(w, "/etc/ctrlz/xray/%i.") && strings.TrimPrefix(w, "-") != "/etc/ctrlz/versions/xray.allow" {
+			bad("ctrlz-xray@: %s is visible to a slot", w)
+		}
+	}
+}
+
+// checkTmpfiles holds the run directories of 3.3: the set, and for each its owner,
+// its group and its mode.
+func checkTmpfiles(text string, acc Accounts, bad func(string, ...any)) {
+	have := map[string][3]string{}
+	for _, f := range lines(text) {
+		if len(f) != 6 || f[0] != "d" {
+			bad("tmpfiles: bad line %q", strings.Join(f, " "))
+			continue
+		}
+		have[f[1]] = [3]string{f[3], f[4], f[2]}
+		if _, ok := acc.Users[f[3]]; !ok {
+			bad("tmpfiles: %s is owned by %s, which is not a declared user", f[1], f[3])
+		}
+		known := false
+		for _, g := range acc.Groups {
+			known = known || g == f[4]
+		}
+		if !known {
+			bad("tmpfiles: %s has group %s, which is not declared", f[1], f[4])
+		}
+	}
+	for p, want := range runDirs {
+		if got, ok := have[p]; !ok || got != want {
+			bad("tmpfiles: %s is %v, want %v", p, have[p], want)
+		}
+	}
+	for p := range have {
+		if _, ok := runDirs[p]; !ok {
+			bad("tmpfiles: %s is not a run directory of 3.3", p)
+		}
+	}
+}

@@ -123,8 +123,8 @@ func DefaultParams(k Kind) Params {
 }
 
 // The outgoing port ranges. The host's ephemeral range must end below
-// FreePortLo (the install script sets net.ipv4.ip_local_port_range to 32768
-// 39999), so the notrack rule that accepts the free Unbound's replies without
+// FreePortLo (the install sets net.ipv4.ip_local_port_range to 10240 39999; only
+// its end matters here), so the notrack rule that accepts the free Unbound's replies without
 // state reaches no other socket (SC 5.2a, Connection tracking).
 const (
 	FreePortLo       = 40000

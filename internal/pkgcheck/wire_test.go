@@ -11,7 +11,9 @@ import (
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/chrony"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/hostcheck"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/hubconn"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sock"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/unbound"
 	"github.com/Kup1ng/CtrlZ-Node/internal/enroll"
 	"github.com/Kup1ng/CtrlZ-Node/internal/pkgcheck"
@@ -188,7 +190,10 @@ func TestInstallWritesWhatTheCodeReads(t *testing.T) {
 // real host, where the agent could never restart dns or start an Unbound. The set of
 // the constants must be the polkit list, and the node's own units must have a unit file.
 func TestTheUnitsTheAgentManagesAreTheOnesPolkitAllows(t *testing.T) {
-	code := []string{agent.DNSUnit, unbound.UnitIdentified, unbound.UnitFree, chrony.Unit}
+	// The two slots: the Xray manager names them in its own code, and the agent's
+	// polkit right is these two names. The test names them here until that code
+	// exports constants of them.
+	code := []string{agent.DNSUnit, unbound.UnitIdentified, unbound.UnitFree, chrony.Unit, "ctrlz-xray@a.service", "ctrlz-xray@b.service"}
 	if !sameSet(code, pkgcheck.AgentUnits) {
 		t.Errorf("the agent manages %v, pkgcheck.AgentUnits (the polkit list) is %v", code, pkgcheck.AgentUnits)
 	}
@@ -201,7 +206,12 @@ func TestTheUnitsTheAgentManagesAreTheOnesPolkitAllows(t *testing.T) {
 		if u == chrony.Unit {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(pk, "systemd", u)); err != nil {
+		// An instance has the file of its template.
+		file := u
+		if i := strings.Index(u, "@"); i >= 0 {
+			file = u[:i+1] + ".service"
+		}
+		if _, err := os.Stat(filepath.Join(pk, "systemd", file)); err != nil {
 			t.Errorf("no unit file packaging/systemd/%s", u)
 		}
 	}
@@ -228,4 +238,59 @@ func sameSet(a, b []string) bool {
 	slices.Sort(x)
 	slices.Sort(y)
 	return slices.Equal(x, y)
+}
+
+// The units of P4b run the roles the binary is given by the other packages of the
+// phase (block, xrayctl, xray-run); this ties the unit's command line and account to
+// the accounts the sockets' peer checks name (sock.User*), so a rename on one side
+// fails here.
+func TestP4bUnitsNameTheirAccountsAndRoles(t *testing.T) {
+	const bin = "/usr/local/bin/ctrlz-node"
+	acc, err := pkgcheck.ParseAccounts(read(t, "accounts.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]struct{ exec, user string }{
+		"ctrlz-proxy":   {bin + " proxy", sock.UserProxy},
+		"ctrlz-block":   {bin + " block", sock.UserBlock},
+		"ctrlz-xrayctl": {bin + " xrayctl", sock.UserXray},
+		"ctrlz-xray@":   {bin + " xray-run %i", sock.UserXray},
+	} {
+		u := unit(t, name)
+		if got := one(t, u, "Service.ExecStart"); got != want.exec {
+			t.Errorf("%s ExecStart %q, want %q", name, got, want.exec)
+		}
+		if got := one(t, u, "Service.User"); got != want.user {
+			t.Errorf("%s runs as %s, the socket checks name %s", name, got, want.user)
+		}
+	}
+	for _, n := range []string{sock.UserDNS, sock.UserAgent, sock.UserProxy, sock.UserBlock, sock.UserXray} {
+		if _, ok := acc.Users[n]; !ok {
+			t.Errorf("accounts.conf has no user %s", n)
+		}
+	}
+	// The groups of the sockets (3.3): who may traverse and connect.
+	for g, want := range map[string][]string{
+		"ctrlz-link":     {"ctrlz-dns", "ctrlz-proxy"},
+		"ctrlz-blockkey": {"ctrlz-block", "ctrlz-agent"},
+		"ctrlz-xrayctl":  {"ctrlz-agent"},
+	} {
+		if !sameSet(acc.Members[g], want) {
+			t.Errorf("group %s has members %v, want %v", g, acc.Members[g], want)
+		}
+	}
+}
+
+// The keys the agent checks are the keys the install sets (5.5).
+func TestAgentChecksTheKeysTheInstallSets(t *testing.T) {
+	have := hostcheck.ProxySysctl
+	want := pkgcheck.P4bSysctl()
+	if len(have) != len(want) {
+		t.Fatalf("the agent checks %d keys, the install check %d", len(have), len(want))
+	}
+	for i := range have {
+		if have[i] != want[i] {
+			t.Errorf("key %d: agent %v, install %v", i, have[i], want[i])
+		}
+	}
 }

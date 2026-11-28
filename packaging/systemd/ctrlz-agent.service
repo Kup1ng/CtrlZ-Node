@@ -3,7 +3,7 @@
 # What it may change on the host is exactly this unit's list, and nothing is added
 # by a package: CAP_NET_ADMIN for its own nftables table; start, stop and restart
 # of the Unbound units, ctrlz-dns and chrony through the polkit rule; writes only
-# below the three ReadWritePaths. It has no right to install anything (R16): no
+# below the ReadWritePaths. It has no right to install anything (R16): no
 # polkit action but those units, no capability that reaches dpkg's files, and the
 # upgrade is a root one-shot (`sudo ctrlz-node upgrade`), not an agent act.
 [Unit]
@@ -21,6 +21,7 @@ Restart=always
 RestartSec=2s
 LimitCORE=0
 LimitNOFILE=65536
+OOMScoreAdjust=-500
 
 # /run/ctrlz holds agent.sock (0660, group ctrlz). It survives an agent restart so
 # that dns, which holds a path to it, does not meet a missing directory.
@@ -32,7 +33,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ctrlz /etc/ctrlz/unbound /etc/ctrlz/chrony
+ReadWritePaths=/var/lib/ctrlz /etc/ctrlz/unbound /etc/ctrlz/chrony /etc/ctrlz/xray
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

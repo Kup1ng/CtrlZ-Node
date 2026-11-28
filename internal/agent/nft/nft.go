@@ -40,6 +40,9 @@ type Params struct {
 	PanelAddrs []netip.Addr
 	// FreePortLo and FreePortHi are the free Unbound's outgoing-port-permit range.
 	FreePortLo, FreePortHi int
+	// Proxy, when set, adds the chains of the proxy role (p4b-proxy 5.5). Nil renders
+	// the table of P4 alone, which is what a node without a proxy address has.
+	Proxy *ProxyParams
 }
 
 // Validate refuses what cannot be rendered.
@@ -58,6 +61,9 @@ func (p Params) Validate() error {
 	if p.FreePortLo < 1024 || p.FreePortHi < p.FreePortLo || p.FreePortHi > 65535 {
 		return errors.New("nft: bad free port range")
 	}
+	if p.Proxy != nil {
+		return p.Proxy.validate(p.DNSIP)
+	}
 	return nil
 }
 
@@ -67,6 +73,7 @@ type view struct {
 	Lo, Hi         int
 	Panel4, Panel6 []netip.Addr
 	Table          string
+	P              *proxyView
 }
 
 // The table is deleted and recreated in one transaction (add, delete, define),
@@ -80,12 +87,18 @@ table inet {{.Table}} {
 		{{.Fam}} daddr {{.DNSIP}} udp dport 53 notrack
 		{{.Fam}} daddr {{.DNSIP}} tcp dport 53 notrack
 		udp sport 53 udp dport {{.Lo}}-{{.Hi}} notrack
+{{- if .P}}
+{{template "proxyraw" .P}}
+{{- end}}
 	}
 	chain raw_out {
 		type filter hook output priority raw; policy accept;
 		{{.Fam}} saddr {{.DNSIP}} udp sport 53 notrack
 		{{.Fam}} saddr {{.DNSIP}} tcp sport 53 notrack
 		udp sport {{.Lo}}-{{.Hi}} udp dport 53 notrack
+{{- if .P}}
+{{template "proxyraw" .P}}
+{{- end}}
 	}
 	chain time_out {
 		type filter hook output priority filter; policy accept;
@@ -104,10 +117,13 @@ table inet {{.Table}} {
 		tcp dport 4460 meta nfproto ipv6 drop
 {{- end}}
 	}
+{{- if .P}}
+{{template "proxychains" .P}}
+{{- end}}
 }
 `
 
-var parsed = template.Must(template.New("nft").Parse(tmpl))
+var parsed = template.Must(template.Must(template.New("nft").Parse(tmpl)).Parse(proxyTmpl))
 
 // Render returns the script for nft -f.
 func Render(p Params) (string, error) {
@@ -125,6 +141,9 @@ func Render(p Params) (string, error) {
 		} else {
 			v.Panel6 = append(v.Panel6, a)
 		}
+	}
+	if p.Proxy != nil {
+		v.P = p.Proxy.view(p)
 	}
 	var b bytes.Buffer
 	if err := parsed.Execute(&b, v); err != nil {

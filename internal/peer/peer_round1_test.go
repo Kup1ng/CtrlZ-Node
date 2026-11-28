@@ -1,6 +1,9 @@
 package peer
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"math"
 	"net"
@@ -9,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -332,4 +338,64 @@ func TestFailedBindKeepsTheOldListenerAndRetriesEvery5s(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// INT2-r1-8: when the pair moves, a former peer that is still live and trusted in the
+// new table loses its open connection at once. Before, only a changed key ended it, so
+// the former peer kept its connections (and could keep opening streams) for good.
+func TestFormerPairPeerConnectionIsClosedWhenThePairMoves(t *testing.T) {
+	p := newPKI(t)
+	nodes := mkNodes(t, p, 3)
+	dir := newDir()
+	a := startRig(t, p, dir, nodes[0], mkTable(5, nodes, nil, [2]int{0, 1}))
+	b := startRig(t, p, dir, nodes[1], mkTable(5, nodes, nil, [2]int{0, 1}))
+	cl := rawClient(t, a, b)
+	// B's pair is now (B, C). A is still a live node with its key in the table.
+	b.env.table.Store(mkTable(6, nodes, nil, [2]int{1, 2}))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := cl.st.Send(fwd(60, 1)); err != nil {
+			break
+		}
+		if _, err := cl.st.Recv(); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the former pair peer's connection is still open")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b.p.cmu.Lock()
+	left := len(b.p.conns)
+	b.p.cmu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d connections are still counted", left)
+	}
+	b.dns.none(t, sock.TypeGrantIn, 100*time.Millisecond)
+}
+
+type deniedStream struct {
+	grpc.BidiStreamingServer[peerv1.GrantForward, peerv1.GrantAck]
+	ctx context.Context
+}
+
+func (s deniedStream) Context() context.Context { return s.ctx }
+
+// INT2-r1-4: a stream that opens for a node that is no longer the pair peer ends in
+// PermissionDenied at its start, before any message is read. The connection of such a
+// node is normally closed by recheck, so the check is reached only in the gap before
+// that close; this calls Forward the way a stream in that gap would.
+func TestForwardStreamOfANodeThatIsNotThePairPeerEndsAtItsStart(t *testing.T) {
+	p := newPKI(t)
+	nodes := mkNodes(t, p, 3)
+	b := startRig(t, p, newDir(), nodes[1], mkTable(5, nodes, nil, [2]int{1, 2}))
+	for _, n := range []*tnode{nodes[0]} { // A is live and trusted, but B is paired with C
+		ctx := grpcpeer.NewContext(context.Background(), &grpcpeer.Peer{AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{PeerCertificates: []*x509.Certificate{n.cert.Leaf}}}})
+		err := (&service{p: b.p}).Forward(deniedStream{ctx: ctx})
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("a stream of a node outside the pair ended with %v", err)
+		}
+	}
+	b.dns.none(t, sock.TypeGrantIn, 50*time.Millisecond)
 }

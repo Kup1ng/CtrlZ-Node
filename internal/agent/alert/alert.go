@@ -28,6 +28,7 @@ const (
 	ConntrackLow        = "conntrack_low"         // nf_conntrack_max below the measured value
 	SyncookiesOff       = "syncookies_off"        // net.ipv4.tcp_syncookies is 0 or unreadable: a SYN flood fills the half-open queue (T-017)
 	NftFailed           = "nft_failed"            // the nftables table could not be applied
+	SysctlOff           = "sysctl_off"            // a kernel setting of the proxy role (p4b-proxy 5.5) is not the installed one
 	ChronyFailed        = "chrony_failed"         // chrony's file or unit could not be updated
 	UpstreamLoop        = "upstream_loop"         // an upstream of the NodeConfig is a node's own address (SC 5.2a, Loops)
 	QuarantineTwoNodes  = "quarantine"            // an entry was refused and reported
