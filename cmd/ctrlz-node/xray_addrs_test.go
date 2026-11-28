@@ -5,8 +5,10 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/conf"
 )
 
@@ -48,5 +50,32 @@ func TestHubNameIsResolvedAtStartAndTheListOnlyGrows(t *testing.T) {
 	h.merge(answers[0])
 	if len(h.got) != 2 {
 		t.Errorf("after two answers: %v", h.got)
+	}
+}
+
+// B5-r2-10: a full list says so and does not silently drop what the panel moves to; an
+// address that the name stopped answering makes room.
+func TestHubAddrsCapAlertsAndStaleAddressesMakeRoom(t *testing.T) {
+	mem := &alert.Memory{}
+	h := &hubAddrs{ac: conf.Agent{Hub: "hub.example.org"}, alert: mem}
+	var first []netip.Addr
+	for i := 0; i < hubMax+8; i++ {
+		first = append(first, netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}))
+	}
+	h.merge(first)
+	if len(h.got) != hubMax {
+		t.Fatalf("list holds %d, want %d", len(h.got), hubMax)
+	}
+	if mem.Count("xray_hub_addrs_capped") != 1 {
+		t.Errorf("alerts: %d, want 1", mem.Count("xray_hub_addrs_capped"))
+	}
+	// A day later the old answers are stale and the new address replaces them.
+	for a := range h.seen {
+		h.seen[a] = time.Now().Add(-2 * hubStale)
+	}
+	next := netip.MustParseAddr("203.0.113.77")
+	h.merge([]netip.Addr{next})
+	if !slices.Contains(h.got, next) {
+		t.Errorf("the panel's new address is missing from %v", h.got)
 	}
 }

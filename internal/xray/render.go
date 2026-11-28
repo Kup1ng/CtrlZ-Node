@@ -60,6 +60,10 @@ type runRec struct {
 	Location uint32 `json:"loc"`
 	Priority uint32 `json:"prio"`
 	Stateful bool   `json:"stateful,omitempty"`
+	// Accepted is the list of unknown keys the admin accepted for this very fragment: the
+	// fragment is checked again against the allow list when it is carried into a new process
+	// or the agent starts, and must pass with what was accepted for it, not for a later edit.
+	Accepted []string `json:"acc,omitempty"`
 }
 
 // baseInput is what the base configuration of a slot depends on.

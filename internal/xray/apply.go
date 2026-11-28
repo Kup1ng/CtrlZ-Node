@@ -273,7 +273,7 @@ func (m *Manager) applyOne(ctx context.Context, c *cfgRec) {
 		return
 	}
 	rec := runRec{ID: c.hex, Gen: m.st.Gens[c.hex] + 1, Port: port, Outs: len(outboundsOf(res.Normalized)),
-		Hash: c.hash, Frag: res.Normalized, Location: c.Location, Priority: c.Priority, Stateful: stateful}
+		Hash: c.hash, Frag: res.Normalized, Location: c.Location, Priority: c.Priority, Stateful: stateful, Accepted: c.Accepted}
 	cfg, err := slotConfig(m.base(m.st.Slot), []runRec{rec})
 	if err != nil {
 		m.refuse(c, old, "the fragment could not be rendered")
@@ -343,6 +343,14 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 		m.pendingAgain(c)
 		return
 	}
+	// The trial needs a process that is the one the loop is watching and is not between two
+	// lives: a start that finds the slot in auto-restart, or a new pid that supervise has
+	// not taken in yet, would take that end as this config's own and lose the real one
+	// (7.5 step 4; B5 r2-4). The config stays pending and supervise attributes the end.
+	if !st.Active || st.AutoRestart || st.PID == 0 || !m.watch.known || st.PID != m.watch.pid || st.Restarts != m.watch.restarts || m.death != nil || !m.slotUp {
+		m.pendingAgain(c)
+		return
+	}
 	m.st.Trial = &trialRec{Rec: rec, Boot: m.opt.BootID(), PID: st.PID}
 	_ = m.saveState()
 	ado, adr, adi, err := addCalls(m.base(slot), rec)
@@ -363,6 +371,10 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 		// The call may have failed because the fragment killed the process while it was
 		// built into a handler, which is exactly what a trial is for.
 		after, serr := m.opt.Units.Status(ctx, slot)
+		if m.guardLost() {
+			m.endTrial() // the stop that ended it was the guard's, not the fragment's
+			return
+		}
 		if serr == nil && processEnded(st, after) {
 			m.trialCrashed(ctx, c, rec, old)
 			return
@@ -391,6 +403,10 @@ func (m *Manager) liveAdd(ctx context.Context, c *cfgRec, rec runRec, old *runRe
 		return // the agent is stopping; the trial record is what the next start reads
 	}
 	after, serr := m.opt.Units.Status(ctx, slot)
+	if m.guardLost() {
+		m.endTrial() // read after the unit, see the same check in runRebuild
+		return
+	}
 	if serr != nil {
 		m.removeHandlers(ctx, slot, ver, rec)
 		m.st.Trial = nil
@@ -577,6 +593,9 @@ func (m *Manager) removeFromOld(ctx context.Context, id string) {
 func (m *Manager) tick(ctx context.Context) {
 	now := m.opt.Now()
 	m.syncGuard(ctx)
+	if !m.guardOn {
+		m.enforceOff(ctx)
+	}
 	if !m.retryAt.IsZero() && !now.Before(m.retryAt) {
 		m.retryAt = time.Time{}
 		m.step(ctx) // what a transient failure left undone (retryIn)

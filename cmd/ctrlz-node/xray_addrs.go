@@ -2,25 +2,28 @@ package main
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent"
+	"github.com/Kup1ng/CtrlZ-Node/internal/agent/alert"
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/conf"
 	"github.com/Kup1ng/CtrlZ-Node/internal/store"
+	"github.com/Kup1ng/CtrlZ-Node/internal/xray"
 )
 
 // xrayNodeAddrs returns the list of addresses that the Xray manager adds to the
 // finalRules of `direct` and of every freedom outbound (p4b-proxy 7.4): the panel, and
 // the DNS and proxy address of every node of the applied table, the node's own
-// addresses from agent.conf included. The manager reads it at every reconcile, so it
-// never waits for a lookup and reads one small file; a change of the list is a change
-// of the base and rebuilds the idle slot (7.5 step 5).
+// addresses from agent.conf included. The manager adds the four addresses of the
+// applied NodeConfig itself (Manager.base), so a bind address that the hub moved is
+// covered there. The manager reads this list at every reconcile, so it never waits for
+// a lookup and reads one small file; a change of the list is a change of the base and
+// rebuilds the idle slot (7.5 step 5).
 func xrayNodeAddrs(cfg *agent.Config) func() []netip.Addr {
-	hub := &hubAddrs{ac: cfg.Conf, lookup: lookupHub}
+	hub := &hubAddrs{ac: cfg.Conf, lookup: lookupHub(identifiedUnbound), alert: cfg.Alert}
 	hub.prime()
 	return func() []netip.Addr {
 		var out []netip.Addr
@@ -55,26 +58,54 @@ func xrayNodeAddrs(cfg *agent.Config) func() []netip.Addr {
 type hubAddrs struct {
 	ac     conf.Agent
 	lookup func(ctx context.Context, host string) []netip.Addr
+	alert  alert.Alerter
 
 	mu       sync.Mutex
 	got      []netip.Addr
+	seen     map[netip.Addr]time.Time
+	capped   bool
 	at       time.Time
 	fetching bool
 }
 
-const hubRefresh = 5 * time.Minute
+const (
+	hubRefresh = 5 * time.Minute
+	hubMax     = 32
+	// hubStale is how long an address may go unanswered before it makes room: a list that
+	// only grew would freeze at the bound and miss the panel's next address (B5 r2-10).
+	hubStale = 24 * time.Hour
+)
 
-// merge only adds: a name that answers with another subset each time must not change
-// the list, because a change of it rebuilds the idle slot, and a stale address stays
-// blocked, which costs nothing. The list is bounded.
+// merge adds what the name answers. A name that answers with another subset each time
+// must not change the list, because a change of it rebuilds the idle slot, so an
+// address stays until it has not been answered for hubStale. The list is bounded, and a
+// full list says so with an alert instead of dropping addresses without a word. The
+// answers come from the identified Unbound only (lookupHub), never from the host's
+// plain resolver, which a network attacker could fill with addresses of its choice.
 func (h *hubAddrs) merge(as []netip.Addr) {
+	if len(as) == 0 {
+		return
+	}
+	now := time.Now()
+	if h.seen == nil {
+		h.seen = map[netip.Addr]time.Time{}
+	}
 	for _, a := range as {
-		if len(h.got) >= 32 {
+		h.seen[a] = now
+	}
+	h.got = slices.DeleteFunc(h.got, func(a netip.Addr) bool { return now.Sub(h.seen[a]) > hubStale })
+	for _, a := range as {
+		if slices.Contains(h.got, a) {
+			continue
+		}
+		if len(h.got) >= hubMax {
+			if !h.capped && h.alert != nil {
+				h.capped = true
+				h.alert.Alert(alert.Alert{Code: "xray_hub_addrs_capped", Detail: "the hub name answers more addresses than the block list holds"})
+			}
 			return
 		}
-		if !slices.Contains(h.got, a) {
-			h.got = append(h.got, a)
-		}
+		h.got = append(h.got, a)
 	}
 }
 
@@ -113,14 +144,16 @@ func (h *hubAddrs) get() []netip.Addr {
 	return append([]netip.Addr(nil), h.got...)
 }
 
-func lookupHub(ctx context.Context, host string) []netip.Addr {
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil
+// lookupHub asks the identified Unbound for the hub name, IPv4 and IPv6.
+func lookupHub(unbound string) func(ctx context.Context, host string) []netip.Addr {
+	v4, v6 := xray.UnboundResolver(unbound), xray.UnboundResolver6(unbound)
+	return func(ctx context.Context, host string) []netip.Addr {
+		var out []netip.Addr
+		for _, f := range []func(context.Context, string) ([]netip.Addr, error){v4, v6} {
+			if as, err := f(ctx, host); err == nil {
+				out = append(out, as...)
+			}
+		}
+		return out
 	}
-	out := make([]netip.Addr, 0, len(ips))
-	for _, ip := range ips {
-		out = append(out, ip.Unmap())
-	}
-	return out
 }

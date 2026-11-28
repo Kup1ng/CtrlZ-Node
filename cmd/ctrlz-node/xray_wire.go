@@ -16,6 +16,10 @@ import (
 // Guard). The integration step assigns it before the agent is built.
 var nftGuard func(*agent.Config) agent.Guard
 
+// identifiedUnbound is the identified Unbound (SC 5.2a), the one resolver that the Xray
+// manager and the hub name lookup trust.
+const identifiedUnbound = "127.0.0.10:5300"
+
 // wireXray is the one block of this part in the agent's boot: it builds the Xray
 // manager with the Faults and DNS that every part shares and adds it to the parts.
 func wireXray(cfg *agent.Config) {
@@ -29,7 +33,7 @@ func wireXray(cfg *agent.Config) {
 	if nftGuard != nil {
 		guard = nftGuard(cfg)
 	}
-	const unbound = "127.0.0.10:5300" // the identified Unbound (SC 5.2a)
+	const unbound = identifiedUnbound
 	m := xray.New(xray.Options{
 		Layout:    xrayrun.DefaultLayout(),
 		StateDir:  filepath.Join(cfg.Root, "xray"),

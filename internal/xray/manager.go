@@ -157,15 +157,16 @@ type Manager struct {
 	probing map[string]bool
 	probeSm chan struct{}
 
-	guardOn   bool
-	slotUp    bool
-	watch     watchState
-	lastPub   []byte
-	pubErr    bool
-	version   string // release the active slot runs
-	cur       *snapshot
-	baseTried string // the base signature a rebuild was last asked for
-	stopping  bool
+	guardOn    bool
+	slotUp     bool
+	watch      watchState
+	lastPub    []byte
+	pubErr     bool
+	version    string // release the active slot runs
+	cur        *snapshot
+	baseTried  string // the base signature a rebuild was last asked for
+	stopping   bool
+	stopFailed bool // a stop of a slot with the guard off failed, and was alerted
 
 	// The guard (5.5) is watched by its own goroutine, because the loop can be busy
 	// for minutes (a first import of 64 configs, a rebuild) and the open-proxy window
@@ -744,4 +745,26 @@ func (m *Manager) tickAlerts() {
 			delete(m.alerted, l)
 		}
 	}
+}
+
+// enforceOff looks at both units on every tick while the guard is off and stops any
+// that is up. The stop at the moment the guard turned off may have failed (a refused
+// stop job, a D-Bus timeout, a missing polkit rule), and a slot that stays up serves
+// every local uid with no nft rule in front of it (5.5; B5 r2-8). A failed stop is
+// alerted once per stretch.
+func (m *Manager) enforceOff(ctx context.Context) {
+	failed := false
+	for _, slot := range []string{"a", "b"} {
+		st, err := m.opt.Units.Status(ctx, slot)
+		if err != nil || (!st.Active && !st.AutoRestart) {
+			continue
+		}
+		if m.opt.Units.Stop(ctx, slot) != nil {
+			failed = true
+		}
+	}
+	if failed && !m.stopFailed {
+		m.opt.Alert.Alert(alert.Alert{Code: "xray_slot_stop_failed", Detail: "an Xray slot could not be stopped while the guard is off"})
+	}
+	m.stopFailed = failed
 }
