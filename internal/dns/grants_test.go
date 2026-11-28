@@ -493,9 +493,13 @@ func TestGrantsVerdictGateRefusal(t *testing.T) {
 	w.h.cfg.GateClass = w.res.GateClass
 	for i, name := range []string{"private.example.com", "loop.example.com"} {
 		w.dot(epP1, name, dns.TypeA)
-		if g.Table().Holders() == 0 {
+		if _, ok := g.Table().Lookup(srcLocal, 64500, wn(name), grant.WidthExact); !ok {
 			t.Fatalf("%s: no Grant was written, so the verdict cannot be tested", name)
 		}
+		// A new kind 1 holder starts a background A lookup of its dial name (warmA). It is
+		// a backend hit of its own, and it may land between the two looks below, so the
+		// hit count only means something once it has finished.
+		g.waitWarm(t)
 		if v := g.look(uint64(10+i), name); v.Kind != sock.VerdictNone {
 			t.Fatalf("%s: a Gate refusal must give none: %+v", name, v)
 		}
@@ -674,5 +678,19 @@ func TestGrantsPlacedAtRefusesAStaleGeneration(t *testing.T) {
 	g.Conns().PlacedAt(g.Conns().Gen(), 5, "127.0.0.20:20002")
 	if cn, _ = g.Conns().Get(5); cn.Socks != "127.0.0.20:20002" {
 		t.Fatalf("a current placement must apply: %q", cn.Socks)
+	}
+}
+
+// waitWarm waits until the background A lookups of new holders (warmA) are done.
+// Their slot is taken before the goroutine starts, so an empty channel means none is
+// running or about to run.
+func (g *Grants) waitWarm(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(g.warm) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a background A lookup did not finish")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

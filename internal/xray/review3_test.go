@@ -131,7 +131,7 @@ func TestPutBackDoesNotRunAGoodFragmentTheTableRefuses(t *testing.T) {
 	r.eventually("running", func() bool { return r.runningRec(hexID(1)) != nil })
 	for i := 0; i < 3; i++ {
 		time.Sleep(60 * time.Millisecond)
-		r.units.crash("a", "signal", 0)
+		r.units.crashSeen("a", "signal", 0)
 	}
 	r.waitState(1, kRefused)
 	if rec := r.runningRec(hexID(1)); rec != nil {

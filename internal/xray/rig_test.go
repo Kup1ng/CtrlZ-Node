@@ -94,6 +94,7 @@ type fakeUnits struct {
 	mu    sync.Mutex
 	slots map[string]*fakeSlot
 	pids  int
+	polls int // calls of Status, so crash can wait until the manager has looked
 }
 
 func newUnits() *fakeUnits {
@@ -124,17 +125,44 @@ func (u *fakeUnits) Stop(_ context.Context, slot string) error {
 func (u *fakeUnits) Status(_ context.Context, slot string) (UnitStatus, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	u.polls++
 	s := u.slots[slot]
 	return UnitStatus{Active: s.active, PID: s.pid, Restarts: s.restarts, Result: s.result, ExitStatus: s.exit, AutoRestart: s.window}, nil
 }
 
-// crash plays systemd: the process ended with this result and was started again.
+// crash plays systemd: the process ended with this result and was started again. It
+// never waits, so a hook that runs inside the manager (ctl onCall, prober) may call it.
 func (u *fakeUnits) crash(slot, result string, exit int) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
+	u.crashLocked(slot, result, exit)
+	u.mu.Unlock()
+}
+
+func (u *fakeUnits) crashLocked(slot, result string, exit int) {
 	u.pids++
 	s := u.slots[slot]
 	s.pid, s.restarts, s.result, s.exit, s.active = u.pids, s.restarts+1, result, exit, true
+}
+
+// crashSeen is crash for a test that crashes the slot on a timer: it returns only after
+// the manager has read the unit twice since. The manager sees a restart as one end per
+// tick, so two crashes inside one tick are one end, and a test loses an end whenever the
+// machine is slow. The second read starts after the tick of the first has been handled.
+// It must not be called from inside the manager. A manager that is not running reads
+// nothing, so the wait is bounded and then lets the test go on.
+func (u *fakeUnits) crashSeen(slot, result string, exit int) {
+	u.mu.Lock()
+	u.crashLocked(slot, result, exit)
+	want := u.polls + 2
+	u.mu.Unlock()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+		u.mu.Lock()
+		seen := u.polls >= want
+		u.mu.Unlock()
+		if seen {
+			return
+		}
+	}
 }
 
 // crashWindow plays what systemd really shows: the process ended and the unit waits to

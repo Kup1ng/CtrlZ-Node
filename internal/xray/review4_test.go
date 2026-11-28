@@ -91,7 +91,7 @@ func TestRestoredGoodFragmentIsTestedBeforeItIsWritten(t *testing.T) {
 	r.ctl.mu.Unlock()
 	for i := 0; i < 3; i++ {
 		time.Sleep(60 * time.Millisecond)
-		r.units.crash("a", "signal", 0)
+		r.units.crashSeen("a", "signal", 0)
 	}
 	r.waitState(1, kRefused)
 	if _, e := r.stateOf(1); !strings.Contains(e, "old spelling") {

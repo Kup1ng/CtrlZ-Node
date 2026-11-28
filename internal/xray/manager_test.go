@@ -341,7 +341,7 @@ func TestThreeEndsPutTheLastGoodSetBack(t *testing.T) {
 	r.waitState(2, kApplied)
 	for i := 0; i < 3; i++ {
 		time.Sleep(60 * time.Millisecond)
-		r.units.crash("a", "signal", 0)
+		r.units.crashSeen("a", "signal", 0)
 	}
 	r.waitState(2, kRefused)
 	if _, e := r.stateOf(2); e != "crashed" {
@@ -377,7 +377,7 @@ func TestSearchTakesOneConfigOutAtATimeAndGivesUpWhenNoneIsTheCause(t *testing.T
 		_, b := r.good(hexID(2))
 		return a && b
 	})
-	crash := func() { time.Sleep(60 * time.Millisecond); r.units.crash(r.activeSlot(), "signal", 0) }
+	crash := func() { time.Sleep(60 * time.Millisecond); r.units.crashSeen(r.activeSlot(), "signal", 0) }
 	crash()
 	crash()
 	crash() // the third end: nothing to put back, so the search starts

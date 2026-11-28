@@ -26,7 +26,7 @@ func TestThirdEndKeepsTheGoodFragmentOutUntilTheBinaryJudges(t *testing.T) {
 			r.setTestAnswer(func() error { return noVerdict })
 			for i := 0; i < 3; i++ {
 				time.Sleep(60 * time.Millisecond)
-				r.units.crash("a", "signal", 0)
+				r.units.crashSeen("a", "signal", 0)
 			}
 			r.eventually("the config is out and owed a test", func() bool {
 				k, _ := r.stateOf(1)
@@ -64,7 +64,7 @@ func TestThirdEndKeepsTheGoodFragmentOutUntilTheBinaryJudges(t *testing.T) {
 		r.setTestAnswer(func() error { return errors.New("xray: ctl.sock does not answer") })
 		for i := 0; i < 3; i++ {
 			time.Sleep(60 * time.Millisecond)
-			r.units.crash("a", "signal", 0)
+			r.units.crashSeen("a", "signal", 0)
 		}
 		r.eventually("owed a test", func() bool { return len(r.persisted().Restore) == 1 })
 		r.setTestAnswer(func() error { return &CtlError{Exit: 23, Text: "failed to load config: old spelling"} })

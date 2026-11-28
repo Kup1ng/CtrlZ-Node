@@ -57,7 +57,7 @@ func TestStartFailRestoreIsTested(t *testing.T) {
 	failTwice := func(r *rig) {
 		for i := 0; i < 2; i++ {
 			time.Sleep(60 * time.Millisecond)
-			r.units.crash("a", "exit-code", 23)
+			r.units.crashSeen("a", "exit-code", 23)
 		}
 	}
 	t.Run("refused", func(t *testing.T) {
