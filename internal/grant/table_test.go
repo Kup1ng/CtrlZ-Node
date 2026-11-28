@@ -505,3 +505,29 @@ func TestPutResultCarriesTheStoredOutcome(t *testing.T) {
 		t.Fatalf("a joiner must see the live outcome: %+v", r)
 	}
 }
+
+// Past 600 ASNs a new one folds into row 0 and is counted without the table lock.
+func TestWidthCountOverflowFoldsIntoRowZero(t *testing.T) {
+	tb := tbl(newClock())
+	for asn := uint32(1); asn <= 700; asn++ {
+		tb.widthCount(asn, 4)
+	}
+	if tb.overRow.Load() == nil {
+		t.Fatal("the overflow row was never published")
+	}
+	before := tb.overRow.Load()[4].Load()
+	for i := 0; i < 5; i++ {
+		tb.widthCount(9999, 4)
+	}
+	if got := tb.overRow.Load()[4].Load(); got != before+5 {
+		t.Fatalf("overflow row %d, want %d", got, before+5)
+	}
+	if _, ok := tb.widths.Load(uint32(9999)); ok {
+		t.Fatal("an ASN past the cap got a row of its own")
+	}
+	var n int
+	tb.widths.Range(func(_, _ any) bool { n++; return true })
+	if n > 601 {
+		t.Fatalf("%d rows", n)
+	}
+}

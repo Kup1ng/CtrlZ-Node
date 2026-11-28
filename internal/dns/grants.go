@@ -486,7 +486,7 @@ func (g *Grants) proxyVerdict(ctx context.Context, gen, id uint64, src netip.Add
 	}
 	// The connection is charged to the first target with room; it starts there.
 	first := cands[rooms[0]].socks
-	g.conns.Moved(id, first, false, 0)
+	g.conns.PlacedAt(gen, id, first)
 	v := &sock.LinkVerdict{Kind: sock.VerdictProxy, Tag: cn.Tag(sock.MaxTag)}
 	for _, i := range rooms {
 		v.Targets = append(v.Targets, sock.Target{Socks: cands[i].socks, Host: cands[i].host, Port: port})
@@ -516,11 +516,27 @@ func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) (a
 	g.mu.Lock()
 	if m, bad := g.noA[key]; bad && now.Sub(m.at) < aRetry {
 		g.mu.Unlock()
-		return nil, false, m.gated
+		if m.gated {
+			return nil, false, true
+		}
+		// The mark may have been written while the 300 ms lookup was still running and
+		// the Gate refused its answer a moment later: ask again, and remember it.
+		gated = g.gateRefused(dial)
+		if gated {
+			g.mu.Lock()
+			if cur, ok := g.noA[key]; ok && cur.at.Equal(m.at) {
+				cur.gated = true
+				g.noA[key] = cur
+			}
+			g.mu.Unlock()
+		}
+		return nil, false, gated
 	}
 	if g.aWaits[ep] >= aWaitsEp {
 		g.mu.Unlock()
-		return nil, false, false
+		// Too many waits to start another, but the Gate's last word on the name still
+		// decides whether it may be dialled at all (5.3).
+		return nil, false, g.gateRefused(dial)
 	}
 	g.aWaits[ep]++
 	g.mu.Unlock()
@@ -546,10 +562,8 @@ func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) (a
 		}
 	}
 	if len(addrs) == 0 {
-		if failed && g.h.cfg.GateClass != nil {
-			if c, ok := g.h.cfg.GateClass(dial); ok && c != netclass.Injected {
-				gated = true
-			}
+		if failed {
+			gated = g.gateRefused(dial)
 		}
 		if len(g.noA) >= maxNoA {
 			g.noA = map[string]noAMark{}
@@ -558,6 +572,16 @@ func (g *Grants) dialAddrs(ctx context.Context, dial names.Name, ep [16]byte) (a
 	}
 	g.mu.Unlock()
 	return addrs, len(addrs) > 0, gated
+}
+
+// gateRefused says the Sanity Gate's last refusal of the name was for a class other
+// than injected (private, loopback, CGNAT).
+func (g *Grants) gateRefused(dial names.Name) bool {
+	if g.h.cfg.GateClass == nil {
+		return false
+	}
+	c, ok := g.h.cfg.GateClass(dial)
+	return ok && c != netclass.Injected
 }
 
 // noAMark is the 60 s memory of a name that had no A at its last lookup.

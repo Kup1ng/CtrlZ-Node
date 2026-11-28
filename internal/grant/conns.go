@@ -439,6 +439,23 @@ func (c *Conns) Get(id uint64) (Conn, bool) {
 func (c *Conns) Moved(id uint64, socks string, left bool, startMS uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.movedLocked(id, socks, left, startMS)
+}
+
+// PlacedAt is the first placement of a connection that AdmitAt admitted under gen: it
+// does nothing when the table was rebuilt since, because ids restart with each proxy
+// run and byID[id] would then be a connection of the new session.
+func (c *Conns) PlacedAt(gen, id uint64, socks string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gen != c.gen {
+		c.cnt(StaleGen)
+		return
+	}
+	c.movedLocked(id, socks, false, 0)
+}
+
+func (c *Conns) movedLocked(id uint64, socks string, left bool, startMS uint32) {
 	cn := c.byID[id]
 	if cn == nil || cn.pl.kind != KindRedirect {
 		return

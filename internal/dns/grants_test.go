@@ -609,3 +609,70 @@ func TestGrantsPassIsThrottledExceptForRevocations(t *testing.T) {
 		t.Fatal("an image more than 5 s after the last pass must be judged")
 	}
 }
+
+// 5.3: the Gate's refusal decides the verdict on every path of dialAddrs, also when
+// the 300 ms lookup had given up before the refusal came (a noA mark written with
+// gated false) and when the Endpoint already has 64 lookups waiting.
+func TestGrantsVerdictGateRefusalOnSkippedPaths(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	w.h.cfg.GateClass = w.res.GateClass
+	const name = "private.example.com"
+	w.dot(epP1, name, dns.TypeA)
+	hit, ok := g.Table().Lookup(srcLocal, 64500, wn(name), grant.WidthExact)
+	if !ok {
+		t.Fatal("setup: no Grant")
+	}
+	nm := names.MustString(name)
+	key := string(nm.Wire())
+	if v := g.look(1, name); v.Kind != sock.VerdictNone {
+		t.Fatalf("setup: %+v", v)
+	}
+	// A noA mark written before the refusal was known.
+	g.mu.Lock()
+	g.noA = map[string]noAMark{key: {at: g.h.now(), gated: false}}
+	g.mu.Unlock()
+	if v := g.look(2, name); v.Kind != sock.VerdictNone {
+		t.Fatalf("a not-gated mark hid the Gate refusal: %+v", v)
+	}
+	g.mu.Lock()
+	remembered := g.noA[key].gated
+	g.mu.Unlock()
+	if !remembered {
+		t.Fatal("the mark must learn the refusal")
+	}
+	// The wait cap.
+	g.mu.Lock()
+	g.noA = map[string]noAMark{}
+	g.aWaits[hit.Holders[0].Endpoint] = aWaitsEp
+	g.mu.Unlock()
+	if v := g.look(3, name); v.Kind != sock.VerdictNone {
+		t.Fatalf("the wait cap hid the Gate refusal: %+v", v)
+	}
+}
+
+// The first placement of a verdict is tied to the generation it was admitted under.
+func TestGrantsPlacedAtRefusesAStaleGeneration(t *testing.T) {
+	w, g, _ := newProxyWorld(t)
+	w.dot(epP1, "pub.example.com", dns.TypeA)
+	hit, ok := g.Table().Lookup(srcLocal, 64500, wn("pub.example.com"), grant.WidthExact)
+	if !ok {
+		t.Fatal("setup")
+	}
+	gen := g.Conns().Gen()
+	if _, _, why := g.Conns().AdmitAt(gen, 5, srcLocal, hit, []string{"exit0005", "exit005b"}, "127.0.0.20:20001"); why != "" {
+		t.Fatal(why)
+	}
+	g.LinkUp(2, nil) // the rebuild bumps the generation
+	if _, _, why := g.Conns().AdmitAt(g.Conns().Gen(), 5, srcLocal, hit, []string{"exit0005", "exit005b"}, "127.0.0.20:20001"); why != "" {
+		t.Fatal(why)
+	}
+	g.Conns().PlacedAt(gen, 5, "127.0.0.20:20002")
+	cn, _ := g.Conns().Get(5)
+	if cn.Socks != "127.0.0.20:20001" {
+		t.Fatalf("a stale placement moved the new session's connection: %q", cn.Socks)
+	}
+	g.Conns().PlacedAt(g.Conns().Gen(), 5, "127.0.0.20:20002")
+	if cn, _ = g.Conns().Get(5); cn.Socks != "127.0.0.20:20002" {
+		t.Fatalf("a current placement must apply: %q", cn.Socks)
+	}
+}

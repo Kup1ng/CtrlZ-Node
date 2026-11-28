@@ -220,7 +220,10 @@ type Table struct {
 	cmu    sync.Mutex
 	widths sync.Map // uint32 -> *widthRow
 	nWidth int
-	last   atomic.Pointer[string]
+	// overRow is row 0 once the 600 cap is reached: an ASN that arrives after that
+	// finds it with one atomic load, so the overflow path never takes cmu.
+	overRow atomic.Pointer[widthRow]
+	last    atomic.Pointer[string]
 }
 
 type widthRow [6]atomic.Uint64
@@ -927,6 +930,10 @@ func (t *Table) widthCount(asn uint32, i int) {
 		v.(*widthRow)[i].Add(1)
 		return
 	}
+	if r := t.overRow.Load(); r != nil {
+		r[i].Add(1)
+		return
+	}
 	t.cmu.Lock()
 	v, ok := t.widths.Load(asn)
 	if !ok {
@@ -935,8 +942,12 @@ func (t *Table) widthCount(asn uint32, i int) {
 		if t.nWidth >= 600 {
 			asn = 0
 			v, ok = t.widths.Load(asn)
-		}
-		if !ok {
+			if !ok {
+				v = new(widthRow)
+				t.widths.Store(asn, v)
+			}
+			t.overRow.Store(v.(*widthRow))
+		} else {
 			v = new(widthRow)
 			t.widths.Store(asn, v)
 			t.nWidth++
