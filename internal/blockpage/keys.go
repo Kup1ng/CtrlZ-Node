@@ -172,7 +172,7 @@ func (k *keyring) get(ctx context.Context, endpoint, account []byte) (*held, err
 			refresh := h.ending(now) && k.askDueLocked(acct, now)
 			k.mu.Unlock()
 			if refresh {
-				_ = k.ask(endpoint, account)
+				k.askNow(endpoint, account, acct)
 			}
 			return h, nil
 		}
@@ -186,7 +186,7 @@ func (k *keyring) get(ctx context.Context, endpoint, account []byte) (*held, err
 		}
 		due := k.askDueLocked(acct, now)
 		k.mu.Unlock()
-		if due && !k.ask(endpoint, account) {
+		if due && !k.askNow(endpoint, account, acct) {
 			return nil, ErrNoKey
 		}
 		select {
@@ -198,6 +198,19 @@ func (k *keyring) get(ctx context.Context, endpoint, account []byte) (*held, err
 		}
 	}
 	return nil, ErrNoKey
+}
+
+// askNow sends the need_key that askDueLocked admitted. An ask that was not sent
+// (the agent link is down) must not start the pause: the agent may be back in a
+// moment, and the next handshake should be able to ask then.
+func (k *keyring) askNow(endpoint, account []byte, acct [16]byte) bool {
+	if k.ask(endpoint, account) {
+		return true
+	}
+	k.mu.Lock()
+	delete(k.lastAsk, acct)
+	k.mu.Unlock()
+	return false
 }
 
 // askDueLocked says whether a need_key may go out now, and marks it sent.

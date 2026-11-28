@@ -76,8 +76,9 @@ func (u *unblocker) valid(tok, name string, endpoint, source []byte) bool {
 
 // admit counts one request against 5 an hour for (Endpoint, source) and 60 an hour
 // for the Endpoint, in windows of the clock hour. It reports whether it may be
-// relayed; a refused request is still answered as received (10.4).
-func (u *unblocker) admit(endpoint, source []byte) bool {
+// relayed; a refused request is still answered as received (10.4). The hour it
+// counted in comes back so that a refund can tell its own window from a later one.
+func (u *unblocker) admit(endpoint, source []byte) (int64, bool) {
 	h := u.now().Unix() / 3600
 	var sk srcKey
 	copy(sk.endpoint[:], endpoint)
@@ -90,26 +91,27 @@ func (u *unblocker) admit(endpoint, source []byte) bool {
 		u.perEP = map[[16]byte]int{}
 	}
 	if len(u.perSrc) >= maxCounters || len(u.perEP) >= maxCounters {
-		return false
+		return h, false
 	}
 	if u.perSrc[sk] >= UnblockPerSource || u.perEP[sk.endpoint] >= UnblockPerEndpoint {
-		return false
+		return h, false
 	}
 	u.perSrc[sk]++
 	u.perEP[sk.endpoint]++
-	return true
+	return h, true
 }
 
 // refund gives back the count that admit took for a request that could not be
 // relayed: the visitor was told to try again, so the try must not be spent. A
-// window that has turned since is left alone.
-func (u *unblocker) refund(endpoint, source []byte) {
+// window that has turned since admit counted (hour is the one admit returned) is
+// left alone: the count it holds belongs to another request.
+func (u *unblocker) refund(hour int64, endpoint, source []byte) {
 	var sk srcKey
 	copy(sk.endpoint[:], endpoint)
 	copy(sk.source[:], source)
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.hour != u.now().Unix()/3600 {
+	if u.hour != hour {
 		return
 	}
 	if u.perSrc[sk] > 0 {

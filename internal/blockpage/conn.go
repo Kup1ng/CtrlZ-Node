@@ -168,7 +168,7 @@ func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, htt
 		writeEmpty(w, http.StatusBadRequest)
 		return
 	}
-	if s.unb.admit(f.Endpoint, f.Source) {
+	if hour, admitted := s.unb.admit(f.Endpoint, f.Source); admitted {
 		wn, err := names.FromString(f.Name)
 		if err != nil || wn.IsRoot() {
 			writeEmpty(w, http.StatusBadRequest)
@@ -179,7 +179,7 @@ func (s *Server) unblock(w io.Writer, req *http.Request, f *sock.ServeFrame, htt
 		if !sent {
 			// The agent is not there to take it: say so, the visitor may try again,
 			// and the try is given back.
-			s.unb.refund(f.Endpoint, f.Source)
+			s.unb.refund(hour, f.Endpoint, f.Source)
 			writeEmpty(w, http.StatusServiceUnavailable)
 			return
 		}

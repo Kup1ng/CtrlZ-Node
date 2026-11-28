@@ -105,6 +105,14 @@ func newHarness(t *testing.T) *harness {
 	if err := agent.Send(&sock.BlockMsg{Type: sock.BlockEpoch, Epoch: &sock.EpochMsg{Epoch: h.epoch}}); err != nil {
 		t.Fatal(err)
 	}
+	// The server reads the epoch frame on its own goroutine, and until it is applied
+	// no key is used (10.2). A test that connects at once would be refused by the
+	// rule under test on a loaded runner, and pass on a quiet machine.
+	waitFor(t, func() bool {
+		s.keys.mu.Lock()
+		defer s.keys.mu.Unlock()
+		return s.keys.haveEpoch
+	})
 	return h
 }
 
