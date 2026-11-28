@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/netip"
 	"text/template"
+	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx"
 )
@@ -152,6 +153,11 @@ func Render(p Params) (string, error) {
 	return b.String(), nil
 }
 
+// applyTimeout bounds each nft run of Apply. Guard.apply holds the guard's lock over
+// both, and the Xray manager's next step takes that lock: a stuck nft must fail the
+// apply and release it, or the manager would stand still with no bound (INT2-r1-3).
+var applyTimeout = 10 * time.Second
+
 // Apply renders the table, has nft check it (-c) and then applies it. A script
 // nft refuses changes nothing.
 func Apply(ctx context.Context, r sysx.Runner, p Params) error {
@@ -159,10 +165,15 @@ func Apply(ctx context.Context, r sysx.Runner, p Params) error {
 	if err != nil {
 		return err
 	}
-	if _, err := r.Run(ctx, []byte(s), "nft", "-c", "-f", "-"); err != nil {
+	cctx, cancel := context.WithTimeout(ctx, applyTimeout)
+	_, err = r.Run(cctx, []byte(s), "nft", "-c", "-f", "-")
+	cancel()
+	if err != nil {
 		return fmt.Errorf("nft: check: %w", err)
 	}
-	if _, err := r.Run(ctx, []byte(s), "nft", "-f", "-"); err != nil {
+	actx, acancel := context.WithTimeout(ctx, applyTimeout)
+	defer acancel()
+	if _, err := r.Run(actx, []byte(s), "nft", "-f", "-"); err != nil {
 		return fmt.Errorf("nft: apply: %w", err)
 	}
 	return nil

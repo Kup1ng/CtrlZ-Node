@@ -227,18 +227,43 @@ func (n *nftApplier) applyWith(ctx context.Context, cfg Config, al alert.Alerter
 	// that bind the uids of the slots that kept running (INT2-r1-1, INT2-r1-4). The
 	// answer cannot change under us: a refused script leaves the table as it was, and
 	// this loop is the only one that applies.
-	var keptRead, keptVal bool
+	var read, holds, known bool
+	ask := func() {
+		if !read {
+			holds, known = n.g.HoldsProxyChains(ctx)
+			read = true
+		}
+	}
 	kept := func() bool {
 		if n.g == nil {
 			return false
 		}
-		if !keptRead {
-			holds, known := n.g.HoldsProxyChains(ctx)
-			keptVal, keptRead = holds || !known, true
-		}
-		return keptVal
+		ask()
+		return holds || !known
 	}
-	if px == nil && kept() {
+	// keptNoPart is kept for a pass with no proxy part at all (px nil). Where the kernel
+	// could not be asked and this process has applied nothing, nothing says that chains
+	// exist, and a node just rebooted holds no table: the notrack and flood rules of
+	// DNS_IP (SC 5.2a) must not wait for a read that may stay unanswered. nft applies a
+	// script whole or not at all, so where nft is truly unreadable the apply fails and
+	// leaves the kernel as it was. The fallbacks below keep kept(): there the part
+	// exists and is only unrenderable, so slots may run under chains (INT2-r1-1).
+	keptNoPart := func() bool {
+		if n.g == nil {
+			return false
+		}
+		ask()
+		if holds {
+			return true
+		}
+		if known {
+			return false
+		}
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		return n.last != ""
+	}
+	if px == nil && keptNoPart() {
 		// The proxy part cannot be had this pass (no address, an account that did not
 		// resolve). That is no reason to take the chains away from uids that still run: the
 		// older table stays, the guard is off, so the manager stops the slots, and the

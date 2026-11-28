@@ -195,8 +195,10 @@ func (g *Guard) HoldsProxyChains(ctx context.Context) (holds, known bool) {
 		return false, false
 	}
 	for _, l := range bytes.Split(tabs, []byte{0x0a}) {
-		if f := bytes.Fields(l); len(f) == 3 && string(f[0]) == "table" && string(f[1]) == "inet" && string(f[2]) == Table {
-			// Listed, yet the read failed: nft is struggling, not the table missing.
+		if f := bytes.Fields(l); len(f) >= 3 && string(f[0]) == "table" && string(f[1]) == "inet" && string(f[2]) == Table {
+			// Listed, yet the read failed: nft is struggling, not the table missing. Any
+			// field after the name (an nft that annotates the line) still counts as listed:
+			// a missed line would read a present table as absent (INT2-r1-2).
 			return false, false
 		}
 	}

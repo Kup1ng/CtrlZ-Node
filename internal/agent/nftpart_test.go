@@ -553,3 +553,25 @@ func TestNftBlockedHubLookupFallsBackToTheStoredAddresses(t *testing.T) {
 		t.Error("the guard is not on with the stored addresses")
 	}
 }
+
+// INT2-r1-1: a node with no proxy address whose kernel cannot be read, and which has
+// applied nothing, still gets the table of P4: it holds no table after a reboot, and the
+// notrack rules of DNS_IP must not wait for a read that may stay unanswered.
+func TestNftNoPartUnreadableKernelFreshAgentAppliesP4(t *testing.T) {
+	k := &fakeKernel{}
+	a, r := restarted(t, k, goodUIDs)
+	a.cfg.Conf.ProxyBindIP = netip.Addr{}
+	k.failRead = true
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	sc := nftScripts(r)
+	if len(sc) != 1 || strings.Contains(sc[0], "chain xray_out") || !strings.Contains(sc[0], "notrack") {
+		t.Fatalf("the table of P4 was not applied: %d scripts", len(sc))
+	}
+	// Once this process has applied a table (the read-back fails here, so say it did), an
+	// unknown read keeps it.
+	a.nftTable.last = sc[0]
+	a.nftTable.applyWith(context.Background(), a.cfg, a.al, a.dnsIP(), a.proxyNft())
+	if len(nftScripts(r)) != 1 {
+		t.Error("an unknown read after our own apply reloaded the table")
+	}
+}

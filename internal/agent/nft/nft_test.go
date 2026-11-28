@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kup1ng/CtrlZ-Node/internal/agent/sysx/fake"
 )
@@ -120,5 +121,47 @@ func TestApplyChecksThenApplies(t *testing.T) {
 	}}
 	if err := Apply(context.Background(), r2, params()); err == nil || len(r2.Calls()) != 1 {
 		t.Errorf("err=%v calls=%v", err, r2.Lines())
+	}
+}
+
+// stuckRunner never answers: it returns only when its context ends, as a hung nft does.
+type stuckRunner struct{}
+
+func (stuckRunner) Run(ctx context.Context, _ []byte, _ string, _ ...string) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// INT2-r1-3: a hung nft must fail the apply on its own bound, so Guard.mu is released.
+func TestApplyHasItsOwnBound(t *testing.T) {
+	old := applyTimeout
+	applyTimeout = 50 * time.Millisecond
+	defer func() { applyTimeout = old }()
+	g := NewGuard(stuckRunner{})
+	done := make(chan error, 1)
+	go func() { done <- g.Apply(context.Background(), params()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a stuck nft applied a table")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the apply waited on a stuck nft with no bound")
+	}
+	if !g.Failed() {
+		t.Error("the guard is not failed after a stuck apply")
+	}
+}
+
+// INT2-r1-2: a `nft list tables` line with a field after the name is still our table.
+func TestHoldsProxyChainsTrailingFieldIsStillListed(t *testing.T) {
+	g := NewGuard(&fake.Runner{Reply: func(c fake.Call) ([]byte, error) {
+		if len(c.Args) > 0 && c.Args[0] == "-s" {
+			return nil, errors.New("busy")
+		}
+		return []byte("table ip other\ntable inet ctrlz_agent # annotated\n"), nil
+	}})
+	if _, known := g.HoldsProxyChains(context.Background()); known {
+		t.Error("a listed table with a trailing field was taken as absent")
 	}
 }
